@@ -1,0 +1,10 @@
+[
+  {
+    "check": "gates:governance/version",
+    "date": "2026-10-30T19:28:07.736Z",
+    "result": "pass",
+    "run_link": "https://github.com/gbholdings/straterai-gates/actions/runs/41115472725",
+    "commit": "3ca047f4b9931d767eec322e436de065b8d61662",
+    "detail": "exit 0"
+  }
+]
