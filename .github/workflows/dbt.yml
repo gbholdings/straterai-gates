@@ -72,7 +72,7 @@ jobs:
       run:
         working-directory: ${{ inputs.dbt_project_dir }}
     env:
-      DBT_PROJECT_DIR: ${{ inputs.dbt_project_dir }}
+      GATES_DBT_DIR: ${{ inputs.dbt_project_dir }}
       DBT_PROFILES_DIR: ./ci # relative to the project dir; matches profiles_dir in .sqlfluff
       DBT_CI_PROJECT: ${{ vars.DBT_CI_PROJECT }}
       DBT_CI_DATASET: ${{ vars.DBT_CI_DATASET }}
@@ -93,7 +93,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           if [ "$LINT_ALL" = "true" ]; then echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          d="${DBT_PROJECT_DIR%/}"
+          d="${GATES_DBT_DIR%/}"
           if [ "$d" = "." ] || [ -z "$d" ]; then p=""; else p="$d/"; fi
           files=$(git diff --name-only "origin/$BASE_REF...HEAD" -- ":(glob)${p}models/**" ":(glob)${p}macros/**" ":(glob)${p}tests/**" ":(glob)${p}seeds/**" ":(glob)${p}snapshots/**" ":(glob)${p}analyses/**" ":(glob)${p}ci/**" "${p}dbt_project.yml" "${p}packages.yml" "${p}dependencies.yml" "${p}package-lock.yml" "${p}selectors.yml" "${p}.sqlfluff")
           if [ -z "$files" ]; then
