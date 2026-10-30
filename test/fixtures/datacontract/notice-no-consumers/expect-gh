@@ -1,0 +1,2 @@
+gh api -X POST repos/example-org/gates-under-test/issues/7/comments
+lists no consumers, so nobody downstream can be told

@@ -10,7 +10,7 @@ A repo calls a gate with a few lines and gets the same check every other repo ge
 |---|---|---|
 | `squawk.yml` | [squawk](https://squawkhq.com/) lint over the migration files a PR adds or changes. | `migration_globs` (Prisma and common raw-SQL folders), `squawk_version` (`2.70.0`), `config_path` (`.squawk.toml`), `lint_all` (`false`) |
 | `dbt.yml` | sqlfluff, then `dbt build --target ci` against a CI-only database. | `dbt_project_dir` (`.`), `adapter_package` (`dbt-bigquery==1.12.1`), `dbt_core` (`1.12.6`), `sqlfluff` (`4.4.0`), `auth` (`wif-google` or `none`), `workload_identity_provider`, `service_account`, `lint_all` |
-| `datacontract.yml` | [datacontract-cli](https://cli.datacontract.com/) lint of every contract, `breaking` against the base branch, and a block on deleting, renaming or retiring a contract that `RETIRED.md` on the base branch does not list. | `contracts_glob` (`contracts/*.odcs.yaml`), `datacontract_cli` (`1.2.8`), `lint_all` |
+| `datacontract.yml` | [datacontract-cli](https://cli.datacontract.com/) lint of every contract; each contract's columns and types against the real schema (`governance-check contract-schema`); an owner on every contract, and on every dbt model with a manifest (`governance-check owner`); `breaking` against the base branch, and a block on deleting, renaming or retiring a contract that `RETIRED.md` on the base branch does not list. When one of those breaks on a PR, one comment names each consumer the base copy of the contract lists. | `contracts_glob` (`contracts/*.odcs.yaml`), `datacontract_cli` (`1.2.8`), `lint_all`, `prisma_schema`, `dbt_manifest`, `dbt_catalog`, `dbt_artifact`, `open_consumer_issues` (`false`, needs the secret `CONSUMER_ISSUES_TOKEN`), `evidence_artifact` (`datacontract-evidence`), `gates_sha`, `fixture` (self-test only) |
 | `governance.yml` | Runs `scripts/governance-check.mjs` checks and records each result as an evidence entry. | `checks` (one `<plugin>:<skill>/<gate>=<arguments>` per line), `evidence_branch` (`governance-evidence`), `gates_sha` |
 
 `lint_all` lints every tracked file that matches instead of the PR's diff. The self-test uses it, and so can a repo adopting a gate for the first time.
@@ -34,7 +34,7 @@ jobs:
 Each workflow's header comment has its own stub.
 
 - The required-check name is `<caller job> / <called job>`: `squawk / squawk`, not `squawk`. A repo that switches from a copied workflow to the stub updates its branch protection in the same change, or every PR waits on "Expected".
-- A reusable workflow cannot exceed the caller's permissions. `dbt.yml` needs `id-token: write` in the stub, and `governance.yml` needs `contents: write` (used only on push and schedule, only for the evidence branch).
+- A reusable workflow cannot exceed the caller's permissions. `dbt.yml` needs `id-token: write` in the stub, `datacontract.yml` needs `pull-requests: write` (from v1.1.0, for the consumer notice), and `governance.yml` needs `contents: write` (used only on push and schedule, only for the evidence branch). A caller still on `contents: read` that bumps `datacontract.yml` to v1.1.0 fails to start until it adds `pull-requests: write`.
 - No workflow has a `paths:` filter, for the same "Expected" reason. Each job always runs and passes when there is nothing to check.
 
 ## Evidence
@@ -43,11 +43,24 @@ Each workflow's header comment has its own stub.
 
 `governance/evidence.json` is a JSON array of `{ "check", "date" (ISO 8601 UTC), "result", "run_link" (URL or null), "commit", "detail" }`. It only grows: the script reads, appends, verifies no earlier entry changed, and writes through a temp file. A file it cannot parse exits 4 and is left untouched. Exit 2 is a usage error. On push and schedule `governance.yml` commits the file to the `governance-evidence` branch, touching nothing else; on a pull request it uploads the would-be file as an artifact and writes no branch. The file records what ran and what it found. It does not say a repo is compliant.
 
+## Contract checks
+
+```
+node scripts/governance-check.mjs owner (--contracts <dir> | --contract <file> ...) [--manifest target/manifest.json]
+node scripts/governance-check.mjs contract-schema --contract <file> (--prisma prisma/schema.prisma | --manifest target/manifest.json [--catalog target/catalog.json])
+node scripts/governance-check.mjs consumers --contract <file> [--format lines|markdown] [--label <path>]
+```
+
+- **Owner** is an ODCS `team` member with `role: owner` and a `username`: `team: [{ username, role: owner }]` in ODCS v3.0.x, `team: { name, members: [...] }` from v3.1.0. A member whose `dateOut` has passed does not count. `datacontract lint` 1.2.8 rejects a top-level `owner:` key. With `--manifest`, every model of the project (not of installed packages) needs `meta.owner` or `config.meta.owner`.
+- **Consumers** are a top-level `customProperties` entry: `{ property: consumers, value: [{ repo: <owner/name>, team: <name or org/team> }] }`. `datacontract lint` 1.2.8 rejects a top-level `consumers:` key. A team written `org/team` is @-mentioned in the notice.
+- **contract-schema** fails when a contract column is missing from the table or model, when its `logicalType` cannot hold the schema's type, when its `physicalType` differs (Postgres for Prisma, including Prisma's defaults such as `DateTime` = `timestamp(3)`; the warehouse type for dbt), or when the contract says `required` and the schema allows null. A schema column the contract leaves out is a note, not a failure: a contract may publish a subset. For dbt, pass `--catalog` for the warehouse's real types; without it the YAML's `data_type` is used, and a typed contract column with no declared type fails as unverifiable.
+- YAML contracts are read with Python's PyYAML (installed with datacontract-cli). No PyYAML exits 2; `GOVERNANCE_PYTHON` picks the interpreter.
+
 ## What is in this repo
 
 - `.github/workflows/`: the gates above, and `self-test`, `fact-scan`, `zizmor` and `release`.
 - `scripts/`: `governance-check.mjs` (Node 20+, no dependencies), `next-tag.mjs`, `publish-evidence.sh`.
-- `test/`: `governance-check.test.mjs` (`node --test test/*.test.mjs`) and `run-blocks.mjs`, which runs each gate's `run:` blocks against `test/fixtures/` in a temp git repo (needs `bash`, `git`, `node`, and Python with PyYAML; `datacontract-cli` for the contract cases).
+- `test/`: `governance-check.test.mjs` (`node --test test/*.test.mjs`) and `run-blocks.mjs`, which runs each gate's `run:` blocks against `test/fixtures/` in a temp git repo, evaluating each step's `if:` and putting a recording stand-in for `gh` on the PATH (needs `bash`, `git`, `node`, and Python with PyYAML; `datacontract-cli` for the contract cases). A failing fixture carries `expect-log`, so it must fail for its stated reason.
 
 ## Rules for changes here
 

@@ -128,3 +128,385 @@ test("publish-evidence creates the branch, then appends to it, writing only that
   r = publish(f2);
   assert.match(r.stdout, /unchanged/);
 });
+
+// ---------------------------------------------------------------------------------------------------
+// owner, contract-schema, consumers. Most contracts here are .odcs.json so the logic is tested without
+// Python; the YAML path has its own test, which needs Python with PyYAML (CI installs datacontract-cli).
+
+const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "datacontract");
+const DBT = path.join(FIXTURES, "dbt-catalog-match", "head", "dbt");
+const write = (dir, rel, body) => {
+  const f = path.join(dir, rel);
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, typeof body === "string" ? body : JSON.stringify(body));
+  return f;
+};
+const OWNER_302 = [{ username: "data-platform", role: "owner" }];
+const contract = (extra = {}, props) => ({
+  apiVersion: "v3.0.2",
+  kind: "DataContract",
+  id: "urn:x",
+  version: "1.0.0",
+  status: "active",
+  team: OWNER_302,
+  schema: [
+    {
+      name: "orders",
+      properties: props ?? [
+        { name: "order_id", logicalType: "string", physicalType: "text", required: true },
+        { name: "status", logicalType: "string", physicalType: "text", required: true },
+        { name: "created_at", logicalType: "date", physicalType: "timestamp" },
+      ],
+    },
+  ],
+  ...extra,
+});
+const PRISMA = `datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Order {
+  id         String   @id @map("order_id") // the key
+  status     String
+  createdAt  DateTime @default(now()) @map("created_at")
+  homepage   String?  @default("https://example.test/a//b")
+  legacy     String   @ignore
+  customer   Customer @relation(fields: [customerId], references: [id])
+  customerId String   @map("customer_id") @db.VarChar(36)
+
+  @@map("orders")
+}
+
+model Customer {
+  id     String  @id
+  orders Order[]
+  @@map("customers")
+}
+`;
+const schemaRun = (d, c, src = ["--prisma", "schema.prisma"]) => {
+  write(d, "c.odcs.json", c);
+  return run(["contract-schema", "--contract", "c.odcs.json", ...src], d);
+};
+
+test("owner: a v3.0.2 team list with role owner passes", () => {
+  const d = tmp();
+  write(d, "contracts/a.odcs.json", contract());
+  const r = run(["owner", "--contracts", "contracts"], d);
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test("owner: a v3.1 team object with an owner member passes", () => {
+  const d = tmp();
+  write(d, "contracts/a.odcs.json", contract({ apiVersion: "v3.1.0", team: { name: "data", members: [{ username: "lead", role: "Owner" }] } }));
+  assert.equal(run(["owner", "--contracts", "contracts"], d).status, 0);
+});
+
+for (const [name, team] of [
+  ["no team", undefined],
+  ["only a steward", [{ username: "s", role: "data steward" }]],
+  ["an owner with no username", [{ role: "owner" }]],
+  ["an owner who left", [{ username: "gone", role: "owner", dateOut: "2020-01-31" }]],
+  ["a team name with no owner member", { name: "data", members: [{ username: "x", role: "engineer" }] }],
+]) {
+  test(`owner: ${name} fails and names the file`, () => {
+    const d = tmp();
+    const c = contract();
+    if (team === undefined) delete c.team;
+    else c.team = team;
+    write(d, "contracts/sub/a.odcs.json", c);
+    write(d, "contracts/b.odcs.json", contract());
+    const r = run(["owner", "--contracts", "contracts"], d);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /contracts[\\/]sub[\\/]a\.odcs\.json: no owner/);
+    assert.doesNotMatch(r.stderr, /b\.odcs\.json/);
+  });
+}
+
+test("owner: a top-level owner key does not count (datacontract lint rejects it)", () => {
+  const d = tmp();
+  const c = contract({ owner: "data-platform" });
+  delete c.team;
+  write(d, "contracts/a.odcs.json", c);
+  assert.equal(run(["owner", "--contracts", "contracts"], d).status, 1);
+});
+
+test("owner: --contract is repeatable and checks each file", () => {
+  const d = tmp();
+  const bad = contract();
+  delete bad.team;
+  write(d, "a.odcs.json", contract());
+  write(d, "b.odcs.json", bad);
+  const r = run(["owner", "--contract", "a.odcs.json", "--contract", "b.odcs.json"], d);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /b\.odcs\.json: no owner/);
+});
+
+test("owner: an empty contracts folder exits 2, never a green over nothing", () => {
+  const d = tmp();
+  fs.mkdirSync(path.join(d, "contracts"));
+  assert.equal(run(["owner", "--contracts", "contracts"], d).status, 2);
+  assert.equal(run(["owner", "--contracts", "missing"], d).status, 2);
+  assert.equal(run(["owner"], d).status, 2);
+  assert.equal(run(["owner", "--contract", "nope.odcs.json"], d).status, 2);
+});
+
+test("owner: a symlinked contract is a finding", { skip: process.platform === "win32" }, () => {
+  const d = tmp();
+  write(d, "elsewhere/a.odcs.json", contract());
+  fs.mkdirSync(path.join(d, "contracts"));
+  fs.symlinkSync(path.join(d, "elsewhere/a.odcs.json"), path.join(d, "contracts/a.odcs.json"));
+  const r = run(["owner", "--contracts", "contracts"], d);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /symlink/);
+});
+
+test("owner: every model of the project needs meta.owner; other packages are not checked", () => {
+  const d = tmp();
+  const m = JSON.parse(fs.readFileSync(path.join(DBT, "manifest.json"), "utf8"));
+  assert.equal(run(["owner", "--manifest", path.join(DBT, "manifest.json")], d).status, 0);
+  delete m.nodes["model.gates_fixture.stg_payments"].config.meta.owner;
+  delete m.nodes["model.gates_fixture.stg_payments"].meta.owner;
+  m.nodes["model.other_pkg.thing"] = { resource_type: "model", package_name: "other_pkg", name: "thing", config: { meta: {} }, meta: {} };
+  write(d, "manifest.json", m);
+  const r = run(["owner", "--manifest", "manifest.json"], d);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /model\.gates_fixture\.stg_payments: no meta\.owner/);
+  assert.doesNotMatch(r.stderr, /other_pkg/);
+});
+
+test("owner: config.meta.owner alone counts (dbt 1.10+ puts meta under config)", () => {
+  const d = tmp();
+  const m = JSON.parse(fs.readFileSync(path.join(DBT, "manifest.json"), "utf8"));
+  for (const n of Object.values(m.nodes)) {
+    n.meta = {};
+    n.config.meta = { owner: "x" };
+  }
+  write(d, "manifest.json", m);
+  assert.equal(run(["owner", "--manifest", "manifest.json"], d).status, 0);
+});
+
+test("owner: a manifest with no models of its project exits 2", () => {
+  const d = tmp();
+  write(d, "manifest.json", { metadata: { project_name: "p" }, nodes: { "model.q.a": { resource_type: "model", package_name: "q" } } });
+  assert.equal(run(["owner", "--manifest", "manifest.json"], d).status, 2);
+  write(d, "nodes.json", { metadata: {} });
+  assert.equal(run(["owner", "--manifest", "nodes.json"], d).status, 2);
+});
+
+test("contract-schema: a contract that matches the Prisma schema passes; relations, @ignore and comments are handled", () => {
+  const d = tmp();
+  write(d, "schema.prisma", PRISMA);
+  const r = schemaRun(d, contract());
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /agrees with schema\.prisma \(3 column\(s\)\)/);
+  assert.match(r.stdout, /not in the contract.*homepage, customer_id/);
+  assert.doesNotMatch(r.stdout, /legacy|customer,|customerId/);
+});
+
+test("contract-schema: a drifted (renamed) column fails", () => {
+  const d = tmp();
+  write(d, "schema.prisma", PRISMA.replace("  status     String\n", "  state      String\n"));
+  const r = schemaRun(d, contract());
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /orders\.status: in the contract, not in the schema/);
+});
+
+test("contract-schema: a column the schema ignores is not a column", () => {
+  const d = tmp();
+  write(d, "schema.prisma", PRISMA);
+  const r = schemaRun(d, contract({}, [{ name: "legacy", logicalType: "string" }]));
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /orders\.legacy: in the contract, not in the schema/);
+});
+
+test("contract-schema: a logical type disagreement fails", () => {
+  const d = tmp();
+  write(d, "schema.prisma", PRISMA.replace("id         String   @id", "id         Int      @id"));
+  const r = schemaRun(d, contract());
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /orders\.order_id: contract logicalType string, schema type Int \(integer\)/);
+  assert.match(r.stderr, /orders\.order_id: contract physicalType text, schema type integer/);
+});
+
+test("contract-schema: required in the contract, nullable in the schema, fails", () => {
+  const d = tmp();
+  write(d, "schema.prisma", PRISMA.replace("  status     String\n", "  status     String?\n"));
+  const r = schemaRun(d, contract());
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /orders\.status: the contract says required, the schema allows null/);
+});
+
+test("contract-schema: physical types compare with lengths, and Prisma's DateTime default is timestamp(3), not timestamptz", () => {
+  const d = tmp();
+  write(d, "schema.prisma", PRISMA);
+  let r = schemaRun(d, contract({}, [{ name: "customer_id", logicalType: "string", physicalType: "character varying(36)" }]));
+  assert.equal(r.status, 0, r.stderr);
+  r = schemaRun(d, contract({}, [{ name: "customer_id", logicalType: "string", physicalType: "varchar(50)" }]));
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /customer_id: contract physicalType varchar\(50\), schema type varchar\(36\)/);
+  r = schemaRun(d, contract({}, [{ name: "created_at", logicalType: "date", physicalType: "timestamptz" }]));
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /created_at: contract physicalType timestamptz, schema type timestamp\(3\)/);
+});
+
+test("contract-schema: a table the schema does not have fails", () => {
+  const d = tmp();
+  write(d, "schema.prisma", PRISMA);
+  const c = contract();
+  c.schema[0].name = "payments";
+  const r = schemaRun(d, c);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /payments: the contract describes it, the schema \(schema\.prisma\) has no such table/);
+});
+
+test("contract-schema: physicalName wins over name, and the model name matches too", () => {
+  const d = tmp();
+  write(d, "schema.prisma", PRISMA);
+  const c = contract();
+  c.schema[0].name = "Orders as published";
+  c.schema[0].physicalName = "orders";
+  assert.equal(schemaRun(d, c).status, 0);
+  c.schema[0].physicalName = "Order";
+  assert.equal(schemaRun(d, c).status, 0);
+});
+
+test("contract-schema: an unknown logical type fails", () => {
+  const d = tmp();
+  write(d, "schema.prisma", PRISMA);
+  const r = schemaRun(d, contract({}, [{ name: "status", logicalType: "text" }]));
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /not an ODCS logical type/);
+});
+
+test("contract-schema: on a provider other than Postgres the physical type is noted as not checked", () => {
+  const d = tmp();
+  write(d, "schema.prisma", PRISMA.replace('"postgresql"', '"mysql"'));
+  const r = schemaRun(d, contract());
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /physicalType text not checked/);
+});
+
+test("contract-schema: the dbt catalog is the real schema; a renamed column fails", () => {
+  const d = tmp();
+  const c = contract({}, [
+    { name: "order_id", logicalType: "integer", physicalType: "INTEGER" },
+    { name: "order_status", logicalType: "string", physicalType: "VARCHAR" },
+  ]);
+  c.schema[0].name = "fct_orders";
+  let r = schemaRun(d, c, ["--manifest", path.join(DBT, "manifest.json"), "--catalog", path.join(DBT, "catalog.json")]);
+  assert.equal(r.status, 0, r.stderr);
+  const cat = JSON.parse(fs.readFileSync(path.join(DBT, "catalog.json"), "utf8"));
+  const cols = cat.nodes["model.gates_fixture.fct_orders"].columns;
+  cols.status = { ...cols.order_status, name: "status" };
+  delete cols.order_status;
+  write(d, "catalog.json", cat);
+  r = schemaRun(d, c, ["--manifest", path.join(DBT, "manifest.json"), "--catalog", "catalog.json"]);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /fct_orders\.order_status: in the contract, not in the schema/);
+});
+
+test("contract-schema: a manifest with no data_type and no catalog cannot vouch for a type", () => {
+  const d = tmp();
+  const c = contract({}, [{ name: "order_id", logicalType: "integer" }]);
+  c.schema[0].name = "fct_orders";
+  const r = schemaRun(d, c, ["--manifest", path.join(DBT, "manifest.json")]);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /cannot be compared/);
+});
+
+test("contract-schema: manifest data_type is used when declared; warehouse names fold case", () => {
+  const d = tmp();
+  const c = contract({}, [{ name: "ORDER_ID", logicalType: "integer", physicalType: "integer" }]);
+  c.schema[0].name = "stg_orders";
+  assert.equal(schemaRun(d, c, ["--manifest", path.join(DBT, "manifest.json")]).status, 0);
+  c.schema[0].properties[0].logicalType = "string";
+  assert.equal(schemaRun(d, c, ["--manifest", path.join(DBT, "manifest.json")]).status, 1);
+});
+
+test("contract-schema: a model missing from the catalog fails", () => {
+  const d = tmp();
+  const cat = JSON.parse(fs.readFileSync(path.join(DBT, "catalog.json"), "utf8"));
+  delete cat.nodes["model.gates_fixture.fct_orders"];
+  write(d, "catalog.json", cat);
+  const c = contract({}, [{ name: "order_id", logicalType: "integer" }]);
+  c.schema[0].name = "fct_orders";
+  const r = schemaRun(d, c, ["--manifest", path.join(DBT, "manifest.json"), "--catalog", "catalog.json"]);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /not in the catalog/);
+});
+
+test("logicalFromPhysical: NUMBER(38,0) holds integers, NUMBER(10,2) does not", async () => {
+  const { logicalFromPhysical } = await import("../scripts/governance-check.mjs");
+  assert.deepEqual(logicalFromPhysical("NUMBER(38,0)"), ["integer", "number"]);
+  assert.deepEqual(logicalFromPhysical("NUMBER(10,2)"), ["number"]);
+  assert.deepEqual(logicalFromPhysical("INT64"), ["integer"]);
+  assert.deepEqual(logicalFromPhysical("ARRAY<STRING>"), ["array"]);
+  assert.deepEqual(logicalFromPhysical("STRUCT<a INT64>"), ["object"]);
+  assert.deepEqual(logicalFromPhysical("timestamp with time zone"), ["date", "timestamp", "time"]);
+  assert.equal(logicalFromPhysical("geheim"), null);
+});
+
+test("contract-schema: usage errors exit 2", () => {
+  const d = tmp();
+  write(d, "schema.prisma", PRISMA);
+  write(d, "c.odcs.json", contract());
+  assert.equal(run(["contract-schema", "--prisma", "schema.prisma"], d).status, 2);
+  assert.equal(run(["contract-schema", "--contract", "c.odcs.json"], d).status, 2);
+  assert.equal(run(["contract-schema", "--contract", "c.odcs.json", "--prisma", "schema.prisma", "--manifest", "m.json"], d).status, 2);
+  assert.equal(run(["contract-schema", "--contract", "c.odcs.json", "--prisma", "schema.prisma", "--catalog", "c.json"], d).status, 2);
+  assert.equal(run(["contract-schema", "--contract", "c.odcs.json", "--prisma", "missing.prisma"], d).status, 2);
+  assert.equal(run(["contract-schema", "--contract", "c.odcs.json", "--prisma", "schema.prisma", "--prisma", "schema.prisma"], d).status, 2);
+  assert.equal(run(["contract-schema", "--contract", "--prisma", "schema.prisma"], d).status, 2);
+});
+
+test("contract-schema: a contract with no schema objects fails", () => {
+  const d = tmp();
+  write(d, "schema.prisma", PRISMA);
+  const c = contract();
+  c.schema = [];
+  assert.equal(schemaRun(d, c).status, 1);
+});
+
+test("consumers: lines, markdown with a team mention and a repo link, and the empty case", () => {
+  const d = tmp();
+  const c = contract({ customProperties: [{ property: "consumers", value: [{ repo: "example-org/billing", team: "example-org/billing-team" }, { team: "Finance *analysts*" }] }] });
+  write(d, "c.odcs.json", c);
+  let r = run(["consumers", "--contract", "c.odcs.json"], d);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, "example-org/billing\texample-org/billing-team\n\tFinance *analysts*\n");
+  r = run(["consumers", "--contract", "c.odcs.json", "--format", "markdown", "--label", "contracts/orders.odcs.yaml"], d);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /- \[example-org\/billing\]\(https:\/\/github\.com\/example-org\/billing\) · @example-org\/billing-team/);
+  assert.match(r.stdout, /- Finance \\\*analysts\\\*/);
+  assert.match(r.stdout, /Owner: data-platform/);
+  write(d, "none.odcs.json", contract());
+  r = run(["consumers", "--contract", "none.odcs.json", "--format", "markdown"], d);
+  assert.match(r.stdout, /lists no consumers/);
+});
+
+test("consumers: a malformed list exits 1; a bad repo is not linked", () => {
+  const d = tmp();
+  write(d, "c.odcs.json", contract({ customProperties: [{ property: "consumers", value: [{ repo: "not a repo; rm -rf /" }] }] }));
+  const r = run(["consumers", "--contract", "c.odcs.json"], d);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /not owner\/name/);
+  write(d, "d.odcs.json", contract({ customProperties: [{ property: "consumers", value: "billing" }] }));
+  assert.equal(run(["consumers", "--contract", "d.odcs.json"], d).status, 1);
+  assert.equal(run(["consumers", "--contract", "d.odcs.json", "--format", "html"], d).status, 2);
+});
+
+test("YAML contracts are read through PyYAML, and a missing interpreter exits 2", () => {
+  const d = tmp();
+  const yaml = "apiVersion: v3.0.2\nkind: DataContract\nid: urn:x\nversion: 1.0.0\nstatus: active\nteam:\n  - username: a\n    role: owner\n    dateIn: 2024-01-01\n";
+  write(d, "contracts/a.odcs.yaml", yaml);
+  const r = run(["owner", "--contracts", "contracts"], d);
+  assert.equal(r.status, 0, r.stderr);
+  const r2 = spawnSync(process.execPath, [SCRIPT, "owner", "--contracts", "contracts"], { cwd: d, encoding: "utf8", env: { ...process.env, GOVERNANCE_PYTHON: path.join(d, "no-such-python") } });
+  assert.equal(r2.status, 2);
+  assert.match(r2.stderr, /needs Python with PyYAML/);
+  write(d, "bad/b.odcs.yaml", "team: [unclosed\n");
+  const r3 = run(["owner", "--contracts", "bad"], d);
+  assert.equal(r3.status, 1);
+  assert.match(r3.stderr, /not valid YAML/);
+});

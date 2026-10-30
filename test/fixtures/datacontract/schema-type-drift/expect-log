@@ -1,0 +1,2 @@
+orders.order_id: contract logicalType string, schema type Int (integer)
+orders.order_id: contract physicalType text, schema type integer

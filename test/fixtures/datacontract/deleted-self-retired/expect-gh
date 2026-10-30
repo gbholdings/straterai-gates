@@ -1,0 +1,4 @@
+gh api -X POST repos/example-org/gates-under-test/issues/7/comments
+<!-- straterai-gates:datacontract-consumers -->
+Why: deleted or renamed
+- [example-org/billing](https://github.com/example-org/billing) · @example-org/billing-team

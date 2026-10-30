@@ -1,0 +1,2 @@
+gh api -X PATCH repos/example-org/gates-under-test/issues/comments/99
+Why: datacontract breaking reports a breaking change

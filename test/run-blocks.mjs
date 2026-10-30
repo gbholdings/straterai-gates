@@ -3,13 +3,25 @@
 //
 // For each fixture case under test/fixtures/<dir>/<case>/ it builds a temp git repo: `base/` becomes
 // origin/main, `head/` becomes the PR branch on top. Then it runs the gate's named steps, in order, with
-// `bash -e` as GitHub does, using the workflow's own env and input defaults. The first nonzero step stops
-// the case, as on a runner. A case may carry `inputs.json` (input overrides), `links` (lines of
-// "<path> <target>" committed as symlinks in head) and `expect-output` (lines that must appear in
-// $GITHUB_OUTPUT).
+// `bash -e` as GitHub does, using the workflow's own env and input defaults. Each step's `if:` is
+// evaluated as GitHub would (success() by default, so a failed step skips the rest unless their `if:`
+// says otherwise), each step gets its own GITHUB_OUTPUT, and GITHUB_ENV carries into later steps. Every
+// case gets its own RUNNER_TEMP, and the repo gets this checkout's scripts/ under .gates/, as the
+// workflows' "Check out the gates" step does.
 //
-// Expressions are resolved the narrow way these workflows use them: inputs.<name>, github.base_ref
-// (main here) and nothing else (vars.* and secrets.* are empty).
+// A case may carry:
+//   expect          the job result: 0 passes, anything else fails (any nonzero step)
+//   inputs.json     input overrides
+//   event.json      { "event_name": ..., "pr_number": ... } (default pull_request, 7)
+//   links           lines of "<path> <target>" committed as symlinks in head
+//   expect-output   lines that must appear in some step's GITHUB_OUTPUT
+//   expect-log      lines that must each appear in the log, so a failing case fails for its stated reason
+//   expect-gh       lines that must each appear in the fake `gh` log (its argv, and any -F body=@file)
+//   secrets.json    secrets the workflow sees (default none)
+//   expect-evidence lines that must each appear in the datacontract evidence file
+//   gh-responses    lines of "<argv substring>\t<stdout>" the fake `gh` answers with (first match wins)
+//
+// Expressions are resolved the narrow way these workflows use them; anything else throws.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -32,8 +44,18 @@ const GATES = [
     name: "datacontract",
     workflow: "datacontract.yml",
     fixtures: "datacontract",
-    steps: ["Did a contract change?", "Lint every contract", "Breaking changes, deletions and retirements"],
+    steps: [
+      "Build the fixture repository",
+      "Did a contract change?",
+      "Lint every contract",
+      "Contracts match the schema",
+      "Every contract has an owner",
+      "Breaking changes, deletions and retirements",
+      "Tell the consumers",
+      "Record evidence",
+    ],
     inputs: {},
+    gates: true,
   },
   {
     name: "dbt (change detection)",
@@ -58,17 +80,147 @@ function load(workflow) {
   return JSON.parse(r.stdout);
 }
 
-function resolve(value, inputs) {
+// ---------------------------------------------------------------------------------------------------
+// GitHub expressions, the subset these workflows use: literals ('x', true, false, numbers), context
+// paths (inputs.*, steps.<id>.outputs.<k>, steps.<id>.outcome, github.*, env.*, secrets.*, job.*,
+// runner.*), ==, !=, !, &&, ||, parentheses, and the status functions. && and || return an operand,
+// as GitHub's do. Equality is loose the way GitHub's is for these types: '' == false, 'true' != true.
+
+function tokenize(src) {
+  const toks = [];
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (/\s/.test(c)) { i++; continue; }
+    if (c === "'") {
+      let j = i + 1, s = "";
+      for (;;) {
+        if (j >= src.length) throw new Error(`unterminated string in: ${src}`);
+        if (src[j] === "'" && src[j + 1] === "'") { s += "'"; j += 2; continue; }
+        if (src[j] === "'") break;
+        s += src[j++];
+      }
+      toks.push({ t: "str", v: s });
+      i = j + 1;
+      continue;
+    }
+    const two = src.slice(i, i + 2);
+    if (["==", "!=", "&&", "||"].includes(two)) { toks.push({ t: "op", v: two }); i += 2; continue; }
+    if ("!()".includes(c)) { toks.push({ t: "op", v: c }); i++; continue; }
+    const m = /^[A-Za-z_][A-Za-z0-9_.-]*|^\d+(\.\d+)?/.exec(src.slice(i));
+    if (!m) throw new Error(`cannot read expression at "${src.slice(i)}"`);
+    toks.push({ t: "id", v: m[0] });
+    i += m[0].length;
+  }
+  return toks;
+}
+
+function evaluate(src, ctx) {
+  const toks = tokenize(src);
+  let p = 0;
+  const peek = () => toks[p];
+  const eat = (v) => {
+    const t = toks[p];
+    if (!t || t.v !== v) throw new Error(`expected ${v} in: ${src}`);
+    p++;
+  };
+  const truthy = (v) => !(v === false || v === null || v === undefined || v === "" || v === 0);
+  const eq = (a, b) => {
+    if (typeof a === typeof b) return a === b;
+    const num = (x) => (x === true ? 1 : x === false || x === null || x === "" ? 0 : Number(x));
+    return num(a) === num(b);
+  };
+  function primary() {
+    const t = peek();
+    if (!t) throw new Error(`unexpected end of: ${src}`);
+    if (t.v === "(") { p++; const v = or(); eat(")"); return v; }
+    if (t.v === "!") { p++; return !truthy(primary()); }
+    p++;
+    if (t.t === "str") return t.v;
+    if (t.v === "true") return true;
+    if (t.v === "false") return false;
+    if (t.v === "null") return null;
+    if (/^\d/.test(t.v)) return Number(t.v);
+    if (peek()?.v === "(") {
+      eat("(");
+      eat(")");
+      if (!(t.v in ctx.fns)) throw new Error(`unsupported function ${t.v}() in: ${src}`);
+      return ctx.fns[t.v]();
+    }
+    return ctx.lookup(t.v, src);
+  }
+  function cmp() {
+    let v = primary();
+    while (peek() && (peek().v === "==" || peek().v === "!=")) {
+      const op = toks[p++].v;
+      const r = primary();
+      v = op === "==" ? eq(v, r) : !eq(v, r);
+    }
+    return v;
+  }
+  function and() {
+    let v = cmp();
+    while (peek()?.v === "&&") { p++; const r = cmp(); v = truthy(v) ? r : v; }
+    return v;
+  }
+  function or() {
+    let v = and();
+    while (peek()?.v === "||") { p++; const r = and(); v = truthy(v) ? v : r; }
+    return v;
+  }
+  const v = or();
+  if (p !== toks.length) throw new Error(`trailing tokens in: ${src}`);
+  return { value: v, truthy: truthy(v), usesStatus: toks.some((t, i) => t.t === "id" && ["always", "failure", "cancelled", "success"].includes(t.v) && toks[i + 1]?.v === "(") };
+}
+
+function makeLookup(inputs, ctx) {
+  return (name, src) => {
+    const parts = name.split(".");
+    switch (parts[0]) {
+      case "inputs":
+        return inputs[parts[1]] ?? "";
+      case "steps": {
+        const s = ctx.steps[parts[1]];
+        if (!s) return "";
+        if (parts[2] === "outcome" || parts[2] === "conclusion") return s.outcome;
+        if (parts[2] === "outputs") return s.outputs[parts[3]] ?? "";
+        break;
+      }
+      case "github":
+        if (parts[1] === "base_ref") return "main";
+        if (parts[1] === "event_name") return ctx.event.event_name;
+        if (parts[1] === "repository") return "example-org/gates-under-test";
+        if (parts[1] === "workspace") return fwd(ctx.repo);
+        if (parts[1] === "server_url") return "https://github.example.test";
+        if (parts[1] === "run_id") return "4242";
+        if (parts[1] === "sha") return "fake-head-sha";
+        if (parts[1] === "token") return "fake-token";
+        if (parts[1] === "event" && parts[2] === "pull_request" && parts[3] === "number") return String(ctx.event.pr_number);
+        if (parts[1] === "event") return "";
+        return "";
+      case "env":
+        return ctx.env[parts[1]] ?? "";
+      case "secrets":
+        return ctx.secrets[parts[1]] ?? "";
+      case "vars":
+      case "job":
+      case "runner":
+        return "";
+    }
+    throw new Error(`unsupported expression: ${name} in: ${src}`);
+  };
+}
+
+// ${{ expr }} inside a string, as in env: values and with: inputs.
+function interpolate(value, lookupCtx) {
   if (typeof value !== "string") return String(value);
   return value.replace(/\$\{\{\s*([^}]*?)\s*\}\}/g, (_, expr) => {
-    let m;
-    if ((m = /^inputs\.(\w+)$/.exec(expr))) return String(inputs[m[1]] ?? "");
-    if (expr === "github.base_ref") return "main";
-    if (/^(vars|secrets|github)\./.test(expr)) return "";
-    // A composite such as "squawk-cli@${{ inputs.x }}" is handled by the outer replace; anything else is unsupported.
-    throw new Error(`unsupported expression: ${expr}`);
+    const v = evaluate(expr, lookupCtx).value;
+    return v === null || v === undefined ? "" : String(v);
   });
 }
+
+// ---------------------------------------------------------------------------------------------------
 
 function sh(cmd, args, cwd, env) {
   const r = spawnSync(cmd, args, { cwd, env: { ...process.env, ...env }, encoding: "utf8" });
@@ -80,8 +232,9 @@ function copyTree(from, to) {
   if (fs.existsSync(from)) fs.cpSync(from, to, { recursive: true });
 }
 
-function buildRepo(caseDir) {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "blocks-"));
+function buildRepo(caseDir, work) {
+  const repo = path.join(work, "repo");
+  fs.mkdirSync(repo);
   const git = (...a) => sh("git", a, repo, { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.test", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.test" });
   git("init", "-q", "-b", "main");
   git("config", "core.autocrlf", "false");
@@ -107,66 +260,152 @@ function buildRepo(caseDir) {
   return repo;
 }
 
+// A stand-in for the GitHub CLI: logs its argv (and the file behind any -F body=@file) and prints the
+// first canned response whose key is a substring of its argv, or nothing.
+function fakeGh(work, caseDir) {
+  const bin = path.join(work, "bin");
+  fs.mkdirSync(bin);
+  const log = path.join(work, "gh.log");
+  const responses = path.join(caseDir, "gh-responses");
+  const script = `#!/usr/bin/env node
+const fs = require("fs");
+const argv = process.argv.slice(2);
+let out = "gh " + argv.join(" ") + "\\n";
+for (const a of argv) { const m = /^body=@(.*)$/.exec(a); if (m) out += fs.readFileSync(m[1], "utf8") + "\\n"; }
+const bf = argv.indexOf("--body-file"); if (bf >= 0) out += fs.readFileSync(argv[bf + 1], "utf8") + "\\n";
+fs.appendFileSync(${JSON.stringify(fwd(log))}, out);
+const r = ${JSON.stringify(fwd(responses))};
+if (fs.existsSync(r)) {
+  for (const line of fs.readFileSync(r, "utf8").split("\\n").filter(Boolean)) {
+    const [key, ...rest] = line.split("\\t");
+    if (argv.join(" ").includes(key)) { process.stdout.write(rest.join("\\t").replace(/\\\\n/g, "\\n") + "\\n"); break; }
+  }
+}
+`;
+  fs.writeFileSync(path.join(bin, "gh"), script, { mode: 0o755 });
+  fs.writeFileSync(log, "");
+  return { bin, log };
+}
+
+function lines(file) {
+  return fs.existsSync(file) ? fs.readFileSync(file, "utf8").split("\n").map((l) => l.replace(/\r$/, "")).filter(Boolean) : [];
+}
+
 function runCase(gate, wf, caseName) {
   const caseDir = path.join(FIX, gate.fixtures, caseName);
   const inputs = { ...wf.inputs, ...gate.inputs };
   const overrides = path.join(caseDir, "inputs.json");
   if (fs.existsSync(overrides)) Object.assign(inputs, JSON.parse(fs.readFileSync(overrides, "utf8")));
-  const repo = buildRepo(caseDir);
-  const out = path.join(repo, "..", `${path.basename(repo)}.out`);
-  fs.writeFileSync(out, "");
-  const baseEnv = {};
-  for (const [k, v] of Object.entries(wf.env)) baseEnv[k] = resolve(v, inputs);
+  const eventFile = path.join(caseDir, "event.json");
+  const event = { event_name: "pull_request", pr_number: 7, ...(fs.existsSync(eventFile) ? JSON.parse(fs.readFileSync(eventFile, "utf8")) : {}) };
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "blocks-"));
+  const runnerTemp = path.join(work, "runner-temp");
+  fs.mkdirSync(runnerTemp);
+  const repo = buildRepo(caseDir, work);
+  if (gate.gates) fs.cpSync(path.join(ROOT, "scripts"), path.join(repo, ".gates", "scripts"), { recursive: true });
+  const gh = fakeGh(work, caseDir);
+
+  const secretsFile = path.join(caseDir, "secrets.json");
+  const secrets = fs.existsSync(secretsFile) ? JSON.parse(fs.readFileSync(secretsFile, "utf8")) : {};
+  const ctx = { steps: {}, event, repo, env: {}, secrets };
+  let failed = false;
+  ctx.fns = { success: () => !failed, failure: () => failed, always: () => true, cancelled: () => false };
+  const exprCtx = { fns: ctx.fns, lookup: makeLookup(inputs, ctx) };
+
+  const jobEnv = {};
+  for (const [k, v] of Object.entries(wf.env)) jobEnv[k] = interpolate(v, exprCtx);
+  ctx.env = { ...jobEnv };
+  const carried = {};
   let code = 0;
   let log = "";
-  for (const step of wf.steps) {
-    if (!step.run || !gate.steps.includes(step.name)) continue;
-    const output = fs.readFileSync(out, "utf8");
+  let outputs = "";
+  wf.steps.forEach((step, i) => {
+    if (!step.run || !gate.steps.includes(step.name)) return;
+    const id = step.id ?? `__step${i}`;
+    let run;
     if (step.if) {
-      if (step.if.includes("steps.changes.outputs.changed == 'true'") && !output.includes("changed=true")) continue;
-      if (step.if.includes("inputs.lint_all != true") && String(inputs.lint_all) === "true") continue;
+      const cond = String(step.if).replace(/^\s*\$\{\{\s*/, "").replace(/\s*\}\}\s*$/, "");
+      const r = evaluate(cond, exprCtx);
+      run = r.usesStatus ? r.truthy : !failed && r.truthy;
+    } else run = !failed;
+    if (!run) {
+      ctx.steps[id] = { outcome: "skipped", outputs: {} };
+      log += `--- ${step.name} (skipped)\n`;
+      return;
     }
-    const env = { ...baseEnv, GITHUB_OUTPUT: fwd(out), RUNNER_TEMP: fwd(os.tmpdir()) };
-    for (const [k, v] of Object.entries(step.env)) env[k] = resolve(v, inputs);
-    const script = path.join(repo, "..", `${path.basename(repo)}.sh`);
+    const out = path.join(work, `${id}.out`);
+    const envFile = path.join(work, `${id}.env`);
+    fs.writeFileSync(out, "");
+    fs.writeFileSync(envFile, "");
+    const env = { ...jobEnv, ...carried, GITHUB_OUTPUT: fwd(out), GITHUB_ENV: fwd(envFile), RUNNER_TEMP: fwd(runnerTemp), GITHUB_WORKSPACE: fwd(repo), PATH: `${gh.bin}${path.delimiter}${process.env.PATH}` };
+    ctx.env = env;
+    for (const [k, v] of Object.entries(step.env)) env[k] = interpolate(v, exprCtx);
+    const script = path.join(work, `${id}.sh`);
     fs.writeFileSync(script, step.run);
     const r = spawnSync("bash", ["-e", fwd(script)], { cwd: repo, env: { ...process.env, ...env }, encoding: "utf8", timeout: 300000 });
     log += `--- ${step.name} (exit ${r.status})\n${r.stdout}${r.stderr}`;
-    if (r.status !== 0) {
-      code = r.status ?? 1;
-      break;
+    const stepOutputs = {};
+    for (const l of lines(out)) {
+      const eq = l.indexOf("=");
+      if (eq > 0) stepOutputs[l.slice(0, eq)] = l.slice(eq + 1);
     }
+    outputs += fs.readFileSync(out, "utf8");
+    for (const l of lines(envFile)) {
+      const eq = l.indexOf("=");
+      if (eq > 0) carried[l.slice(0, eq)] = l.slice(eq + 1);
+    }
+    ctx.steps[id] = { outcome: r.status === 0 ? "success" : "failure", outputs: stepOutputs };
+    if (r.status !== 0) {
+      failed = true;
+      if (!code) code = r.status ?? 1;
+    }
+  });
+  let expectOk = true;
+  const want = (file, haystack, what) => {
+    const missing = lines(path.join(caseDir, file)).filter((l) => !haystack.includes(l));
+    if (missing.length) {
+      expectOk = false;
+      log += `--- expected ${what} to contain:\n${missing.join("\n")}\n`;
+    }
+  };
+  want("expect-output", outputs.split("\n").map((l) => `${l}\n`).join(""), "a step's GITHUB_OUTPUT");
+  want("expect-log", log, "the log");
+  const ghLog = fs.readFileSync(gh.log, "utf8");
+  want("expect-gh", ghLog, "the gh calls");
+  // A case that expects no gh call gets none: a notice on a passing PR is a bug.
+  if (!fs.existsSync(path.join(caseDir, "expect-gh")) && ghLog) {
+    expectOk = false;
+    log += `--- expected no gh calls, got:
+${ghLog}`;
   }
-  const outputFile = path.join(caseDir, "expect-output");
-  let outputOk = true;
-  if (fs.existsSync(outputFile)) {
-    const got = fs.readFileSync(out, "utf8");
-    outputOk = fs.readFileSync(outputFile, "utf8").split("\n").filter(Boolean).every((l) => got.split("\n").includes(l));
-    if (!outputOk) log += `--- expected GITHUB_OUTPUT to contain:\n${fs.readFileSync(outputFile, "utf8")}got:\n${got}\n`;
-  }
-  fs.rmSync(repo, { recursive: true, force: true });
-  return { code, outputOk, log };
+  if (fs.existsSync(path.join(caseDir, "expect-gh"))) log += `--- gh calls\n${ghLog}`;
+  const evidence = path.join(runnerTemp, "datacontract-evidence", "evidence.json");
+  if (fs.existsSync(evidence)) log += `--- evidence\n${fs.readFileSync(evidence, "utf8")}`;
+  want("expect-evidence", fs.existsSync(evidence) ? fs.readFileSync(evidence, "utf8") : "", "the evidence file");
+  fs.rmSync(work, { recursive: true, force: true });
+  return { code, expectOk, log };
 }
 
-let failed = 0;
+let failedCases = 0;
 const only = process.argv[2];
+const verbose = process.argv.includes("--verbose");
 for (const gate of GATES) {
-  if (only && !gate.name.startsWith(only)) continue;
+  if (only && only !== "--verbose" && !gate.name.startsWith(only)) continue;
   const wf = load(gate.workflow);
   for (const caseName of fs.readdirSync(path.join(FIX, gate.fixtures)).sort()) {
     if (!fs.statSync(path.join(FIX, gate.fixtures, caseName)).isDirectory()) continue;
     const want = Number(fs.readFileSync(path.join(FIX, gate.fixtures, caseName, "expect"), "utf8").trim());
     const r = runCase(gate, wf, caseName);
-    // Exit codes compare as pass or fail: a gate that fails may fail with any nonzero code.
-    const ok = (want === 0 ? r.code === 0 : r.code !== 0) && r.outputOk;
+    // Exit codes compare as pass or fail; expect-log pins down why a failing case failed.
+    const ok = (want === 0 ? r.code === 0 : r.code !== 0) && r.expectOk;
     console.log(`${ok ? "ok  " : "FAIL"} ${gate.name} / ${caseName} (want ${want}, got ${r.code})`);
-    if (!ok) {
-      failed++;
+    if (!ok || verbose) {
+      if (!ok) failedCases++;
       console.log(r.log);
     }
   }
 }
-if (failed) {
-  console.log(`${failed} fixture case(s) failed`);
+if (failedCases) {
+  console.log(`${failedCases} fixture case(s) failed`);
   process.exit(1);
 }

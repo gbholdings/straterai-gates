@@ -1,0 +1,2 @@
+contract-schema: contracts/orders.odcs.yaml agrees with prisma/schema.prisma (3 column(s))
+note: orders: in the schema, not in the contract (not published, not a failure): customer_id

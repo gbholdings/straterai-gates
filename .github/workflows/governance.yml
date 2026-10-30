@@ -18,7 +18,7 @@
 #       uses: gbholdings/straterai-gates/.github/workflows/governance.yml@<40-char sha> # v1.0.0
 #       with:
 #         checks: |
-#           data:data-contract/owner=owner --contracts contracts/ --manifest target/manifest.json
+#           governance:data-contract/owner=owner --contracts contracts --manifest target/manifest.json
 #
 # Each line of `checks` is `<plugin>:<skill>/<gate>=<subcommand and arguments>`, split on spaces (no
 # quoting) and run as `node governance-check.mjs <arguments>` in the caller's checkout. Exit 0 records
