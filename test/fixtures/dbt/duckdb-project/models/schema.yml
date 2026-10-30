@@ -1,0 +1,14 @@
+version: 2
+models:
+  - name: stg_orders
+    columns:
+      - name: order_id
+        data_tests: [not_null, unique]
+  - name: stg_payments
+    columns:
+      - name: order_id
+        data_tests: [not_null]
+  - name: fct_orders
+    columns:
+      - name: order_id
+        data_tests: [not_null, unique]

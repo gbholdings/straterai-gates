@@ -1,0 +1,11 @@
+name: gates_fixture
+version: "1.0.0"
+config-version: 2
+profile: gates_fixture
+model-paths: ["models"]
+models:
+  gates_fixture:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

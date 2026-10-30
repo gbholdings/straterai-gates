@@ -1,0 +1,74 @@
+# Reusable gate: squawk lint over the migrations a pull request adds or changes.
+#
+# Caller stub (make "squawk / squawk" the required check; the name is caller job / called job):
+#
+#   name: squawk
+#   on: pull_request
+#   permissions:
+#     contents: read
+#   jobs:
+#     squawk:
+#       uses: gbholdings/straterai-gates/.github/workflows/squawk.yml@<40-char sha> # v1.0.0
+#       with:
+#         migration_globs: ":(glob)prisma/migrations/**/migration.sql :(glob)migrations/**/*.sql"
+#
+# No `paths:` filter on purpose: a required check from a path-filtered workflow never reports on a PR
+# outside those paths, and that PR waits on "Expected" forever. The job always runs and passes when the
+# PR adds or changes no migration.
+#
+# squawk reads the SQL as written: SQL built at run time (a DO block, EXECUTE format(...)) is not seen.
+# Read those by eye. The destructive-change approval guard is not in this release.
+name: squawk
+on:
+  workflow_call:
+    inputs:
+      migration_globs:
+        description: "Space-separated git pathspecs for migration files. Use :(glob) so ** also matches zero folders."
+        type: string
+        default: ":(glob)prisma/migrations/**/migration.sql :(glob)migrations/**/*.sql :(glob)db/migrations/**/*.sql :(glob)db/migrate/**/*.sql"
+      squawk_version:
+        description: "squawk-cli version from npm."
+        type: string
+        default: "2.70.0"
+      config_path:
+        description: "Path of the repo's squawk config."
+        type: string
+        default: ".squawk.toml"
+      lint_all:
+        description: "Lint every tracked file that matches, not only the PR's changes. For self-tests and first adoption."
+        type: boolean
+        default: false
+permissions: {}
+jobs:
+  squawk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      BASE_REF: ${{ github.base_ref }}
+      MIGRATION_GLOBS: ${{ inputs.migration_globs }}
+      SQUAWK: "squawk-cli@${{ inputs.squawk_version }}"
+      CONFIG_PATH: ${{ inputs.config_path }}
+      LINT_ALL: ${{ inputs.lint_all }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Lint changed migrations
+        run: |
+          set -uo pipefail
+          # The globs are a space-separated pathspec list on purpose, so $MIGRATION_GLOBS stays unquoted.
+          if [ "$LINT_ALL" = "true" ]; then
+            files=$(git -c core.attributesFile=/dev/null ls-files -- $MIGRATION_GLOBS)
+          else
+            BASE="origin/$BASE_REF"
+            git rev-parse -q --verify "$BASE^{commit}" >/dev/null || { echo "::error::cannot resolve $BASE"; exit 1; }
+            files=$(git -c core.attributesFile=/dev/null diff --name-only --no-renames --diff-filter=AM "$BASE...HEAD" -- $MIGRATION_GLOBS)
+          fi
+          if [ -z "$files" ]; then echo "no migration files changed"; exit 0; fi
+          npx --yes "$SQUAWK" -c "$CONFIG_PATH" $files

@@ -1,0 +1,1 @@
+- contracts/orders.odcs.yaml: replaced by orders v2

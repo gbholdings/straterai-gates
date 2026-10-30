@@ -1,0 +1,127 @@
+# Reusable gate: sqlfluff, then `dbt build --target ci`, against a CI-only database. Nothing here runs
+# against prod. Keep every version pinned.
+#
+# Caller stub (make "dbt / dbt" the required check). A reusable workflow cannot exceed the caller's
+# permissions, so the stub declares id-token: write even when auth is none:
+#
+#   name: dbt
+#   on: pull_request
+#   permissions:
+#     contents: read
+#     id-token: write
+#   jobs:
+#     dbt:
+#       uses: gbholdings/straterai-gates/.github/workflows/dbt.yml@<40-char sha> # v1.0.0
+#       with:
+#         workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+#         service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+#
+# Setup, once per repo:
+#   1. Put a profiles.yml in <dbt project>/ci/ (profile name = `profile:` in dbt_project.yml, target `ci`).
+#   2. Repo variables DBT_CI_PROJECT and DBT_CI_DATASET: the CI-only project and dataset dbt may write to.
+#   3. For auth=wif-google: let the CI service account write only to the CI dataset, and trust only this
+#      repo (attribute condition on the provider). No key file, no secret: the job gets a short-lived
+#      token from GitHub's OIDC. A PR from a fork gets no token and fails at the auth step.
+#
+# No `paths:` filter on purpose (a required check from a path-filtered workflow waits on "Expected"
+# forever). The job always runs; its first step works out whether a dbt file changed, and the rest are
+# skipped (the job still passes) when none did.
+name: dbt
+on:
+  workflow_call:
+    inputs:
+      dbt_project_dir:
+        description: "The folder holding dbt_project.yml."
+        type: string
+        default: "."
+      adapter_package:
+        description: "Adapter requirement, pinned, for pip."
+        type: string
+        default: "dbt-bigquery==1.12.1"
+      dbt_core:
+        type: string
+        default: "1.12.6"
+      sqlfluff:
+        type: string
+        default: "4.4.0"
+      auth:
+        description: "wif-google for keyless Google Cloud auth, or none."
+        type: string
+        default: "wif-google"
+      workload_identity_provider:
+        description: "Full resource name of the workload identity provider (auth=wif-google)."
+        type: string
+        default: ""
+      service_account:
+        description: "CI service account email (auth=wif-google)."
+        type: string
+        default: ""
+      lint_all:
+        description: "Treat every dbt file as changed and skip the base comparison. For self-tests and first adoption."
+        type: boolean
+        default: false
+permissions: {}
+jobs:
+  dbt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # keyless auth to Google Cloud
+    defaults:
+      run:
+        working-directory: ${{ inputs.dbt_project_dir }}
+    env:
+      GATES_DBT_DIR: ${{ inputs.dbt_project_dir }}
+      DBT_PROFILES_DIR: ./ci # relative to the project dir; matches profiles_dir in .sqlfluff
+      DBT_CI_PROJECT: ${{ vars.DBT_CI_PROJECT }}
+      DBT_CI_DATASET: ${{ vars.DBT_CI_DATASET }}
+      BASE_REF: ${{ github.base_ref }}
+      LINT_ALL: ${{ inputs.lint_all }}
+      DBT_CORE: ${{ inputs.dbt_core }}
+      ADAPTER_PACKAGE: ${{ inputs.adapter_package }}
+      SQLFLUFF: ${{ inputs.sqlfluff }}
+      DO_NOT_TRACK: "1" # dbt usage statistics off
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Did a dbt file change?
+        id: changes
+        working-directory: ${{ github.workspace }}
+        run: |
+          if [ "$LINT_ALL" = "true" ]; then echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          d="${GATES_DBT_DIR%/}"
+          if [ "$d" = "." ] || [ -z "$d" ]; then p=""; else p="$d/"; fi
+          files=$(git diff --name-only "origin/$BASE_REF...HEAD" -- ":(glob)${p}models/**" ":(glob)${p}macros/**" ":(glob)${p}tests/**" ":(glob)${p}seeds/**" ":(glob)${p}snapshots/**" ":(glob)${p}analyses/**" ":(glob)${p}ci/**" "${p}dbt_project.yml" "${p}packages.yml" "${p}dependencies.yml" "${p}package-lock.yml" "${p}selectors.yml" "${p}.sqlfluff")
+          if [ -z "$files" ]; then
+            echo "no dbt file changed; the rest of this job is skipped"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf '%s\n' "$files"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+      - if: steps.changes.outputs.changed == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Install
+        if: steps.changes.outputs.changed == 'true'
+        run: pip install "dbt-core==$DBT_CORE" "$ADAPTER_PACKAGE" "sqlfluff==$SQLFLUFF" "sqlfluff-templater-dbt==$SQLFLUFF"
+      - name: Authenticate to Google Cloud (keyless)
+        if: steps.changes.outputs.changed == 'true' && inputs.auth == 'wif-google'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ inputs.service_account }}
+      - name: Deps
+        if: steps.changes.outputs.changed == 'true'
+        run: dbt deps
+      - name: SQLFluff (a nonzero exit fails the job)
+        if: steps.changes.outputs.changed == 'true'
+        run: sqlfluff lint models --format github-annotation-native
+      - name: Build, tests and dbt-project-evaluator
+        if: steps.changes.outputs.changed == 'true'
+        run: dbt build --target ci

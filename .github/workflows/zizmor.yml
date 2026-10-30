@@ -1,0 +1,30 @@
+# Lints every workflow here for injection, unpinned actions, over-broad permissions and persisted
+# credentials. Same action and tool version as the security pack's template.
+name: zizmor
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "29 6 * * 1"
+permissions: {}
+concurrency:
+  group: zizmor-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  zizmor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
+        with:
+          version: 1.31.1
+          advanced-security: false
+          annotations: true
+          online-audits: true
+          min-severity: medium

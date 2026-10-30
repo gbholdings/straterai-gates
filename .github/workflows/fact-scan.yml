@@ -1,0 +1,52 @@
+# Scans this repo for client names and internal facts. The deny list lives in a private repo, because a
+# public repo cannot hold client names and its Actions logs are public. So this job reads the scanner
+# and the list from gbholdings/straterai-devagent with a short-lived GitHub App token (app
+# straterai-gates-reader: contents read, installed on that one repo), and the scanner prints only
+# `<file>:<line> deny-rule #<n>`, never the matched text (--redact).
+#
+# Fails closed: with no app secrets (a fork PR, or the app not created yet) the job fails with a message
+# and scans nothing. It never reports green because it could not look.
+name: fact-scan
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions: {}
+jobs:
+  fact-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      GATES_READER_APP_ID: ${{ secrets.GATES_READER_APP_ID }}
+      GATES_READER_PRIVATE_KEY: ${{ secrets.GATES_READER_PRIVATE_KEY }}
+    steps:
+      - name: Require the reader app secrets
+        run: |
+          if [ -z "$GATES_READER_APP_ID" ] || [ -z "$GATES_READER_PRIVATE_KEY" ]; then
+            echo "::error::fact-scan cannot run: the secrets GATES_READER_APP_ID and GATES_READER_PRIVATE_KEY are not set for this run. Create the straterai-gates-reader GitHub App (contents: read, installed on gbholdings/straterai-devagent only) and set both as repository secrets. A pull request from a fork never gets them, so it fails here by design. Nothing was scanned."
+            exit 1
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: gates
+          persist-credentials: false
+      - name: Mint a read-only token for the devagent repo
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.GATES_READER_APP_ID }}
+          private-key: ${{ secrets.GATES_READER_PRIVATE_KEY }}
+          owner: gbholdings
+          repositories: straterai-devagent
+          permission-contents: read
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: gbholdings/straterai-devagent
+          ref: master
+          path: devagent
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+      - name: Scan
+        run: node devagent/scripts/packs-check.mjs --scan-dir gates --redact
