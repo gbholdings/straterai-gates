@@ -1,0 +1,111 @@
+# Reusable gate: run governance checks with scripts/governance-check.mjs and record each result as an
+# evidence entry (governance/evidence.json, format in the README).
+#
+# Caller stub. The stub declares contents: write because a reusable workflow cannot exceed it; the job
+# only writes on push and schedule, and only to the evidence branch:
+#
+#   name: governance
+#   on:
+#     push:
+#       branches: [main]
+#     pull_request:
+#     schedule:
+#       - cron: "17 5 * * 1"
+#   permissions:
+#     contents: write
+#   jobs:
+#     governance:
+#       uses: gbholdings/straterai-gates/.github/workflows/governance.yml@<40-char sha> # v1.0.0
+#       with:
+#         checks: |
+#           data:data-contract/owner=owner --contracts contracts/ --manifest target/manifest.json
+#
+# Each line of `checks` is `<plugin>:<skill>/<gate>=<subcommand and arguments>`, split on spaces (no
+# quoting) and run as `node governance-check.mjs <arguments>` in the caller's checkout. Exit 0 records
+# pass; any other exit records fail and fails the job.
+#
+# On a push or schedule the entries go to the `governance-evidence` branch (only that file; protect it
+# with a ruleset that allows the Actions bot). On a pull request nothing is written to a branch: the
+# would-be file is uploaded as an artifact.
+name: governance
+on:
+  workflow_call:
+    inputs:
+      checks:
+        description: "One check per line: <plugin>:<skill>/<gate>=<governance-check.mjs arguments>."
+        type: string
+        default: ""
+      evidence_branch:
+        type: string
+        default: "governance-evidence"
+      gates_sha:
+        description: "Commit of straterai-gates to run the script from. Default: the called workflow's own commit (job.workflow_sha)."
+        type: string
+        default: ""
+permissions: {}
+jobs:
+  governance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # push to the evidence branch, push and schedule events only
+    concurrency:
+      group: governance-evidence-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      CHECKS: ${{ inputs.checks }}
+      EVIDENCE_BRANCH: ${{ inputs.evidence_branch }}
+      EVENT_NAME: ${{ github.event_name }}
+      COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      RUN_LINK: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Check out the gates
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ inputs.gates_sha || job.workflow_sha }}
+          path: .gates
+          persist-credentials: false
+      - name: Load current evidence
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/evidence.json"
+          if git -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')" fetch --quiet origin "$EVIDENCE_BRANCH" 2>/dev/null; then
+            git show "FETCH_HEAD:governance/evidence.json" > "$out" || rm -f "$out"
+          fi
+          echo "GOVERNANCE_EVIDENCE_FILE=$out" >> "$GITHUB_ENV"
+      - name: Run checks and record evidence
+        id: run
+        run: |
+          set -uo pipefail
+          GC=".gates/scripts/governance-check.mjs"
+          [ -f "$GC" ] || { echo "::error::$GC is missing from the gates checkout"; exit 1; }
+          failed=0
+          ran=0
+          while IFS= read -r line; do
+            line="${line%$'\r'}"
+            [ -z "${line// /}" ] && continue
+            case "$line" in \#*) continue ;; esac
+            case "$line" in *=*) ;; *) echo "::error::bad checks line (want name=args): $line"; failed=1; continue ;; esac
+            name="${line%%=*}"
+            read -r -a args <<< "${line#*=}"
+            ran=1
+            if node "$GC" "${args[@]}"; then result=pass; detail="exit 0"; else rc=$?; result=fail; detail="exit $rc"; failed=1; fi
+            node "$GC" evidence append --check "$name" --result "$result" --run-link "$RUN_LINK" --commit "$COMMIT" --detail "$detail" || exit $?
+            echo "recorded=true" >> "$GITHUB_OUTPUT"
+          done <<< "$CHECKS"
+          [ "$ran" = 1 ] || echo "::notice::no checks configured; nothing recorded"
+          exit $failed
+      - name: Publish evidence to the evidence branch
+        if: ${{ !cancelled() && env.EVENT_NAME != 'pull_request' && steps.run.outputs.recorded == 'true' }}
+        run: EVIDENCE_FILE="$GOVERNANCE_EVIDENCE_FILE" bash .gates/scripts/publish-evidence.sh
+      - name: Upload the would-be evidence
+        if: ${{ !cancelled() && env.EVENT_NAME == 'pull_request' && steps.run.outputs.recorded == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: governance-evidence
+          path: ${{ env.GOVERNANCE_EVIDENCE_FILE }}

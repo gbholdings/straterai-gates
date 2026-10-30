@@ -1,0 +1,7 @@
+gates_fixture:
+  target: ci
+  outputs:
+    ci:
+      type: duckdb
+      path: ":memory:"
+      threads: 1

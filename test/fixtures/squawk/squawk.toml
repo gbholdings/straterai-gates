@@ -1,0 +1,15 @@
+# Same settings as the db-migrate skill template, so the self-test lints the way a caller does.
+pg_version = "16"
+
+# Postgres runs a Prisma migration file as one implicit transaction.
+assume_in_transaction = true
+
+# Each exclusion is a rule an ordinary Prisma migration trips and the author cannot fix from
+# schema.prisma, or one that belongs to the database role rather than the migration.
+excluded_rules = [
+  "prefer-robust-stmts",        # re-run safety: covered by assume_in_transaction (a failed file rolls back)
+  "require-lock-timeout",       # set lock_timeout on the migration role or connection string, once
+  "require-statement-timeout",  # same: set statement_timeout on the role
+  "prefer-identity",            # Prisma always emits SERIAL for autoincrement; it cannot emit IDENTITY
+  "require-enum-value-ordering", # fires on every Prisma enum addition (ALTER TYPE ... ADD VALUE); Prisma owns the order and schema.prisma cannot change it
+]

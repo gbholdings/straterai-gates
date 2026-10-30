@@ -1,0 +1,40 @@
+# Tags the merge commit vX.Y.Z from the merged PR's label: semver:major when an input is removed or
+# renamed, semver:minor for a new input or gate, semver:patch otherwise. Fails if the label is missing.
+# The first release is v1.0.0. A tag never moves (the v* tag ruleset blocks updates and deletion).
+name: release
+on:
+  push:
+    branches: [main]
+permissions: {}
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # create the tag
+      pull-requests: read # find the merged PR and its labels
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Tag the merge commit
+        run: |
+          set -euo pipefail
+          labels=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq '.[] | select(.merged_at != null) | .labels[].name')
+          picked=$(printf '%s\n' "$labels" | grep -E '^semver:(major|minor|patch)$' || true)
+          n=$(printf '%s\n' "$picked" | grep -c . || true)
+          if [ "$n" != 1 ]; then
+            echo "::error::the PR merged as $SHA needs exactly one label of semver:major, semver:minor or semver:patch (found $n)."
+            exit 1
+          fi
+          tag=$(git tag --list 'v*' | node scripts/next-tag.mjs "${picked#semver:}")
+          echo "tagging $SHA as $tag"
+          gh api "repos/$REPO/git/refs" -f "ref=refs/tags/$tag" -f "sha=$SHA" >/dev/null
