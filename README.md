@@ -11,6 +11,7 @@ A repo calls a gate with a few lines and gets the same check every other repo ge
 | `squawk.yml` | [squawk](https://squawkhq.com/) lint over the migration files a PR adds or changes. | `migration_globs` (Prisma and common raw-SQL folders), `squawk_version` (`2.70.0`), `config_path` (`.squawk.toml`), `lint_all` (`false`) |
 | `dbt.yml` | sqlfluff, then `dbt build --target ci` against a CI-only database. | `dbt_project_dir` (`.`), `adapter_package` (`dbt-bigquery==1.12.1`), `dbt_core` (`1.12.6`), `sqlfluff` (`4.4.0`), `auth` (`wif-google` or `none`), `workload_identity_provider`, `service_account`, `lint_all` |
 | `datacontract.yml` | [datacontract-cli](https://cli.datacontract.com/) lint of every contract, `breaking` against the base branch, and a block on deleting, renaming or retiring a contract that `RETIRED.md` on the base branch does not list. | `contracts_glob` (`contracts/*.odcs.yaml`), `datacontract_cli` (`1.2.8`), `lint_all` |
+| `bq-dry-run.yml` | Compiles the dbt models a PR changes and dry-runs each on BigQuery (free; nothing runs). Fails when a model would process more bytes than its budget in `warehouse-budgets.yml` (`default` plus per-model bytes, e.g. `10 GiB`). | `project_id` (required), `location` (`US`), `dbt_project_dir` (`.`), `budgets_path` (`warehouse-budgets.yml`), `adapter_package`, `dbt_core`, `workload_identity_provider`, `service_account`, `gates_sha`, `lint_all` |
 | `governance.yml` | Runs `scripts/governance-check.mjs` checks and records each result as an evidence entry. | `checks` (one `<plugin>:<skill>/<gate>=<arguments>` per line), `evidence_branch` (`governance-evidence`), `gates_sha` |
 
 `lint_all` lints every tracked file that matches instead of the PR's diff. The self-test uses it, and so can a repo adopting a gate for the first time.
@@ -34,7 +35,7 @@ jobs:
 Each workflow's header comment has its own stub.
 
 - The required-check name is `<caller job> / <called job>`: `squawk / squawk`, not `squawk`. A repo that switches from a copied workflow to the stub updates its branch protection in the same change, or every PR waits on "Expected".
-- A reusable workflow cannot exceed the caller's permissions. `dbt.yml` needs `id-token: write` in the stub, and `governance.yml` needs `contents: write` (used only on push and schedule, only for the evidence branch).
+- A reusable workflow cannot exceed the caller's permissions. `dbt.yml` and `bq-dry-run.yml` need `id-token: write` in the stub, and `governance.yml` needs `contents: write` (used only on push and schedule, only for the evidence branch).
 - No workflow has a `paths:` filter, for the same "Expected" reason. Each job always runs and passes when there is nothing to check.
 
 ## Evidence
@@ -46,8 +47,8 @@ Each workflow's header comment has its own stub.
 ## What is in this repo
 
 - `.github/workflows/`: the gates above, and `self-test`, `fact-scan`, `zizmor` and `release`.
-- `scripts/`: `governance-check.mjs` (Node 20+, no dependencies), `next-tag.mjs`, `publish-evidence.sh`.
-- `test/`: `governance-check.test.mjs` (`node --test test/*.test.mjs`) and `run-blocks.mjs`, which runs each gate's `run:` blocks against `test/fixtures/` in a temp git repo (needs `bash`, `git`, `node`, and Python with PyYAML; `datacontract-cli` for the contract cases).
+- `scripts/`: `governance-check.mjs` and `bq-dry-run-check.mjs` (Node 20+, no dependencies), `next-tag.mjs`, `publish-evidence.sh`.
+- `test/`: `governance-check.test.mjs` and `bq-dry-run-check.test.mjs` (`node --test test/*.test.mjs`) and `run-blocks.mjs`, which runs each gate's `run:` blocks against `test/fixtures/` in a temp git repo (needs `bash`, `git`, `node`, and Python with PyYAML; `datacontract-cli` for the contract cases).
 
 ## Rules for changes here
 
@@ -56,3 +57,7 @@ Each workflow's header comment has its own stub.
 - No `${{ inputs.* }}` or `${{ github.event.* }}` inside a `run:` block. Values go through `env:`. `zizmor` checks it.
 - No client names, internal hosts or thresholds. `fact-scan` reads a deny list from a private repo with a read-only GitHub App token and prints only `file:line deny-rule #n`. It fails closed: no app secrets (a fork PR, say) means a red check and no scan.
 - Every PR carries one label: `semver:major` (an input removed or renamed), `semver:minor` (a new input or gate) or `semver:patch`. On merge, `release.yml` tags the merge commit.
+
+## What the self-test cannot prove
+
+`bq-dry-run.yml` needs a Google Cloud project and keyless auth, which this public repo's CI does not have. The self-test runs its change detection against fixtures and the script against a stubbed API; the live dry run is `test/bq-dry-run-check.test.mjs`'s last test, which runs when `BQ_ACCESS_TOKEN` and `BQ_LIVE_PROJECT` are set and is skipped otherwise.

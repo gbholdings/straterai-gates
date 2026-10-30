@@ -42,6 +42,13 @@ const GATES = [
     steps: ["Did a dbt file change?"],
     inputs: {},
   },
+  {
+    name: "bq-dry-run (change detection)",
+    workflow: "bq-dry-run.yml",
+    fixtures: "bq-dry-run-changes",
+    steps: ["Which models changed?"],
+    inputs: {},
+  },
 ];
 
 function pythonBin() {
