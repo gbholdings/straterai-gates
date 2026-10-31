@@ -22,6 +22,9 @@
 //   expect-evidence lines that must each appear in the datacontract evidence file
 //   gh-responses    lines of "<argv substring>\t<stdout>" the fake `gh` answers with (first match wins)
 //   reviews.json    what `gh api graphql` prints for the squawk guard's reviews query ("HEAD" becomes the head SHA)
+//   head-rename.json  [{ from, to }] as base-rename.json, for head files
+//   reject-commands lines no workflow command the runner would act on may contain: each step's stdout and stderr
+//                   are read as the runner reads them, honouring ::stop-commands::<token> until ::<token>::
 //
 // Expressions are resolved the narrow way these workflows use them; anything else throws.
 import fs from "node:fs";
@@ -283,6 +286,8 @@ function buildRepo(caseDir, work) {
   git("checkout", "-q", "-b", "pr");
   for (const e of fs.readdirSync(repo)) if (e !== ".git") fs.rmSync(path.join(repo, e), { recursive: true, force: true });
   copyTree(path.join(caseDir, "head"), repo);
+  const headRenames = path.join(caseDir, "head-rename.json");
+  if (fs.existsSync(headRenames)) for (const { from, to } of JSON.parse(fs.readFileSync(headRenames, "utf8"))) fs.renameSync(path.join(repo, from), path.join(repo, to));
   git("add", "-A");
   const links = path.join(caseDir, "links");
   if (fs.existsSync(links)) {
@@ -330,6 +335,24 @@ if (fs.existsSync(r)) {
   return { bin, log };
 }
 
+// The lines of a step's output the runner would act on as workflow commands. A line that starts with :: (after
+// leading spaces) is a command, unless ::stop-commands::<token> came first and ::<token>:: has not ended it.
+function workflowCommands(text) {
+  const acted = [];
+  let stop = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const l = raw.trimStart();
+    if (stop !== null) {
+      if (l === `::${stop}::`) stop = null;
+      continue;
+    }
+    const m = /^::stop-commands::(.+)$/.exec(l);
+    if (m) stop = m[1];
+    else if (l.startsWith("::")) acted.push(l);
+  }
+  return acted;
+}
+
 function lines(file) {
   return fs.existsSync(file) ? fs.readFileSync(file, "utf8").split("\n").map((l) => l.replace(/\r$/, "")).filter(Boolean) : [];
 }
@@ -353,6 +376,7 @@ function runCase(gate, wf, caseName) {
   const needs = {};
   let code = 0;
   let log = "";
+  const commands = [];
   let outputs = "";
   let first = true;
   let firstTemp = null;
@@ -423,6 +447,7 @@ function runCase(gate, wf, caseName) {
       const shell = (step.shell ?? job.shell ?? "bash -e -o pipefail {0}").trim().split(/\s+/).map((a) => (a === "{0}" ? fwd(script) : a));
       const r = spawnSync(shell[0], shell.slice(1), { cwd: workspace, env: { ...process.env, ...env }, encoding: "utf8", timeout: 300000 });
       log += `--- ${step.name} (exit ${r.status})\n${r.stdout}${r.stderr}`;
+      commands.push(...workflowCommands(r.stdout ?? ""), ...workflowCommands(r.stderr ?? ""));
       const stepOutputs = {};
       for (const l of lines(out)) {
         const eq = l.indexOf("=");
@@ -472,6 +497,7 @@ function runCase(gate, wf, caseName) {
   };
   reject("reject-log", log + ghLog, "the log or the gh calls");
   reject("reject-gh", ghLog, "the gh calls");
+  reject("reject-commands", commands.join("\n"), "the workflow commands the runner acts on");
   // A case that expects no gh call gets none: a notice on a passing PR is a bug.
   if (!fs.existsSync(path.join(caseDir, "expect-gh")) && ghLog) {
     expectOk = false;

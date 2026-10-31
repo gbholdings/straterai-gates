@@ -42,17 +42,21 @@
 #     DROP EXPRESSION, DROP IDENTITY, DETACH PARTITION, NO INHERIT; ALTER DOMAIN DROP CONSTRAINT or DROP
 #     DEFAULT; DROP OWNED and REASSIGN OWNED; lo_unlink(). A foreign key added back under the same name on the
 #     same table, and a policy created again under the same name on the same table, each later in the same
-#     file, do not count. DROP INDEX has its own rule, guard-drop-index: what it can break is a query plan or a
-#     uniqueness rule, so the reviewer wants the index's idx_scan and the query sites. A plain DROP INDEX passes
-#     only when a later statement in the same file builds an index with the same definition, under any name:
-#     the same table, uniqueness, method, columns or expressions, INCLUDE list and predicate. That is a Prisma
-#     @unique rename, which Prisma emits as a drop and a re-create; a check that failed on it every week would
-#     get switched off. The guard reads what the dropped index was from earlier in the file or from the
-#     migrations at the merge base. A drop with nothing rebuilt, a unique index rebuilt as a plain one, a
-#     rebuild on other columns, an index it cannot find, and any DROP INDEX ... CASCADE need the review;
+#     file, do not count. Every DROP INDEX needs the review, under its own rule, guard-drop-index: what it can
+#     break is a query plan or a uniqueness rule, so the reviewer wants the index's idx_scan (on the primary and
+#     every replica) and the query sites. A drop followed by a re-create gets no exemption: on Postgres 17 it
+#     can still lose a uniqueness rule (IF NOT EXISTS onto another index, ON ONLY a partitioned table,
+#     CONCURRENTLY with a write in the gap), and Prisma never writes one for a rename;
 #   - TRUNCATE, DELETE, UPDATE, MERGE and INSERT ... ON CONFLICT DO UPDATE, wherever they sit (a CTE, a rule,
 #     a prepared statement, a function or procedure body), and any DO INSTEAD rule;
-#   - any RENAME, SET SCHEMA, ALTER COLUMN ... TYPE (guard-collation when it changes the COLLATE, which needs a
+#   - any RENAME, with one exception: ALTER INDEX x RENAME TO y, which is what prisma migrate diff (6.19.3 and
+#     7.10.1) writes for a @unique(map:) or @@unique rename. Postgres runs ALTER INDEX on a table named x too,
+#     so it passes only when the merge base's migrations prove x is an index: exactly one statement there
+#     names x, and it creates x as an index (CREATE [UNIQUE] INDEX x, or a named PRIMARY KEY, UNIQUE or EXCLUDE
+#     constraint) on a table in the schema the rename names; nothing later there or in the PR drops its table,
+#     a schema, anything with CASCADE or DROP OWNED; the PR names x only in the rename; and every migration
+#     at the merge base was read in full (no DO block or EXECUTE the guard cannot read, no search_path change);
+#   - SET SCHEMA, ALTER COLUMN ... TYPE (guard-collation when it changes the COLLATE, which needs a
 #     reindex plan), SET NOT NULL, ADD COLUMN ... NOT NULL with no default (serial counts as a default),
 #     DISABLE or NO FORCE ROW LEVEL SECURITY, SET UNLOGGED, COPY ... PROGRAM, and COPY ... TO or lo_export()
 #     of a server file;
@@ -63,7 +67,10 @@
 #     DATABASE, ALTER ROLE or ALTER SYSTEM; only a session SET to a pg_dump header's value passes.
 # A symlink, a submodule or a file-type change at, above or under a migration folder fails with no approval
 # that clears it. An approver who pushed a commit to the PR still counts: turn on "Require approval of the
-# most recent reviewable push" in branch protection to stop that.
+# most recent reviewable push" in branch protection to stop that. One writer's approval clears the guard even
+# while another writer's latest verdict is CHANGES_REQUESTED; branch protection blocks on that review on its
+# own. File names and file text are printed between ::stop-commands:: and a random token, so a newline in a
+# migration's name cannot start a workflow command in the log.
 #
 # What the guard cannot know, so a reviewer reads it by eye: what an existing function does when the migration
 # calls it, or when CREATE OR REPLACE changes one a trigger already calls; a new trigger whose function returns
@@ -192,6 +199,11 @@ jobs:
             echo "::error::the checkout is $(G rev-parse HEAD), not the pull request's head commit $HEAD_SHA"; exit 1
           fi
           T=$(mktemp -d "${RUNNER_TEMP:-/tmp}/squawk-guard.XXXXXX")
+          # File names and anything read from a file are the PR's text, and git allows a newline in a name: printed
+          # raw, a name could put ::notice:: or ::add-mask:: at the start of a log line. quiet prints between
+          # ::stop-commands:: and a random token, so the runner reads none of it as a workflow command.
+          tok="squawk-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          quiet() { echo "::stop-commands::$tok"; "$@"; echo "::$tok::"; }
           hard=""
           near() { # $1 is at or under a migration folder at any depth, or named like a folder on the way to one
             local d p="/${1,,}/" b="${1##*/}"
@@ -227,14 +239,12 @@ jobs:
           if [ ${#files[@]} -eq 0 ]; then
             echo "squawk guard: no added or changed file matches MIGRATION_GLOBS ($MIGRATION_GLOBS)"
           else
-            echo "squawk guard scans ${#files[@]} file(s):"
-            printf '  %s\n' "${paths[@]}"
+            quiet printf '%s\n' "squawk guard scans ${#files[@]} file(s):" "${paths[@]/#/  }"
             printf '%s\0' "${paths[@]}" > "$T/paths"
           fi
-          # 2b. The migrations as they stood at the merge base, the schema a DROP INDEX acts on. guard-drop-index
-          #     reads only their CREATE INDEX statements, to learn what a dropped index was; nothing in them is
-          #     flagged. A file that is not a regular file there defines nothing, so its indexes need the review.
-          #     lint_all has no base, so every DROP INDEX there needs the review unless the same file built it.
+          # 2b. The migrations as they stood at the merge base. They are read only to prove that the name an ALTER
+          #     INDEX ... RENAME acts on is an index, not a table; nothing in them is flagged. A file that is not a
+          #     regular file there is skipped, so the proof cannot rest on it.
           mkdir -p "$T/hist"
           : > "$T/hist/paths"
           if [ ${#files[@]} -gt 0 ] && [ "$LINT_ALL" != "true" ] && MB=$(G merge-base "$BASE" HEAD); then
@@ -335,53 +345,136 @@ jobs:
               return acc
 
 
-          def bare(v):
-              """A parse tree without its source offsets, so two spellings of one definition compare equal."""
+          # Rules whose finding means the guard could not read a statement fully, so a file in the merge base's migrations
+          # that raises one could have created or removed any name.
+          OPAQUE = (" guard-unparseable:", " guard-psql-meta-command:", " guard-dynamic-sql:", " guard-lexer-setting:")
+          INDEX_CONSTRAINTS = {"CONSTR_PRIMARY", "CONSTR_UNIQUE", "CONSTR_EXCLUSION"}
+
+
+          def top_stmts(data):
+              """A file's top-level statements with their source text, [(statement, source), ...]; None if the parser rejects it."""
+              if data.startswith(b"\xef\xbb\xbf"):
+                  data = data[3:]
+              if b"\0" in data:
+                  return None
+              try:
+                  stmts = json.loads(parser.parse_sql_json(data.decode("utf-8"))).get("stmts", [])
+              except Exception:  # noqa: BLE001
+                  return None
+              out = []
+              for s in stmts:
+                  st, ln = s.get("stmt_location", 0), s.get("stmt_len", 0)
+                  out.append((s.get("stmt") or {}, data[st: st + ln if ln else len(data)].decode("utf-8", "replace")))
+              return out
+
+
+          def leaves(v):
+              """Every string in a parse tree: identifiers as the server reads them, quoted, escaped or not."""
               if isinstance(v, dict):
-                  return {k: bare(w) for k, w in v.items() if k != "location"}
-              return [bare(w) for w in v] if isinstance(v, list) else v
+                  for w in v.values():
+                      yield from leaves(w)
+              elif isinstance(v, list):
+                  for w in v:
+                      yield from leaves(w)
+              elif isinstance(v, str):
+                  yield v
 
 
-          def index_def(x):
-              """What a CREATE INDEX builds, apart from its name: table, uniqueness, method, keys, INCLUDE and predicate."""
-              return json.dumps([rel_key(x.get("relation")), bool(x.get("unique")), bool(x.get("nulls_not_distinct")),
-                                 x.get("accessMethod") or "btree", bare(x.get("indexParams") or []),
-                                 bare(x.get("indexIncludingParams") or []), bare(x.get("whereClause"))], sort_keys=True)
+          def mentions(stmt, src, key):
+              """True if a statement names `key` anywhere: in its text (comments and string bodies too) or as a parsed name."""
+              return key in src.lower() or any(x.lower() == key for x in leaves(stmt))
 
 
-          def index_adds(stmts):
-              """Each top-level CREATE INDEX, in order: [(statement, name, table schema, definition), ...]."""
-              acc = []
-              for i, s in enumerate(stmts):
-                  x = s.get("stmt", {}).get("IndexStmt")
-                  if x:
-                      acc.append((i, x.get("idxname") or "", (x.get("relation") or {}).get("schemaname", ""), index_def(x)))
-              return acc
+          def index_names(stmt):
+              """The indexes a top-level statement is certain to create: [(name, table schema, table), ...]. A named CREATE
+              [UNIQUE] INDEX without IF NOT EXISTS, and a named PRIMARY KEY, UNIQUE or EXCLUDE constraint (not USING INDEX)
+              in CREATE TABLE or ALTER TABLE ... ADD CONSTRAINT, neither with IF NOT EXISTS or IF EXISTS."""
+              t, n = node_type(stmt)
+              cons, rel = [], None
+              if t == "IndexStmt" and n.get("idxname") and not n.get("if_not_exists"):
+                  return [(n["idxname"],) + rel_key(n.get("relation"))]
+              if t == "CreateStmt" and not n.get("if_not_exists"):
+                  rel = n.get("relation")
+                  for e in n.get("tableElts", []):
+                      cons += [e.get("Constraint")] + [c.get("Constraint") for c in (e.get("ColumnDef") or {}).get("constraints", [])]
+              elif t == "AlterTableStmt" and n.get("objtype") == "OBJECT_TABLE" and not n.get("missing_ok"):
+                  rel = n.get("relation")
+                  cons = [c.get("AlterTableCmd", {}).get("def", {}).get("Constraint") for c in n.get("cmds", [])
+                          if c.get("AlterTableCmd", {}).get("subtype") == "AT_AddConstraint"]
+              return [(c["conname"],) + rel_key(rel) for c in cons
+                      if c and c.get("contype") in INDEX_CONSTRAINTS and c.get("conname") and not c.get("indexname")]
+
+
+          def unmakes(stmt, table):
+              """True if a statement can remove an index on `table` without naming the index: DROP TABLE of that table,
+              DROP SCHEMA, anything with CASCADE, and DROP OWNED."""
+              t, n = node_type(stmt)
+              if t == "DropOwnedStmt":
+                  return True
+              if t != "DropStmt":
+                  return False
+              kind = n.get("removeType", "")
+              if n.get("behavior") == "DROP_CASCADE" or kind == "OBJECT_SCHEMA":
+                  return True
+              return kind in ("OBJECT_TABLE", "OBJECT_MATVIEW", "OBJECT_FOREIGN_TABLE") and any(
+                  (strings(o.get("List", {}).get("items")) or [""])[-1] == table for o in n.get("objects", []))
 
 
           class History:
-              """The CREATE INDEX statements in the migrations at the merge base, parsed the first time a DROP INDEX asks."""
-              def __init__(self, d=None):
-                  self.d, self.defs = d, None
+              """The migrations at the merge base (in path order) and the PR's own files, read the first time an ALTER INDEX
+              ... RENAME asks whether its name is an index."""
+              def __init__(self, d=None, pr=()):
+                  self.d, self.pr_files, self.loaded = d, list(pr), False
+                  self.hist, self.pr, self.opaque = [], [], False
 
-              def find(self, name, schema):
-                  """The definition of the last index of that name (and schema, if the drop names one), or None."""
-                  if self.defs is None:
-                      self.defs = []
+              def load(self):
+                  if self.loaded:
+                      return
+                  self.loaded = True
+                  try:
+                      paths = open(os.path.join(self.d, "paths"), "rb").read().decode("utf-8").split("\0")[:-1] if self.d else []
+                  except OSError:
+                      paths = []
+                  for k, p in sorted(enumerate(paths), key=lambda e: e[1]):
                       try:
-                          paths = open(os.path.join(self.d, "paths"), "rb").read().decode("utf-8").split("\0")[:-1] if self.d else []
+                          with open(os.path.join(self.d, f"h{k + 1:05d}.sql"), "rb") as fh:
+                              data = fh.read()
                       except OSError:
-                          paths = []
-                      for k, _ in sorted(enumerate(paths), key=lambda e: e[1]):
-                          try:
-                              with open(os.path.join(self.d, f"h{k + 1:05d}.sql"), "rb") as fh:
-                                  text = fh.read().decode("utf-8-sig")
-                              stmts = json.loads(parser.parse_sql_json(text)).get("stmts", [])
-                          except Exception:  # noqa: BLE001 - an old file the parser rejects defines nothing
-                              continue
-                          self.defs += [(nm, sc, d) for _, nm, sc, d in index_adds(stmts)]
-                  hit = [d for nm, sc, d in self.defs if nm == name and (schema is None or sc == schema)]
-                  return hit[-1] if hit else None
+                          self.opaque = True
+                          continue
+                      stmts = top_stmts(data)
+                      if stmts is None or any(o in x for x in scan_file(p, data) for o in OPAQUE):
+                          self.opaque = True  # a statement the guard cannot read could have made or dropped any name
+                      self.hist += stmts or []
+                  for name in self.pr_files:
+                      try:
+                          with open(name, "rb") as fh:
+                              stmts = top_stmts(fh.read())
+                      except OSError:
+                          stmts = None
+                      if stmts is None:
+                          self.opaque = True
+                      self.pr += stmts or []
+
+              def is_index(self, name, schema):
+                  """True only when the merge base proves `name` is an index and nothing has touched it since: exactly one
+                  statement in those migrations names it, and that statement creates it as an index on a table in the same
+                  schema the rename names (both unqualified, or both the same); no later statement there, and none in the
+                  PR, drops its table, a schema or anything with CASCADE; the PR names it in one statement only, the rename
+                  itself; and every migration at the merge base was fully read. Anything else, a table of that name
+                  included, needs the review."""
+                  self.load()
+                  key = (name or "").lower()
+                  if self.opaque or not key:
+                      return False
+                  hits = [k for k, (s, src) in enumerate(self.hist) if mentions(s, src, key)]
+                  if len(hits) != 1 or sum(mentions(s, src, key) for s, src in self.pr) != 1:
+                      return False
+                  made = [(sc, tb) for nm, sc, tb in index_names(self.hist[hits[0]][0]) if nm == name]
+                  if len(made) != 1 or made[0][0] != (schema or ""):
+                      return False
+                  later = [s for s, _ in self.hist[hits[0] + 1:]] + [s for s, _ in self.pr]
+                  return not any(unmakes(s, made[0][1]) for s in later)
 
 
           def is_null(d):
@@ -399,8 +492,8 @@ jobs:
 
 
           class Walker:
-              def __init__(self, f, fks, pols=None, idxs=None, hist=None):
-                  self.f, self.fks, self.pols, self.idxs, self.at = f, fks, pols or {}, idxs or [], None  # self.at: (statement, command) of a top-level ALTER TABLE command
+              def __init__(self, f, fks, pols=None, hist=None):
+                  self.f, self.fks, self.pols, self.at = f, fks, pols or {}, None  # self.at: (statement, command) of a top-level ALTER TABLE command
                   self.hist = hist or History()
                   self.top = None  # index of the top-level statement being walked; None inside a body or an EXECUTE string
                   self.persist, self.fn_set = set(), set()  # ids of SET clauses on a database/role/system, and on a function
@@ -450,12 +543,11 @@ jobs:
                               self.fn_set.add(id(vs))
                   if t == "DropStmt":
                       kind = n.get("removeType", "").replace("OBJECT_", "")
-                      if kind == "INDEX" and n.get("behavior") != "DROP_CASCADE":
-                          gone = [self.index_gone(o) for o in n.get("objects", [])] if self.top is not None else [(None, False)]
-                          if gone and all(back for _, back in gone):
-                              return  # the same index built again later in the file, under any name (Prisma's @unique rename)
-                          lost = "a uniqueness rule the app may rely on" if any(d and json.loads(d)[1] for d, _ in gone) else "an index a query may depend on"
-                          f.flag(loc, "guard-drop-index", f"DROP INDEX removes {lost}, and this file does not build the same index (table, uniqueness, columns) again; show the reviewer its pg_stat_user_indexes.idx_scan and the query sites that use it.", where)
+                      if kind == "INDEX":
+                          # Every DROP INDEX needs the review: a drop and a re-create can still lose a uniqueness rule (IF NOT
+                          # EXISTS onto another index, ON ONLY, CONCURRENTLY with a write in the gap), and Prisma never writes
+                          # one for a rename: it writes ALTER INDEX ... RENAME, handled below.
+                          f.flag(loc, "guard-drop-index", "DROP INDEX removes an index a query may depend on, or a uniqueness rule the app relies on; show the reviewer its pg_stat_user_indexes.idx_scan on the primary and every replica, and the query sites that use it.", where)
                           return
                       if kind == "POLICY" and self.top is not None and all(self.policy_back(o) for o in n.get("objects", [])):
                           return  # a policy edit (supabase db diff): the same policy, created again on the same table later in the file
@@ -469,8 +561,12 @@ jobs:
                   elif t == "InsertStmt" and n.get("onConflictClause", {}).get("action") == "ONCONFLICT_UPDATE":
                       f.flag(loc, "guard-row-change", "INSERT ... ON CONFLICT DO UPDATE changes existing rows.", where)
                   elif t == "RenameStmt" and n.get("renameType") == "OBJECT_INDEX":
-                      # Postgres runs ALTER INDEX t RENAME on a table named t too, and the guard cannot tell which it is.
-                      f.flag(loc, "guard-rename", "ALTER INDEX ... RENAME also renames a table of that name, which breaks its readers.", where)
+                      # Postgres runs ALTER INDEX t RENAME on a table named t too. It passes only when the merge base's
+                      # migrations prove the name is an index (Prisma's @unique(map:) and @@index rename write this).
+                      r = n.get("relation") or {}
+                      if self.top is not None and self.hist.is_index(r.get("relname"), r.get("schemaname", "")):
+                          return
+                      f.flag(loc, "guard-rename", "ALTER INDEX ... RENAME also renames a table of that name, which breaks its readers; it passes without a review only when an earlier migration at the merge base creates this name as an index and nothing since names it.", where)
                   elif t == "RenameStmt" or (t == "AlterEnumStmt" and n.get("oldVal")):
                       f.flag(loc, "guard-rename", "a rename breaks every reader that uses the old name.", where)
                   elif t == "AlterObjectSchemaStmt":
@@ -528,19 +624,6 @@ jobs:
                           self.plpgsql(src, loc, f" (in a plpgsql {what} body)")
                       else:
                           f.flag(loc, "guard-dynamic-sql", f"a {what} in LANGUAGE {lang} is code the guard cannot read.", where)
-
-              def index_gone(self, o):
-                  """(definition, rebuilt) for one DROP INDEX object. The definition is the last CREATE INDEX of that
-                  name earlier in this file, or else in the migrations at the merge base; rebuilt means a later
-                  statement in this file creates an index with that same definition, under any name. An index the
-                  guard cannot find is never rebuilt."""
-                  name = strings(o.get("List", {}).get("items"))
-                  if not name:
-                      return None, False
-                  schema = name[-2] if len(name) > 1 else None
-                  mine = [d for i, nm, sc, d in self.idxs if i < self.top and nm == name[-1] and (schema is None or sc == schema)]
-                  d = mine[-1] if mine else self.hist.find(name[-1], schema)
-                  return d, d is not None and any(i > self.top and dd == d for i, _, _, dd in self.idxs)
 
               def policy_back(self, o):
                   """True if a DROP POLICY object is created again, same schema, table and name, later in the file."""
@@ -672,7 +755,7 @@ jobs:
                   Walker(f, {}).unparseable(e, loc, "")
                   return f.out
               stmts = tree.get("stmts", [])
-              w = Walker(f, fk_adds(stmts), policy_adds(stmts), index_adds(stmts), hist)
+              w = Walker(f, fk_adds(stmts), policy_adds(stmts), hist)
               for i, s in enumerate(stmts):
                   start = s.get("stmt_location", 0)
                   ln = s.get("stmt_len", 0)
@@ -685,7 +768,7 @@ jobs:
 
           def main(argv):
               paths = open(argv[1], "rb").read().decode("utf-8").split("\0")[:-1]
-              hist = History(argv[2])  # the merge base's migrations, for what a dropped index was
+              hist = History(argv[2], argv[3:])  # the merge base's migrations and the PR's, for what an ALTER INDEX renames
               for i, name in enumerate(argv[3:]):
                   with open(name, "rb") as fh:
                       data = fh.read()
@@ -707,12 +790,12 @@ jobs:
           fi
           if [ -n "$hard" ]; then
             echo "::error::The squawk guard could not check this PR's migrations, and no review clears that. Make each migration a regular file in its folder and push again."
-            printf '%s\n' "$hard"
+            quiet printf '%s\n' "$hard"
             exit 1
           fi
           if [ ! -s "$T/found" ]; then echo "no destructive migration change"; exit 0; fi
           echo "Findings that need a human (read by the Postgres parser; squawk-ignore comments and .squawk.toml do not apply):"
-          cat "$T/found"
+          quiet cat "$T/found"
           # 4. The approval: an APPROVED review on the current head commit, from a person other than the PR's
           #    author who can push to the repository. A user's latest APPROVED / CHANGES_REQUESTED / DISMISSED
           #    review is their verdict, as GitHub counts it; a COMMENTED review does not change it. One GraphQL
@@ -780,6 +863,9 @@ jobs:
             range=("origin/$BASE_REF...HEAD")
           fi
           T=$(mktemp -d "${RUNNER_TEMP:-/tmp}/squawk-lint.XXXXXX")
+          # File names reach the log here and in squawk's report: no workflow commands from them (see the guard).
+          tok="squawk-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          echo "::stop-commands::$tok"
           files=()
           # shellcheck disable=SC2086 # $MIGRATION_GLOBS splits into pathspecs on purpose; set -f stops globbing
           while IFS= read -r -d '' f; do
@@ -792,5 +878,8 @@ jobs:
               *) files+=("$f") ;;
             esac
           done < <(G diff -z --name-only --no-renames --no-textconv --no-ext-diff --diff-filter=AM "${range[@]}" -- $MIGRATION_GLOBS)
-          if [ "${#files[@]}" -eq 0 ]; then echo "no migration files changed"; exit 0; fi
-          "${SQUAWK_BIN:?the Install squawk step did not run}" -c "$CONFIG_PATH" "${files[@]}"
+          if [ "${#files[@]}" -eq 0 ]; then echo "no migration files changed"; echo "::$tok::"; exit 0; fi
+          rc=0
+          "${SQUAWK_BIN:?the Install squawk step did not run}" -c "$CONFIG_PATH" "${files[@]}" || rc=$?
+          echo "::$tok::"
+          exit "$rc"

@@ -1,0 +1,2 @@
+guard-rename
+ALTER INDEX ... RENAME also renames a table

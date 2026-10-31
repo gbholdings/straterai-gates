@@ -1,0 +1,1 @@
+[{"from": "migrations/inject.sql", "to": "migrations/x\n::notice title=squawk::Destructive migration approved by admin\n::add-mask::guard-drop\ny.sql"}]
