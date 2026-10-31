@@ -12,7 +12,7 @@ A repo calls a gate with a few lines and gets the same check every other repo ge
 | `dbt.yml` | sqlfluff, then `dbt build --target ci` against a CI-only database. | `dbt_project_dir` (`.`), `adapter_package` (`dbt-bigquery==1.12.1`), `dbt_core` (`1.12.6`), `sqlfluff` (`4.4.0`), `auth` (`wif-google` or `none`), `workload_identity_provider`, `service_account`, `lint_all` |
 | `datacontract.yml` | [datacontract-cli](https://cli.datacontract.com/) lint of every contract; each contract's columns and types against the real schema (`governance-check contract-schema`); an owner on every contract, and on every dbt model with a manifest (`governance-check owner`); `breaking` against the base branch, and a block on deleting, renaming or retiring a contract that `RETIRED.md` on the base branch does not list. When one of those breaks on a PR, one comment names each consumer the base copy of the contract lists. | `contracts_dir` (`contracts`), `contracts_glob` (`contracts/**/*.odcs.yaml`), `datacontract_cli` (`1.2.8`, installed from a hash-pinned lockfile), `lint_all`, `prisma_schema`, `dbt_manifest`, `dbt_catalog`, `dbt_artifact`, `open_consumer_issues` (`false`, needs the secret `CONSUMER_ISSUES_TOKEN`), `evidence_artifact` (`datacontract-evidence`), `gates_sha` (a 40-character commit), `fixture` (self-test only) |
 | `bq-dry-run.yml` | Compiles the dbt models a PR can change and dry-runs each on BigQuery (free; nothing runs). Fails when a model would process more bytes than its budget in `warehouse-budgets.yml` (`default` plus per-model bytes, e.g. `10 GiB`), or when the gate cannot measure it. See [bq-dry-run](#bq-dry-run). | `project_id` (required), `location` (`US`), `dbt_project_dir` (`.`), `budgets_path` (`warehouse-budgets.yml`), `adapter_package`, `dbt_core`, `workload_identity_provider`, `service_account`, `gates_sha`, `lint_all` |
-| `governance.yml` | Runs `scripts/governance-check.mjs` checks and records each result as an evidence entry. | `checks` (one `<plugin>:<skill>/<gate>=<arguments>` per line), `evidence_branch` (`governance-evidence`), `gates_sha` |
+| `governance.yml` | Runs `scripts/governance-check.mjs` checks (evidence, contract checks, monitor routing) and records each result as an evidence entry. | `checks` (one `<plugin>:<skill>/<gate>=<arguments>` per line), `evidence_branch` (`governance-evidence`), `gates_sha` |
 
 `lint_all` lints every tracked file that matches instead of the PR's diff. The self-test uses it, and so can a repo adopting a gate for the first time.
 
@@ -59,7 +59,7 @@ Access: the service account needs `roles/bigquery.jobUser` in the job project an
 
 `node scripts/governance-check.mjs evidence append --check <plugin>:<skill>/<gate> --result pass|fail|not_run [--run-link <url>] [--commit <sha>] [--detail <text>] [--file governance/evidence.json]`
 
-`governance/evidence.json` is a JSON array of `{ "check", "date" (ISO 8601 UTC), "result", "run_link" (URL or null), "commit", "detail" }`. It only grows: the script reads, appends, verifies no earlier entry changed, and writes through a temp file. A file it cannot parse exits 4 and is left untouched. Exit 2 is a usage error. On push and schedule `governance.yml` commits the file to the `governance-evidence` branch, touching nothing else; on a pull request it uploads the would-be file as an artifact and writes no branch. The file records what ran and what it found. It does not say a repo is compliant.
+`governance/evidence.json` is a JSON array of `{ "check", "date" (ISO 8601 UTC), "result", "run_link" (URL or null), "commit", "detail" }`. It only grows: the script reads, appends, verifies no earlier entry changed, and writes through a temp file. A file it cannot parse exits 4 and is left untouched. Exit 2 is a usage error. A check line in `governance.yml` that exits 2 (NOT CHECKED) is recorded as `not_run`, exit 0 as `pass` and anything else as `fail`; only `pass` lets the job succeed. On push and schedule `governance.yml` commits the file to the `governance-evidence` branch, touching nothing else; on a pull request it uploads the would-be file as an artifact and writes no branch. The file records what ran and what it found. It does not say a repo is compliant.
 
 ## Contract checks
 
@@ -79,11 +79,37 @@ node scripts/governance-check.mjs consumers --contract <file> [--format lines|ma
 - YAML contracts are read with Python's PyYAML (installed with datacontract-cli), run isolated (`python3 -I`, from the temp directory), so a `yaml.py` in the repository is never imported. No PyYAML exits 2; `GOVERNANCE_PYTHON` picks the interpreter.
 - The notice renders every path, owner and team as a code span with line breaks, control characters and backticks removed, so none of them can add Markdown, HTML, a mention or a link. A path under the contracts folder with a control character in it fails the gate's first step.
 
+## Monitor routing
+
+```
+node scripts/governance-check.mjs monitors [--repo .] (--manifest <dbt project>/target/manifest.json ... | --gx <gx dir> ... [--gx-python <python>])
+```
+
+Every run-time monitor must reach a person: it needs a deliverable alert destination and a real owner. In CI, have `governance.yml` parse the project itself and point the check at what it wrote:
+
+```yaml
+    with:
+      dbt_parse: transform
+      checks: |
+        <plugin>:<skill>/monitors=monitors --repo . --manifest transform/target/manifest.json
+```
+
+For GX, set `gx: true` and pass `--gx <dir>`; the job installs GX Core from `requirements/` and sets `GATES_GX_PYTHON`.
+
+- **Elementary** (`--manifest`, repeatable): every test in the `elementary` namespace (`volume_anomalies`, `freshness_anomalies`, `schema_changes` and the rest) needs `channel` and `owner`, read as Elementary reads them: the test's meta over its model's, at the top of `meta` or under `alerts_config`, from `meta` or `config.meta`. A value the test sets wins, so an empty `channel` on the test is not rescued by the model's. An `alert_suppression_interval` above 168 hours, or one that is not a number, fails. A manifest with no Elementary test is NOT CHECKED.
+- **The manifest must be this commit's.** Its `metadata.project_name` must name a dbt project under `--repo`; every `.sql` there must be in it with the checksum dbt gives it (sha256 of the stripped text); every file it lists must exist; and no project file may be newer than its `generated_at`. Otherwise it is NOT CHECKED: a committed manifest is stale by construction. Every dbt project whose packages pull in Elementary must be covered by a `--manifest`.
+- **GX Core** (`--gx`, repeatable): every checkpoint under `checkpoints/` needs an action that notifies with what delivery needs: `slack` (a webhook, or a token and a channel), `microsoft` (`teams_webhook`), `email` (`smtp_address`, `smtp_port` and `receiver_emails`), `opsgenie` (`api_key`) or `api` (`url`), with `notify_on` of `all` or `failure`. Every suite it validates needs `meta.owner`. Each context is then loaded in GX itself (`--gx-python`, or `GATES_GX_PYTHON`, a Python with `great_expectations`, run `-I` from a temp directory with no token in its environment); one GX refuses to load fails, and one not loaded is NOT CHECKED. Every directory under `--repo` holding `great_expectations.yml` must be covered by a `--gx`.
+- **Placeholders are not owners or channels.** Empty, a bare `#` or `@`, `<...>`, anything containing `example`, and `TODO`, `TBD`, `none`, `n/a`, `changeme`, `owner`, `team` and the like fail.
+- **Never both.** `--repo` (default `.`) is scanned for Elementary (`elementary-data/elementary` in `packages.yml` or `dependencies.yml`, or `elementary-data` in a Python dependency file) and GX (`great_expectations.yml`, or `great_expectations` or `great-expectations` anywhere in a dependency line: the Airflow provider, a `requirements*.txt` or any `.txt` under a `requirements/` folder, `pyproject.toml`, and a `Dockerfile` or `*.dockerfile`). Both in one repository exit 1. `dbt_packages/`, `target/`, virtualenvs and comments are not read.
+- **NOT CHECKED is exit 2, never a pass,** and `governance.yml` records it as `not_run` and fails the job. A problem found elsewhere in the same run still exits 1, with the unchecked inputs listed under it.
+- **Nothing from the repository reaches the log as a command.** Control characters in a path or a name are printed as `\u000a`-style escapes, no output line may start with `::`, and `governance.yml` prints each check between `::stop-commands::` markers.
+- `test/monitors-engine.sh` proves it in the self-test on what the tools write: `dbt parse` with the Elementary package (dbt-core 1.12.6, dbt-duckdb 1.11.1, elementary 0.26.1) and GX Core 1.24.1 contexts, each installed from a hash-pinned file under `requirements/`. Each case the review found (a stale and a foreign manifest, placeholders, an eleven-year suppression, an email action GX refuses, a second project and a second context, GX through the Airflow provider, `requirements/prod.txt` and a `Dockerfile`, and a directory name that would inject a workflow command) is a line there.
+
 ## What is in this repo
 
 - `.github/workflows/`: the gates above, and `self-test`, `fact-scan`, `zizmor` and `release`.
-- `scripts/`: `governance-check.mjs` and `bq-dry-run-check.mjs` (Node 20+, no dependencies), `next-tag.mjs`, `publish-evidence.sh`.
-- `test/`: `governance-check.test.mjs` and `bq-dry-run-check.test.mjs` (`node --test test/*.test.mjs`) and `run-blocks.mjs`, which runs each gate's `run:` blocks against `test/fixtures/` in a temp git repo, evaluating each step's `if:` and putting a recording stand-in for `gh` on the PATH (needs `bash`, `git`, `node`, and Python with PyYAML; `datacontract-cli` for the contract cases). A failing fixture carries `expect-log`, so it must fail for its stated reason.
+- `scripts/`: `governance-check.mjs` and `bq-dry-run-check.mjs` (Node 20+, no dependencies), `next-tag.mjs`, `version-check.mjs` (the self-test fails a PR whose `VERSION` is not the tag its `semver:` label will cut), `run-governance-checks.sh` and `dbt-parse.sh` (`governance.yml`'s check and parse steps), `publish-evidence.sh`.
+- `test/`: `governance-check.test.mjs`, `monitors-check.test.mjs`, `governance-run.test.mjs` and `bq-dry-run-check.test.mjs` (`node --test test/*.test.mjs`) and `run-blocks.mjs`, which runs each gate's `run:` blocks against `test/fixtures/` in a temp git repo, evaluating each step's `if:` and putting a recording stand-in for `gh` on the PATH (needs `bash`, `git`, `node`, and Python with PyYAML; `datacontract-cli` for the contract cases). A failing fixture carries `expect-log`, so it must fail for its stated reason.
 
 ## Rules for changes here
 

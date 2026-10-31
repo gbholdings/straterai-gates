@@ -1,0 +1,15 @@
+version: 2
+models:
+  # Elementary installed and no monitor declared: nothing to check, so NOT CHECKED, never a pass
+  - name: orders
+    config:
+      meta:
+        owner: "@data-platform"
+        channel: data-alerts
+    data_tests:
+      - not_null:
+          column_name: order_id
+  - name: customers
+    config:
+      meta:
+        owner: "@data-platform"

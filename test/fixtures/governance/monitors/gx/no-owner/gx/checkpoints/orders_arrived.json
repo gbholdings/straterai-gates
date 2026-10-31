@@ -1,0 +1,27 @@
+{
+  "actions": [
+    {
+      "name": "page_data_platform",
+      "notify_on": "failure",
+      "notify_with": null,
+      "renderer": {
+        "class_name": "SlackRenderer",
+        "module_name": "great_expectations.render.renderer.slack_renderer"
+      },
+      "show_failed_expectations": false,
+      "slack_channel": null,
+      "slack_token": null,
+      "slack_webhook": "${SLACK_WEBHOOK}",
+      "type": "slack"
+    }
+  ],
+  "id": "00000000-0000-0000-0000-000000000000",
+  "name": "orders_arrived",
+  "result_format": "SUMMARY",
+  "validation_definitions": [
+    {
+      "id": "00000000-0000-0000-0000-000000000000",
+      "name": "orders_arrived"
+    }
+  ]
+}
