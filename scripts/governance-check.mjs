@@ -12,12 +12,13 @@
 // Python runs isolated (-I: no script or working directory on sys.path, no PYTHON* variables, no user
 // site-packages) from the system temp directory, so a yaml.py or json.py in the repository under review
 // is never the module that loads.
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 
-export const VERSION = "1.2.0";
+export const VERSION = "1.3.0";
 const RESULTS = ["pass", "fail", "not_run"];
 const DEFAULT_EVIDENCE = "governance/evidence.json";
 
@@ -158,6 +159,389 @@ function readJson(file, what) {
   } catch (e) {
     throw new Exit(2, `${what} ${file}: not valid JSON: ${e.message}`);
   }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// monitors: every run-time monitor reaches a person. Each Elementary test in a dbt manifest, and each GX
+// checkpoint in a file data context, must name a deliverable alert destination and a real owner, and one
+// repository must not configure both Elementary and GX. Every dbt project that uses Elementary and every GX
+// context under --repo must be covered by an input, each manifest must be this repository's and newer than
+// every project file, and each GX context must load in GX itself. Anything the check could not look at is
+// NOT CHECKED (exit 2), never a pass.
+//
+// Elementary reads `channel`, `owner` and `alert_suppression_interval` from the test's meta over the model's,
+// each at the top of meta or under `alerts_config` (elementary/monitor/fetchers/alerts/schema/alert_data.py
+// at 54368c6381caa2d00569b4b49c512ff0a31e9457). dbt 1.10+ writes meta under `config.meta`; both are read.
+
+const SKIP_DIRS = new Set([".git", "node_modules", "dbt_packages", "dbt_modules", "target", "logs", ".venv", "venv", "site-packages", "__pycache__", ".gates"]);
+const REQ_FILE = /^(requirements[\w.-]*\.(txt|in)|constraints[\w.-]*\.txt|pyproject\.toml|Pipfile|setup\.cfg|setup\.py|environment\.ya?ml)$/i;
+const DOCKER_FILE = /^(Dockerfile|Containerfile)([.-][\w.-]+)?$|\.(dockerfile|containerfile)$/i;
+// Hours. Past a week, a monitor that fired once stays silent through a week of further failures.
+export const MAX_SUPPRESSION_HOURS = 168;
+
+// Text from the repository (paths, model and test names) printed into the Actions log. A newline in a name
+// would start a new line, and a line that starts with `::` is a workflow command, so control characters are
+// written as escapes and nothing interpolated can begin a line.
+export const q = (v) => String(v).replace(/[\u0000-\u001f\u007f\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+
+function repoFiles(root) {
+  const out = [];
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) {
+        if (!SKIP_DIRS.has(e.name)) walk(p);
+      } else if (e.isFile()) out.push(p);
+    }
+  };
+  walk(root);
+  return out;
+}
+
+const relTo = (root, f) => path.relative(root, f).split(path.sep).join("/") || ".";
+// A dependency file: a requirements or constraints file wherever it sits (requirements/prod.txt too), a
+// Python project file, or a container build file.
+const isReqFile = (f, root) => {
+  const base = path.basename(f);
+  if (REQ_FILE.test(base) || DOCKER_FILE.test(base)) return true;
+  return /\.(txt|in)$/i.test(base) && relTo(root, path.dirname(f)).split("/").some((s) => /^(requirements|constraints)$/i.test(s));
+};
+
+const dbtProjectName = (file) => /^name:\s*["']?([A-Za-z_][\w]*)["']?\s*(#.*)?$/m.exec(fs.readFileSync(file, "utf8"))?.[1] ?? null;
+const usesElementary = (lines) => lines.some((l) => /elementary-data\/(elementary|dbt-data-reliability)\b/i.test(l));
+const stripComments = (text) => text.split(/\r?\n/).map((l) => l.replace(/#.*$/, ""));
+
+// What the repository configures: the tools, with the files that say so, every dbt project (and whether its
+// packages pull in Elementary) and every GX file context. Comments are ignored.
+export function detectMonitorTools(root) {
+  const found = { elementary: [], gx: [], dbtProjects: [], gxContexts: [] };
+  const files = repoFiles(root);
+  for (const f of files) {
+    const base = path.basename(f);
+    const rel = relTo(root, f);
+    if (base === "great_expectations.yml") {
+      found.gx.push(rel);
+      found.gxContexts.push({ dir: path.dirname(f), rel: relTo(root, path.dirname(f)) });
+    }
+    if (base === "dbt_project.yml") {
+      const dir = path.dirname(f);
+      const pk = ["packages.yml", "packages.yaml", "dependencies.yml", "dependencies.yaml"].map((n) => path.join(dir, n)).filter((p) => fs.existsSync(p));
+      found.dbtProjects.push({ dir, rel: relTo(root, dir), name: dbtProjectName(f), elementary: pk.some((p) => usesElementary(stripComments(fs.readFileSync(p, "utf8")))) });
+    }
+    const isPackages = /^(packages|dependencies)\.ya?ml$/.test(base);
+    const isReq = isReqFile(f, root);
+    if (!isPackages && !isReq) continue;
+    const lines = stripComments(fs.readFileSync(f, "utf8"));
+    if (isPackages && usesElementary(lines)) found.elementary.push(rel);
+    if (isReq) {
+      // great_expectations, great-expectations, and anything that pulls it in by name, such as
+      // apache-airflow-providers-great-expectations or `RUN pip install great_expectations`
+      if (lines.some((l) => /great[-_]expectations\b/i.test(l))) found.gx.push(rel);
+      if (lines.some((l) => /(^|[^\w/-])elementary-data\b/i.test(l))) found.elementary.push(rel);
+    }
+  }
+  return found;
+}
+
+// A name a person can be reached at, or a list of them. Placeholders are not names: empty, a bare `#` or
+// `@`, `<...>`, TODO, TBD, none, n/a, changeme, example, and the bare words owner and team.
+const PLACEHOLDER = /^(todo|tbd|tba|fixme|xxx+|none|null|nil|n\/?a|na|changeme|change[-_ ]?me|replace[-_ ]?me|placeholder|owner|team|channel|someone|unknown|default|\?+|-+|_+)$/i;
+export function isPlaceholder(s) {
+  const t = String(s).trim();
+  if (/^<.*>$/.test(t) || /example/i.test(t)) return true;
+  const bare = t.replace(/^[#@]+/, "").trim();
+  return bare === "" || PLACEHOLDER.test(bare) || /^(todo|tbd|fixme)\b/i.test(bare);
+}
+// The usable names in a value, and the placeholders found in it. Anything that is not a string or a list of
+// strings (a number, an object, a list holding one) holds no name.
+const names = (v) => {
+  const list = Array.isArray(v) ? v : v === undefined || v === null ? [] : [v];
+  if (!list.every((x) => typeof x === "string")) return { ok: [], bad: [] };
+  const trimmed = list.map((x) => x.trim()).filter(Boolean);
+  return { ok: trimmed.filter((x) => !isPlaceholder(x)), bad: trimmed.filter(isPlaceholder) };
+};
+const why = (n, what) => (n.bad.length ? `${what} is a placeholder (${n.bad.map((b) => JSON.stringify(q(b))).join(", ")})` : `no ${what}`);
+
+// Elementary's view of a node's meta: config.meta over meta, then alerts_config flattened on top.
+function elementaryMeta(node) {
+  const m = { ...(node?.meta ?? {}), ...(node?.config?.meta ?? {}) };
+  const ac = m.alerts_config && typeof m.alerts_config === "object" ? m.alerts_config : {};
+  const flat = { ...m, ...ac };
+  delete flat.alerts_config;
+  return flat;
+}
+
+const sha256 = (s) => crypto.createHash("sha256").update(s, "utf8").digest("hex");
+const PROJECT_EXT = /\.(sql|ya?ml|csv|py|md|jinja2?)$/i;
+
+// The files dbt reads for a project: its config files and everything under its resource paths
+// (dbt_project.yml's model-paths, seed-paths and the rest, each defaulting to dbt's own folder name). A
+// script, a README or a CI file beside the project is not an input, so editing one does not make the
+// manifest stale.
+const RESOURCE_PATHS = { "model-paths": ["models"], "seed-paths": ["seeds"], "test-paths": ["tests"], "analysis-paths": ["analyses"], "macro-paths": ["macros"], "snapshot-paths": ["snapshots"], "docs-paths": [] };
+const DBT_CONFIG_FILES = ["dbt_project.yml", "packages.yml", "packages.yaml", "dependencies.yml", "dependencies.yaml", "selectors.yml"];
+function dbtInputs(dir) {
+  const text = fs.readFileSync(path.join(dir, "dbt_project.yml"), "utf8");
+  const dirs = new Set();
+  for (const [key, def] of Object.entries(RESOURCE_PATHS)) {
+    const inline = new RegExp(`^${key}:[ \\t]*\\[([^\\]]*)\\]`, "m").exec(text);
+    const block = new RegExp(`^${key}:[ \\t]*(?:#.*)?\\r?\\n((?:[ \\t]+-[^\\n]*\\r?\\n?)+)`, "m").exec(text);
+    const list = inline ? inline[1].split(",") : block ? block[1].split(/\r?\n/).map((l) => l.replace(/^\s*-\s*/, "")) : def;
+    for (const v of list.map((x) => x.replace(/#.*$/, "").trim().replace(/^["']|["']$/g, "")).filter(Boolean)) dirs.add(v);
+  }
+  const out = DBT_CONFIG_FILES.map((f) => path.join(dir, f)).filter((f) => fs.existsSync(f));
+  for (const d of dirs) {
+    const p = path.resolve(dir, d);
+    if (p.startsWith(path.resolve(dir)) && fs.existsSync(p) && fs.statSync(p).isDirectory()) out.push(...repoFiles(p));
+  }
+  return [...new Set(out)];
+}
+
+// Why a manifest is not a current parse of the dbt project at `proj.dir`, or [] when it is. dbt checksums a
+// .sql file as sha256 of its stripped text; every .sql in the project is a node or a macro of the project's
+// package; and no project file is newer than the manifest's generated_at (a schema.yml carries no checksum,
+// so its mtime is what ties it).
+function manifestStaleness(m, proj) {
+  const pkg = m.metadata.project_name;
+  const reasons = [];
+  const listed = new Set();
+  const own = [m.nodes, m.sources, m.macros, m.exposures, m.metrics, m.semantic_models, m.saved_queries, m.unit_tests]
+    .flatMap((o) => Object.values(o ?? {}))
+    .filter((n) => n?.package_name === pkg);
+  for (const n of own) {
+    const files = [n.original_file_path, typeof n.patch_path === "string" ? n.patch_path.replace(/^[\w-]+:\/\//, "") : null].filter((x) => typeof x === "string" && x);
+    for (const rel of files) {
+      listed.add(rel.split(path.sep).join("/"));
+      const p = path.join(proj.dir, rel);
+      if (!fs.existsSync(p)) {
+        reasons.push(`${q(rel)} is in the manifest and not in ${q(proj.rel)}`);
+        continue;
+      }
+      if (rel === n.original_file_path && /\.sql$/i.test(rel) && n.checksum?.name === "sha256" && sha256(fs.readFileSync(p, "utf8").trim()) !== n.checksum.checksum)
+        reasons.push(`${q(rel)} has changed since the manifest was written`);
+    }
+  }
+  const files = dbtInputs(proj.dir);
+  for (const f of files) {
+    const rel = relTo(proj.dir, f);
+    if (/\.sql$/i.test(f) && !listed.has(rel)) reasons.push(`${q(rel)} is not in the manifest`);
+  }
+  const generated = Date.parse(m.metadata.generated_at ?? "");
+  if (!Number.isFinite(generated)) reasons.push("the manifest has no metadata.generated_at");
+  else {
+    const newer = files.filter((f) => PROJECT_EXT.test(f) && fs.statSync(f).mtimeMs > generated + 1).map((f) => relTo(proj.dir, f));
+    if (newer.length) reasons.push(`${newer.slice(0, 5).map(q).join(", ")}${newer.length > 5 ? ` and ${newer.length - 5} more` : ""} changed after the manifest was written (${q(m.metadata.generated_at)})`);
+  }
+  return [...new Set(reasons)];
+}
+
+function elementaryMonitors(manifestFile, tools, problems, counted, unchecked) {
+  const m = readJson(manifestFile, "--manifest");
+  const shown = q(manifestFile);
+  if (!/\/manifest\/v\d+/.test(m?.metadata?.dbt_schema_version ?? "")) throw new Exit(2, `--manifest ${shown}: not a dbt manifest (no metadata.dbt_schema_version)`);
+  const pkg = m.metadata.project_name;
+  const candidates = tools.dbtProjects.filter((p) => p.name && p.name === pkg);
+  if (!candidates.length) {
+    unchecked.push(`${shown} is the manifest of dbt project ${q(pkg ?? "(unnamed)")}, and --repo holds no dbt project of that name`);
+    return null;
+  }
+  const tried = candidates.map((p) => ({ p, reasons: manifestStaleness(m, p) }));
+  const tied = tried.find((t) => !t.reasons.length);
+  if (!tied) {
+    for (const t of tried) unchecked.push(`${shown} is not a current parse of ${q(t.p.rel)} (run dbt parse): ${t.reasons.slice(0, 5).join("; ")}`);
+    return null;
+  }
+  const nodes = m.nodes ?? {};
+  const sources = m.sources ?? {};
+  const tests = Object.entries(nodes).filter(([, n]) => n?.resource_type === "test" && n?.test_metadata?.namespace === "elementary");
+  if (!tests.length) {
+    unchecked.push(`${shown} holds no Elementary test, so there is nothing to check in ${q(tied.p.rel)}`);
+    return tied.p;
+  }
+  for (const [id, t] of tests) {
+    const parentId = t.attached_node ?? (t.depends_on?.nodes ?? []).find((x) => /^(model|source|seed|snapshot)\./.test(x));
+    const parent = parentId ? (nodes[parentId] ?? sources[parentId]) : undefined;
+    const tm = elementaryMeta(t);
+    const pm = elementaryMeta(parent);
+    const on = q(parent?.name ?? "(no model)");
+    const where = `${q(id)} (elementary.${q(t.test_metadata.name)} on ${on})`;
+    counted.push(where);
+    // the test's value wins, as in Elementary; an empty one on the test does not fall back to the model's
+    const pick = (k) => (k in tm ? tm[k] : pm[k]);
+    const channel = names(pick("channel"));
+    const owner = names(pick("owner"));
+    if (!channel.ok.length) problems.push(`${where}: ${why(channel, "alert destination")} (set meta.channel on the test or on ${on})`);
+    if (!owner.ok.length) problems.push(`${where}: ${why(owner, "owner")} (set meta.owner on ${on}; a monitor's owner is its dataset's)`);
+    const supp = pick("alert_suppression_interval");
+    if (supp !== undefined && supp !== null) {
+      const h = typeof supp === "number" ? supp : typeof supp === "string" && supp.trim() !== "" ? Number(supp) : NaN;
+      if (!Number.isFinite(h) || h < 0) problems.push(`${where}: alert_suppression_interval ${JSON.stringify(q(JSON.stringify(supp)))} is not a number of hours`);
+      else if (h > MAX_SUPPRESSION_HOURS) problems.push(`${where}: alert_suppression_interval ${h} hours silences the monitor for longer than ${MAX_SUPPRESSION_HOURS} after it fires`);
+    }
+  }
+  return tied.p;
+}
+
+// GX Core 1.x actions that send a notification, and the field sets that make one deliverable: each inner
+// list must be fully set. Slack takes a webhook, or a token with a channel; email takes the server, the port
+// and the receivers.
+const GX_ROUTES = {
+  slack: [["slack_webhook"], ["slack_token", "slack_channel"]],
+  microsoft: [["teams_webhook"]],
+  email: [["smtp_address", "smtp_port", "receiver_emails"]],
+  opsgenie: [["api_key"]],
+  api: [["url"]],
+};
+const isSet = (v) => (typeof v === "number" ? Number.isFinite(v) : names(v).ok.length > 0);
+
+function jsonFiles(dir) {
+  return fs.existsSync(dir) && fs.statSync(dir).isDirectory() ? fs.readdirSync(dir).filter((f) => f.endsWith(".json")).sort() : [];
+}
+
+// Loads the context and each checkpoint with GX itself, in a separate isolated Python, from a temp
+// directory. Prints {"error": <str|null>, "checkpoints": {<name>: <error|null>}}.
+const GX_LOAD = `
+import json, os, sys
+os.environ["GX_ANALYTICS_ENABLED"] = "false"
+out = {"error": None, "checkpoints": {}}
+try:
+    import great_expectations as gx
+    ctx = gx.get_context(mode="file", context_root_dir=sys.argv[1])
+except Exception as e:
+    out["error"] = (type(e).__name__ + ": " + str(e))[:400]
+else:
+    for name in sys.argv[2:]:
+        try:
+            ctx.checkpoints.get(name)
+            out["checkpoints"][name] = None
+        except Exception as e:
+            out["checkpoints"][name] = (type(e).__name__ + ": " + str(e))[:400]
+print("GATES-GX-LOAD " + json.dumps(out))
+`;
+
+function gxLoad(python, gxDir, cpNames) {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gates-gx-"));
+  try {
+    const env = { ...process.env, GX_ANALYTICS_ENABLED: "false" };
+    delete env.BASH_ENV;
+    delete env.ENV;
+    delete env.GH_TOKEN;
+    delete env.GITHUB_TOKEN;
+    const r = spawnSync(python, ["-I", "-c", GX_LOAD, path.resolve(gxDir), ...cpNames], { cwd, env, encoding: "utf8", timeout: 120000 });
+    const line = (r.stdout ?? "").split("\n").find((l) => l.startsWith("GATES-GX-LOAD "));
+    if (!line) return { fatal: `${q(python)} could not run GX (exit ${r.status ?? r.signal ?? r.error?.code}): ${q((r.stderr ?? "").trim().split("\n").slice(-1)[0] ?? "")}` };
+    return JSON.parse(line.slice("GATES-GX-LOAD ".length));
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+function gxMonitors(gxDir, python, problems, counted, unchecked) {
+  if (!fs.existsSync(gxDir) || !fs.statSync(gxDir).isDirectory()) throw new Exit(2, `--gx ${q(gxDir)}: no such directory`);
+  const cpDir = path.join(gxDir, "checkpoints");
+  const files = jsonFiles(cpDir);
+  if (!files.length) {
+    unchecked.push(`${q(cpDir)} holds no checkpoint (*.json), so there is nothing to check`);
+    return;
+  }
+  const index = (sub) => new Map(jsonFiles(path.join(gxDir, sub)).map((f) => readJson(path.join(gxDir, sub, f), sub)).map((j) => [j?.name, j]));
+  const vds = index("validation_definitions");
+  const suites = index("expectations");
+  const cps = files.map((f) => ({ f, cp: readJson(path.join(cpDir, f), "checkpoint") }));
+  for (const { f, cp } of cps) {
+    const where = `checkpoint ${q(cp?.name ?? f)}`;
+    counted.push(where);
+    const actions = (Array.isArray(cp?.actions) ? cp.actions : []).filter((a) => GX_ROUTES[a?.type] && (a.notify_on ?? "all") !== "success");
+    const deliverable = actions.filter((a) => GX_ROUTES[a.type].some((set) => set.every((k) => isSet(a[k]))));
+    if (!deliverable.length) {
+      const partial = actions.map((a) => `${q(a.type)} needs ${GX_ROUTES[a.type].map((s) => s.join(" + ")).join(" or ")}`);
+      problems.push(`${where}: no deliverable alert destination (${partial.length ? partial.join("; ") : `an action of type ${Object.keys(GX_ROUTES).join(", ")} with notify_on all or failure`})`);
+    }
+    for (const a of deliverable) {
+      for (const k of ["slack_channel", "receiver_emails"]) if (a[k] !== undefined && names(a[k]).bad.length) problems.push(`${where}: ${q(a.type)} ${k} is a placeholder`);
+    }
+    const refs = Array.isArray(cp?.validation_definitions) ? cp.validation_definitions : [];
+    if (!refs.length) problems.push(`${where}: validates nothing (no validation_definitions)`);
+    for (const ref of refs) {
+      const vd = vds.get(ref?.name);
+      const suite = vd && suites.get(vd?.suite?.name);
+      if (!vd) problems.push(`${where}: validation definition ${q(ref?.name ?? "(unnamed)")} is not in ${q(path.join(gxDir, "validation_definitions"))}`);
+      else if (!suite) problems.push(`${where}: suite ${q(vd?.suite?.name ?? "(unnamed)")} is not in ${q(path.join(gxDir, "expectations"))}`);
+      else {
+        const owner = names(suite?.meta?.owner);
+        if (!owner.ok.length) problems.push(`${where}: suite ${q(suite.name)} ${owner.bad.length ? "owner is a placeholder" : "has no owner"} (set meta.owner on the suite to its dataset's owner)`);
+      }
+    }
+  }
+  if (!python) {
+    unchecked.push(`GX context ${q(gxDir)} was not loaded in GX (pass --gx-python <python with great_expectations>, or set GATES_GX_PYTHON)`);
+    return;
+  }
+  const loaded = gxLoad(python, gxDir, cps.map(({ f, cp }) => cp?.name ?? f.replace(/\.json$/, "")));
+  if (loaded.fatal) unchecked.push(`GX context ${q(gxDir)}: ${loaded.fatal}`);
+  else if (loaded.error) problems.push(`GX context ${q(gxDir)}: GX refuses to load it: ${q(loaded.error)}`);
+  else for (const [n, err] of Object.entries(loaded.checkpoints ?? {})) if (err) problems.push(`checkpoint ${q(n)}: GX refuses to load it: ${q(err)}`);
+}
+
+const real = (p) => {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+};
+
+export function monitorsCheck(argv, env = process.env) {
+  const f = parseFlags(argv, ["repo", "manifest", "gx", "gx-python"], ["manifest", "gx"]);
+  const repo = f.repo ?? ".";
+  if (!fs.existsSync(repo) || !fs.statSync(repo).isDirectory()) throw new Exit(2, `--repo ${q(repo)}: no such directory`);
+  const manifests = f.manifest ?? [];
+  const gxDirs = f.gx ?? [];
+  const tools = detectMonitorTools(repo);
+  const both = (w) => new Exit(1, `monitors: ${w}; use Elementary in a dbt repo and GX elsewhere, never both`);
+  if (tools.elementary.length && tools.gx.length) throw both(`${q(repo)} configures both Elementary (${tools.elementary.map(q).join(", ")}) and GX (${tools.gx.map(q).join(", ")})`);
+  if (manifests.length && gxDirs.length) throw both("both --manifest (Elementary) and --gx (GX) were given");
+  if (manifests.length && tools.gx.length) throw both(`--manifest checks Elementary, and ${q(repo)} configures GX (${tools.gx.map(q).join(", ")})`);
+  if (gxDirs.length && tools.elementary.length) throw both(`--gx checks GX, and ${q(repo)} configures Elementary (${tools.elementary.map(q).join(", ")})`);
+  if (!manifests.length && !gxDirs.length) {
+    const which = tools.elementary.length
+      ? "Elementary is configured; pass --manifest target/manifest.json"
+      : tools.gx.length
+        ? "GX is configured; pass --gx <the gx directory>"
+        : `neither Elementary nor GX is configured in ${q(repo)}`;
+    throw new Exit(2, `monitors is NOT CHECKED: ${which}`);
+  }
+  const problems = [];
+  const counted = [];
+  const unchecked = [];
+  if (manifests.length) {
+    const covered = new Set();
+    for (const m of manifests) {
+      const p = elementaryMonitors(m, tools, problems, counted, unchecked);
+      if (p) covered.add(real(p.dir));
+    }
+    for (const p of tools.dbtProjects) if (p.elementary && !covered.has(real(p.dir))) unchecked.push(`dbt project ${q(p.rel)} uses Elementary and no --manifest covers it`);
+  } else {
+    const python = f["gx-python"] ?? env.GATES_GX_PYTHON ?? "";
+    const contexts = new Set(tools.gxContexts.map((c) => real(c.dir)));
+    const given = new Set();
+    for (const d of gxDirs) {
+      if (!contexts.has(real(d))) {
+        if (!fs.existsSync(d)) throw new Exit(2, `--gx ${q(d)}: no such directory`);
+        unchecked.push(`--gx ${q(d)} is not a GX context under --repo ${q(repo)} (no great_expectations.yml there)`);
+        continue;
+      }
+      given.add(real(d));
+      gxMonitors(d, python, problems, counted, unchecked);
+    }
+    for (const c of tools.gxContexts) if (!given.has(real(c.dir))) unchecked.push(`GX context ${q(c.rel)} is not covered by a --gx`);
+  }
+  const tool = manifests.length ? "Elementary" : "GX";
+  const lines = (xs) => xs.map((p) => `  ${p}`).join("\n");
+  const notChecked = unchecked.length ? `\nNOT CHECKED:\n${lines(unchecked)}` : "";
+  if (problems.length) throw new Exit(1, `monitors: ${problems.length} problem(s) in ${counted.length} ${tool} monitor(s)\n${lines(problems)}${notChecked}`);
+  if (unchecked.length) throw new Exit(2, `monitors is NOT CHECKED: ${unchecked.length} input(s) could not be checked (${counted.length} ${tool} monitor(s) were)${notChecked}`);
+  return `monitors: ${counted.length} ${tool} monitor(s), each with an alert destination and an owner`;
 }
 
 const isContractFile = (name) => /\.odcs\.(ya?ml|json)$/i.test(name);
@@ -785,6 +1169,7 @@ export function main(argv, env = process.env) {
   const [cmd, sub, ...rest] = argv;
   if (cmd === "version" || cmd === "--version") return VERSION;
   if (cmd === "evidence" && sub === "append") return evidenceAppend(rest, env);
+  if (cmd === "monitors") return monitorsCheck(argv.slice(1), env);
   if (cmd === "owner") return ownerCheck(argv.slice(1), env);
   if (cmd === "contract-schema") return contractSchemaCheck(argv.slice(1), env);
   if (cmd === "consumers") return consumersCmd(argv.slice(1), env);
@@ -794,6 +1179,7 @@ export function main(argv, env = process.env) {
       "usage: governance-check.mjs <command>",
       "  version",
       "  evidence append --check <name> --result pass|fail|not_run [--run-link <url>] [--commit <sha>] [--detail <text>] [--file <path>]",
+      "  monitors [--repo <dir>] (--manifest <manifest.json> ... | --gx <gx directory> ... [--gx-python <python>])",
       "  owner (--contracts <dir> | --contract <file> ...) [--manifest <manifest.json>]",
       "  contract-schema --contract <file> (--prisma <schema.prisma or folder> | --manifest <manifest.json> [--catalog <catalog.json>])",
       "  consumers --contract <file> [--format lines|markdown] [--label <path>]",
@@ -804,10 +1190,11 @@ export function main(argv, env = process.env) {
 if (process.argv[1] && path.basename(process.argv[1]) === "governance-check.mjs") {
   try {
     const out = main(process.argv.slice(2));
-    if (out) console.log(out);
+    if (out) console.log(String(out).replace(/^(\s*)::/gm, "$1: :"));
   } catch (e) {
     if (e instanceof Exit) {
-      console.error(`governance-check: ${e.message}`);
+      // no line of a message may start a workflow command, whatever it interpolated
+      console.error(`governance-check: ${e.message}`.replace(/^(\s*)::/gm, "$1: :"));
       process.exit(e.code);
     }
     console.error(`governance-check: ${e?.stack ?? e}`);
