@@ -1,6 +1,13 @@
-Each case holds `base/` (optional, the base branch tree), `head/` (the PR's tree) and `expect` (the exit code).
+Each case holds `base/` (optional, the base branch tree), `head/` (the PR's tree), `expect` (the exit code) and
+`expect-log` (lines the run must print, so a red case proves which check made it red). The approval cases add
+`event.json` (the pull request) and `reviews.json` (what `gh api graphql` returns; `test/bin/gh` prints it).
 
-`destructive-ignore` passes in this release because it ships only the lint step, and squawk honours a scoped
-`-- squawk-ignore <rule>` comment. The destructive-change approval guard arrives as a minor release and flips it
-to 1. `bare-ignore` (a `-- squawk-ignore` with no rule name) is not honoured by squawk 2.70.0: the lint fails on
-its own, observed 2026-10-30.
+- `ordinary`, `no-migration`: pass. `dangerous`: the lint fails (`require-concurrent-index-creation`).
+- `destructive-ignore`, `bare-ignore`: a `squawk-ignore` does not get a DROP COLUMN past the guard.
+- `cue-*`: the destructive changes that need a human. A dropped index (`cue-drop-index`, and a Prisma unique
+  change that renames it, `cue-drop-index-renamed`), a removed enum value (the type recreated: DROP TYPE, a type
+  change and a rename), a dropped default and a collation change each fail on their own rule. An index built
+  again under its name later in the file passes, and so does a COLLATE in a comment or a new table.
+- `cue-approved*`: an approval of the head commit by a writer who is not the author clears the guard, and the
+  lint still needs its scoped ignore (`cue-approved-no-ignore`). A stale commit, the author, a reader without
+  push access, and an approval since dismissed do not clear it; each says why.

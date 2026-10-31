@@ -6,10 +6,15 @@
 // `bash -e -o pipefail` as GitHub does, using the workflow's own env and input defaults. The first nonzero step stops
 // the case, as on a runner. A case may carry `inputs.json` (input overrides), `links` (lines of
 // "<path> <target>" committed as symlinks in head) and `expect-output` (lines that must appear in
-// $GITHUB_OUTPUT).
+// $GITHUB_OUTPUT), `expect-log` (lines that must appear in the steps' output, so a failing case proves which
+// check failed it), `event.json` (the pull request the event carries: {"number", "author", "repository"}) and
+// `reviews.json` (what `gh api graphql` returns for that pull request; "HEAD" in it becomes the head commit's
+// SHA). With reviews.json, test/bin goes first on PATH, so the gate's `gh` prints that file. Lines a step
+// appends to $GITHUB_ENV are in the environment of the steps after it, as on a runner.
 //
-// Expressions are resolved the narrow way these workflows use them: inputs.<name>, github.base_ref
-// (main here) and nothing else (vars.* and secrets.* are empty).
+// Expressions are resolved the narrow way these workflows use them: inputs.<name>, github.base_ref and
+// github.event.pull_request.base.ref (main here), github.event.pull_request.head.sha (the head commit), the
+// event.json fields, and nothing else (vars.*, secrets.* and other github.* are empty).
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -25,7 +30,7 @@ const GATES = [
     name: "squawk",
     workflow: "squawk.yml",
     fixtures: "squawk",
-    steps: ["Lint changed migrations"],
+    steps: ["Install the SQL parser", "Install squawk", "Destructive change needs an approving review", "Lint changed migrations"],
     inputs: { config_path: fwd(path.join(FIX, "squawk", "squawk.toml")) },
   },
   {
@@ -72,12 +77,16 @@ function load(workflow) {
   return JSON.parse(r.stdout);
 }
 
-function resolve(value, inputs) {
+function resolve(value, inputs, ctx = {}) {
   if (typeof value !== "string") return String(value);
   return value.replace(/\$\{\{\s*([^}]*?)\s*\}\}/g, (_, expr) => {
     let m;
     if ((m = /^inputs\.(\w+)$/.exec(expr))) return String(inputs[m[1]] ?? "");
-    if (expr === "github.base_ref") return "main";
+    if (expr === "github.base_ref" || expr === "github.event.pull_request.base.ref") return "main";
+    if (expr === "github.event.pull_request.head.sha") return ctx.head ?? "";
+    if (expr === "github.event.pull_request.number") return String(ctx.event?.number ?? "");
+    if (expr === "github.event.pull_request.user.login") return ctx.event?.author ?? "";
+    if (expr === "github.repository") return ctx.event?.repository ?? "";
     if (/^(vars|secrets|github)\./.test(expr)) return "";
     // A composite such as "squawk-cli@${{ inputs.x }}" is handled by the outer replace; anything else is unsupported.
     throw new Error(`unsupported expression: ${expr}`);
@@ -127,8 +136,20 @@ function runCase(gate, wf, caseName) {
   const repo = buildRepo(caseDir);
   const out = path.join(repo, "..", `${path.basename(repo)}.out`);
   fs.writeFileSync(out, "");
+  const envFile = path.join(repo, "..", `${path.basename(repo)}.env`);
+  fs.writeFileSync(envFile, "");
+  const read = (f) => (fs.existsSync(path.join(caseDir, f)) ? fs.readFileSync(path.join(caseDir, f), "utf8") : null);
+  const ctx = { head: sh("git", ["rev-parse", "HEAD"], repo, {}).trim(), event: JSON.parse(read("event.json") ?? "null") };
+  const extra = {};
+  const reviews = read("reviews.json");
+  if (reviews !== null) {
+    const f = path.join(repo, "..", `${path.basename(repo)}.reviews.json`);
+    fs.writeFileSync(f, reviews.replaceAll("HEAD", ctx.head));
+    extra.GH_STUB_REVIEWS = fwd(f);
+    extra.PATH = `${path.join(ROOT, "test", "bin")}${path.delimiter}${process.env.PATH}`;
+  }
   const baseEnv = {};
-  for (const [k, v] of Object.entries(wf.env)) baseEnv[k] = resolve(v, inputs);
+  for (const [k, v] of Object.entries(wf.env)) baseEnv[k] = resolve(v, inputs, ctx);
   let code = 0;
   let log = "";
   for (const step of wf.steps) {
@@ -138,8 +159,10 @@ function runCase(gate, wf, caseName) {
       if (step.if.includes("steps.changes.outputs.changed == 'true'") && !output.includes("changed=true")) continue;
       if (step.if.includes("inputs.lint_all != true") && String(inputs.lint_all) === "true") continue;
     }
-    const env = { ...baseEnv, GITHUB_OUTPUT: fwd(out), RUNNER_TEMP: fwd(os.tmpdir()) };
-    for (const [k, v] of Object.entries(step.env)) env[k] = resolve(v, inputs);
+    const added = {};
+    for (const l of fs.readFileSync(envFile, "utf8").split("\n")) if (l.includes("=")) added[l.slice(0, l.indexOf("="))] = l.slice(l.indexOf("=") + 1);
+    const env = { ...baseEnv, ...added, ...extra, GITHUB_OUTPUT: fwd(out), GITHUB_ENV: fwd(envFile), RUNNER_TEMP: fwd(os.tmpdir()) };
+    for (const [k, v] of Object.entries(step.env)) env[k] = resolve(v, inputs, ctx);
     const script = path.join(repo, "..", `${path.basename(repo)}.sh`);
     fs.writeFileSync(script, step.run);
     const r = spawnSync("bash", ["-e", "-o", "pipefail", fwd(script)], { cwd: repo, env: { ...process.env, ...env }, encoding: "utf8", timeout: 300000 });
@@ -155,6 +178,14 @@ function runCase(gate, wf, caseName) {
     const got = fs.readFileSync(out, "utf8");
     outputOk = fs.readFileSync(outputFile, "utf8").split("\n").filter(Boolean).every((l) => got.split("\n").includes(l));
     if (!outputOk) log += `--- expected GITHUB_OUTPUT to contain:\n${fs.readFileSync(outputFile, "utf8")}got:\n${got}\n`;
+  }
+  const logFile = path.join(caseDir, "expect-log");
+  if (fs.existsSync(logFile)) {
+    const missing = fs.readFileSync(logFile, "utf8").split("\n").filter(Boolean).filter((l) => !log.includes(l));
+    if (missing.length) {
+      outputOk = false;
+      log += `--- expected the log to contain:\n${missing.join("\n")}\n`;
+    }
   }
   fs.rmSync(repo, { recursive: true, force: true });
   return { code, outputOk, log };

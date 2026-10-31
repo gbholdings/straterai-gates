@@ -1,23 +1,73 @@
-# Reusable gate: squawk lint over the migrations a pull request adds or changes.
+# Reusable gate: a destructive-change guard and squawk lint over the migrations a pull request adds or changes.
 #
 # Caller stub (make "squawk / squawk" the required check; the name is caller job / called job):
 #
 #   name: squawk
-#   on: pull_request
+#   on:
+#     pull_request:
+#     pull_request_review:
+#       types: [submitted, dismissed]
 #   permissions:
 #     contents: read
+#     pull-requests: read
+#   concurrency:
+#     group: squawk-${{ github.event.pull_request.number }}
+#     cancel-in-progress: true
 #   jobs:
 #     squawk:
-#       uses: gbholdings/straterai-gates/.github/workflows/squawk.yml@<40-char sha> # v1.0.0
-#       with:
-#         migration_globs: ":(glob)prisma/migrations/**/migration.sql :(glob)migrations/**/*.sql"
+#       uses: gbholdings/straterai-gates/.github/workflows/squawk.yml@<40-char sha> # v1.2.0
+#
+# The review trigger makes an approval re-run the check, and the concurrency group lets only the latest run per
+# pull request report (a review submitted and then dismissed starts two runs on the same commit). The caller
+# must grant pull-requests: read, because the guard reads the reviews and a called workflow cannot exceed the
+# caller's permissions. The base and head come from the event's pull_request object, which both events carry
+# (github.base_ref is empty on pull_request_review), and the job checks out the head commit itself, so the
+# files it reads are the commit an approval names.
 #
 # No `paths:` filter on purpose: a required check from a path-filtered workflow never reports on a PR
 # outside those paths, and that PR waits on "Expected" forever. The job always runs and passes when the
 # PR adds or changes no migration.
 #
-# squawk reads the SQL as written: SQL built at run time (a DO block, EXECUTE format(...)) is not seen.
-# Read those by eye. The destructive-change approval guard is not in this release.
+# Protect the caller stub. On pull_request, Actions runs the PR's own copy of the caller, so a PR that edits
+# it (repoints `uses:`, drops the job) judges itself. Put .github/workflows/ in CODEOWNERS with "Require
+# review from Code Owners", or make the caller a ruleset-required workflow.
+#
+# The first step that reads the PR is the guard. It reads every migration file the PR adds or changes (git
+# --no-renames, so a renamed migration counts as new, every line of it) from its committed blob, by literal
+# path, and parses it with Postgres's own parser: libpg_query, through pglast (PGLAST below, pinned by wheel
+# hash). It never reads diff lines, squawk-ignore comments or the repo's squawk config, and comments and string
+# literals are never read as SQL. Each of these fails the job unless the PR has an approving review on its
+# current head commit from someone other than the author who can push to the repository:
+#   - DROP of any object, and ALTER TABLE DROP COLUMN, DROP CONSTRAINT, DROP DEFAULT or SET DEFAULT NULL,
+#     DROP EXPRESSION, DROP IDENTITY, DETACH PARTITION, NO INHERIT; ALTER DOMAIN DROP CONSTRAINT or DROP
+#     DEFAULT; DROP OWNED and REASSIGN OWNED; lo_unlink(). A foreign key added back under the same name on the
+#     same table, a policy created again under the same name on the same table, and an index built again under
+#     the same name, each later in the same file, do not count. DROP INDEX has its own rule, guard-drop-index:
+#     what it can break is a query plan, so the reviewer wants the index's idx_scan and the query sites;
+#   - TRUNCATE, DELETE, UPDATE, MERGE and INSERT ... ON CONFLICT DO UPDATE, wherever they sit (a CTE, a rule,
+#     a prepared statement, a function or procedure body), and any DO INSTEAD rule;
+#   - any RENAME, SET SCHEMA, ALTER COLUMN ... TYPE (guard-collation when it changes the COLLATE, which needs a
+#     reindex plan), SET NOT NULL, ADD COLUMN ... NOT NULL with no default (serial counts as a default),
+#     DISABLE or NO FORCE ROW LEVEL SECURITY, SET UNLOGGED, COPY ... PROGRAM, and COPY ... TO or lo_export()
+#     of a server file;
+#   - SQL the guard cannot read: a file the parser rejects (a psql meta-command is one), a NUL byte, a DO block
+#     or function body in any language but plpgsql or sql, an EXECUTE of anything but a constant string, a
+#     dblink call, and any setting that changes how later SQL is read (standard_conforming_strings,
+#     backslash_quote, escape_string_warning, client_encoding, search_path), by SET, set_config, ALTER
+#     DATABASE, ALTER ROLE or ALTER SYSTEM; only a session SET to a pg_dump header's value passes.
+# A symlink, a submodule or a file-type change at, above or under a migration folder fails with no approval
+# that clears it. An approver who pushed a commit to the PR still counts: turn on "Require approval of the
+# most recent reviewable push" in branch protection to stop that.
+#
+# What the guard cannot know, so a reviewer reads it by eye: what an existing function does when the migration
+# calls it, or when CREATE OR REPLACE changes one a trigger already calls; a new trigger whose function returns
+# NULL; whether a foreign key or policy added back matches the one dropped; RLS-equivalent weakening (GRANT ...
+# TO anon, BYPASSRLS); and a widening type change still needs the review, because the guard cannot see the old
+# type. It assumes the database runs with standard_conforming_strings on. The grammar is Postgres 18's.
+#
+# The last step is the ordinary squawk lint with the repo's config. An approved destructive migration needs
+# both: a scoped squawk-ignore so the lint passes, and the review so the guard passes. squawk is the release
+# binary, pinned by sha256 (squawk_sha256), so no package manager runs in the checkout.
 name: squawk
 on:
   workflow_call:
@@ -25,17 +75,25 @@ on:
       migration_globs:
         description: "Space-separated git pathspecs for migration files. Use :(glob) so ** also matches zero folders."
         type: string
-        default: ":(glob)prisma/migrations/**/migration.sql :(glob)migrations/**/*.sql :(glob)db/migrations/**/*.sql :(glob)db/migrate/**/*.sql"
-      squawk_version:
-        description: "squawk-cli version from npm."
+        default: ":(glob,icase)**/prisma/migrations/**/migration.sql :(glob,icase)**/supabase/migrations/**/*.sql :(glob,icase)**/migrations/**/*.sql :(glob,icase)**/db/migrate/**/*.sql :(glob,icase)**/db/migration/**/*.sql :(glob,icase)**/drizzle/**/*.sql"
+      migration_dirs:
+        description: "The folders migration_globs live in. Nothing at or under them, or named like a folder on the way to them, may be a symlink or a submodule. Change both together."
         type: string
-        default: "2.70.0"
+        default: "prisma/migrations supabase/migrations migrations db/migrate db/migration drizzle"
+      squawk_version:
+        description: "squawk release (github.com/sbdchd/squawk). Changing it needs squawk_sha256 for that release."
+        type: string
+        default: "2.71.0"
+      squawk_sha256:
+        description: "sha256 of the release's Linux binaries, as linux-x64=<hex> linux-arm64=<hex>."
+        type: string
+        default: "linux-x64=ab978cb412e5e5eb2f06aaa4c5035a1567f6eba53274d7d1e068f73169b88bbd linux-arm64=cc6b563f205e9d93472232ca21113c736d6e1f45a7ce700170b7e17bcecc9b7f"
       config_path:
         description: "Path of the repo's squawk config."
         type: string
         default: ".squawk.toml"
       lint_all:
-        description: "Lint every tracked file that matches, not only the PR's changes. For self-tests and first adoption."
+        description: "Check every tracked file that matches, not only the PR's changes. For self-tests and first adoption."
         type: boolean
         default: false
 permissions: {}
@@ -45,30 +103,623 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      pull-requests: read
     env:
-      BASE_REF: ${{ github.base_ref }}
+      # github.base_ref is empty on pull_request_review; the event's pull_request object has both refs on both.
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       MIGRATION_GLOBS: ${{ inputs.migration_globs }}
-      SQUAWK: "squawk-cli@${{ inputs.squawk_version }}"
+      MIGRATION_DIRS: ${{ inputs.migration_dirs }}
+      SQUAWK_VERSION: ${{ inputs.squawk_version }}
+      SQUAWK_SHA256: ${{ inputs.squawk_sha256 }}
       CONFIG_PATH: ${{ inputs.config_path }}
       LINT_ALL: ${{ inputs.lint_all }}
+      # The guard's parser: pglast 8.7 wraps libpg_query 18, Postgres's own parser. pip installs it with
+      # --require-hashes, so only these exact CPython 3.12 Linux wheels (x86_64, aarch64) are accepted.
+      PGLAST: "pglast==8.7 --hash=sha256:e1c2e041507b723ac4eb521846c2a0be76f0b52b4bfd22a7e8e3dce05e3c78cb --hash=sha256:02f7b819df3244870dabfe1e65f3797932bd33b738738c9ae7870157306fecee"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          # The PR's head commit, not the merge ref, so what the guard reads is what a review approves.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          node-version: 22
-      - name: Lint changed migrations
+          python-version: "3.12"
+      - name: Install the SQL parser
         run: |
-          set -uo pipefail
-          # The globs are a space-separated pathspec list on purpose, so $MIGRATION_GLOBS stays unquoted.
-          if [ "$LINT_ALL" = "true" ]; then
-            files=$(git -c core.attributesFile=/dev/null ls-files -- $MIGRATION_GLOBS)
-          else
-            BASE="origin/$BASE_REF"
-            git rev-parse -q --verify "$BASE^{commit}" >/dev/null || { echo "::error::cannot resolve $BASE"; exit 1; }
-            files=$(git -c core.attributesFile=/dev/null diff --name-only --no-renames --diff-filter=AM "$BASE...HEAD" -- $MIGRATION_GLOBS)
+          set -euo pipefail
+          # A venv outside the checkout, made from outside it with -I, so nothing in the repo is on any path
+          # (python -m puts the current folder first on sys.path, and a PR could plant a venv package there).
+          V="${RUNNER_TEMP:-/tmp}/pglast"
+          cd "${RUNNER_TEMP:-/tmp}"
+          python3 -I -m venv "$V"
+          printf '%s\n' "$PGLAST" > "$V.txt"
+          "$V/bin/python" -I -m pip install --quiet --disable-pip-version-check --no-deps --only-binary :all: --require-hashes -r "$V.txt"
+          "$V/bin/python" -I -c 'import pglast, pglast.parser as p; print("pglast", pglast.__version__, "parses as postgres", p.get_postgresql_version())'
+          echo "PGLAST_PY=$V/bin/python" >> "${GITHUB_ENV:-/dev/null}"
+      - name: Install squawk
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in x86_64) arch=linux-x64 ;; aarch64|arm64) arch=linux-arm64 ;; *) echo "::error::no squawk binary for $(uname -m)"; exit 1 ;; esac
+          want=""
+          for kv in $SQUAWK_SHA256; do [ "${kv%%=*}" = "$arch" ] && want="${kv#*=}"; done
+          [[ "$want" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::squawk_sha256 has no sha256 for $arch"; exit 1; }
+          D="${RUNNER_TEMP:-/tmp}/squawk-$SQUAWK_VERSION-$arch"
+          mkdir -p "$D"
+          if ! echo "$want  $D/squawk" | sha256sum -c --status 2>/dev/null; then
+            curl -fsSL --retry 3 -o "$D/squawk.part" "https://github.com/sbdchd/squawk/releases/download/v$SQUAWK_VERSION/squawk-$arch"
+            echo "$want  $D/squawk.part" | sha256sum -c --quiet || { echo "::error::squawk $SQUAWK_VERSION $arch does not match squawk_sha256"; exit 1; }
+            mv "$D/squawk.part" "$D/squawk"
           fi
-          if [ -z "$files" ]; then echo "no migration files changed"; exit 0; fi
-          npx --yes "$SQUAWK" -c "$CONFIG_PATH" $files
+          chmod +x "$D/squawk"
+          "$D/squawk" --version
+          echo "SQUAWK_BIN=$D/squawk" >> "${GITHUB_ENV:-/dev/null}"
+      - name: Destructive change needs an approving review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          # This step holds a token, so bash must not source a startup file named by the environment.
+          BASH_ENV: ""
+          ENV: ""
+        run: |
+          # -f: no pathname expansion, so $MIGRATION_GLOBS, $MIGRATION_DIRS and any other unquoted list reach
+          # git and the loops as written and never match files in the checkout.
+          set -f -uo pipefail
+          # No global attributes file; .gitattributes cannot hide anything here either, because nothing below
+          # reads a diff body: names, modes and blobs only.
+          G() { git -c core.attributesFile=/dev/null -c core.quotePath=false "$@"; }
+          # The range: the PR's changes against its base branch, or every tracked file (lint_all) against the
+          # empty tree. The checkout is the PR's head commit itself, which is the commit an approval names.
+          if [ "$LINT_ALL" = "true" ]; then
+            range=("$(G hash-object -t tree /dev/null)" HEAD)
+          else
+            [ -n "$BASE_REF" ] || { echo "::error::no pull request in this event: call the gate on pull_request or pull_request_review, or set lint_all"; exit 1; }
+            BASE="origin/$BASE_REF"
+            G rev-parse -q --verify "$BASE^{commit}" >/dev/null || { echo "::error::cannot resolve $BASE"; exit 1; }
+            range=("$BASE...HEAD")
+          fi
+          if [ -n "${HEAD_SHA:-}" ] && [ "$(G rev-parse HEAD)" != "$HEAD_SHA" ]; then
+            echo "::error::the checkout is $(G rev-parse HEAD), not the pull request's head commit $HEAD_SHA"; exit 1
+          fi
+          T=$(mktemp -d "${RUNNER_TEMP:-/tmp}/squawk-guard.XXXXXX")
+          hard=""
+          near() { # $1 is at or under a migration folder at any depth, or named like a folder on the way to one
+            local d p="/${1,,}/" b="${1##*/}"
+            b="${b,,}"
+            for d in $MIGRATION_DIRS; do
+              case "$p" in *"/$d/"*) return 0 ;; esac
+              case "/$d/" in *"/$b/"*) return 0 ;; esac
+            done
+            return 1
+          }
+          # 1. Symlinks and submodules anywhere near the migration folders in the PR's tree, changed or not, and
+          #    any file-type change there. Prisma and psql would read whatever a link points at.
+          while IFS= read -r -d '' e; do
+            mode=${e%% *}; p=${e#*$'\t'}
+            case "$mode" in 120000|160000) if near "$p"; then hard="$hard"$'\n'"> $p: mode $mode (symlink or submodule)"; fi ;; esac
+          done < <(G ls-tree -r -z --full-tree HEAD)
+          while IFS= read -r -d '' meta && IFS= read -r -d '' p; do
+            read -r _ newmode _ _ status <<< "$meta"
+            if [ "$status" = T ] && near "$p"; then hard="$hard"$'\n'"> $p: file type changed (now mode $newmode)"; fi
+          done < <(G diff --raw -z --no-renames --no-textconv --no-ext-diff "${range[@]}")
+          # 2. Every added or changed migration, from the committed blob, under a neutral name (f0001.sql, ...).
+          #    paths[] maps each back; nothing below reads a path as a glob.
+          mkdir -p "$T/raw"
+          files=() paths=()
+          # shellcheck disable=SC2086 # $MIGRATION_GLOBS splits into pathspecs on purpose; set -f stops globbing
+          while IFS= read -r -d '' p; do
+            mode=$(GIT_LITERAL_PATHSPECS=1 G ls-tree --full-tree HEAD -- "$p" | cut -d" " -f1)
+            case "$mode" in 100644|100755) ;; *) hard="$hard"$'\n'"> $p: not a regular file (mode ${mode:-none})"; continue ;; esac
+            n=$(printf 'f%04d.sql' $(( ${#files[@]} + 1 )))
+            G cat-file blob "HEAD:$p" > "$T/raw/$n"
+            files+=("$n") paths+=("$p")
+          done < <(G diff --name-only -z --no-renames --no-textconv --no-ext-diff --diff-filter=d "${range[@]}" -- $MIGRATION_GLOBS)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "squawk guard: no added or changed file matches MIGRATION_GLOBS ($MIGRATION_GLOBS)"
+          else
+            echo "squawk guard scans ${#files[@]} file(s):"
+            printf '  %s\n' "${paths[@]}"
+            printf '%s\0' "${paths[@]}" > "$T/paths"
+          fi
+          # 3. Parse each file with Postgres's parser and walk the tree. The script prints one line per finding.
+          : > "$T/found"
+          if [ ${#files[@]} -gt 0 ]; then
+            cat > "$T/guard.py" <<'PY'
+          import json, re, sys
+          from pglast import parser
+
+          DROP_CMDS = {
+              # DROP NOT NULL is not here: it only loosens a column, the expand half of expand/contract.
+              "AT_DropColumn": "DROP COLUMN", "AT_DropConstraint": "DROP CONSTRAINT",
+              "AT_DropExpression": "DROP EXPRESSION", "AT_DropIdentity": "DROP IDENTITY", "AT_DropInherit": "NO INHERIT",
+              "AT_DropOf": "NOT OF", "AT_DetachPartition": "DETACH PARTITION", "AT_DetachPartitionFinalize": "DETACH PARTITION",
+          }
+          OTHER_CMDS = {
+              "AT_AlterColumnType": ("guard-type-change", "ALTER COLUMN ... TYPE rewrites or reinterprets a column."),
+              "AT_SetNotNull": ("guard-required-column", "SET NOT NULL fails on existing NULLs and breaks writers that omit the column."),
+              "AT_DisableRowSecurity": ("guard-rls", "DISABLE ROW LEVEL SECURITY removes every policy's protection."),
+              "AT_NoForceRowSecurity": ("guard-rls", "NO FORCE ROW LEVEL SECURITY lets the table owner bypass its policies."),
+              "AT_SetUnLogged": ("guard-unlogged", "SET UNLOGGED loses the table's rows on a crash and on replicas."),
+          }
+          # dblink runs the SQL string it is handed, on any server, this one included; the parser sees only a string.
+          RUNS_SQL = {"dblink", "dblink_exec", "dblink_send_query", "dblink_open"}
+          # Large-object calls that delete an object or write a file on the database server.
+          LO_DROP, SERVER_FILE = {"lo_unlink"}, {"lo_export"}
+          # Settings that change how later SQL is read: the first four change how psql and the server split strings
+          # (a change mid-file, or on the database or role for every later session, could make them read a string
+          # where the parser read code); search_path changes which object every unqualified name means.
+          LEXER_SETTINGS = {"standard_conforming_strings", "backslash_quote", "escape_string_warning", "client_encoding", "search_path"}
+          # The values a pg_dump header sets in its own session, which are what the guard already assumes. Only a
+          # session SET or set_config to one of these passes; on a database, role or the system, nothing does.
+          SAFE_SESSION = {"standard_conforming_strings": {"on", "true"}, "client_encoding": {"utf8", "unicode"}, "search_path": {""}}
+          # Fields libpg_query writes as a bare struct, without the {"NodeType": {...}} wrapper the walk dispatches on.
+          TYPED_FIELDS = {"setstmt": "VariableSetStmt"}
+          SERIALS = {"serial", "serial4", "bigserial", "serial8", "smallserial", "serial2"}
+
+
+          class File:
+              def __init__(self, path, raw):
+                  self.path, self.raw, self.out = path, raw, []
+
+              def line(self, loc):
+                  return self.raw.count(b"\n", 0, max(loc, 0)) + 1
+
+              def flag(self, loc, rule, msg, where=""):
+                  self.out.append(f"> {self.path}:{self.line(loc)} {rule}: {msg}{where}")
+
+
+          def node_type(d):
+              if isinstance(d, dict) and len(d) == 1:
+                  (k, v), = d.items()
+                  if k[:1].isupper() and isinstance(v, dict):
+                      return k, v
+              return None, None
+
+
+          def rel_key(r):
+              r = r or {}
+              return (r.get("schemaname", ""), r.get("relname", ""))
+
+
+          def strings(v):
+              return [x["String"]["sval"] for x in (v or []) if isinstance(x, dict) and "String" in x]
+
+
+          def fk_adds(stmts):
+              """Where each top-level ALTER TABLE adds a named FOREIGN KEY: {(table, name): [(statement, command), ...]}."""
+              acc = {}
+              for i, s in enumerate(stmts):
+                  a = s.get("stmt", {}).get("AlterTableStmt")
+                  for j, c in enumerate((a or {}).get("cmds", [])):
+                      c = c.get("AlterTableCmd", {})
+                      con = c.get("def", {}).get("Constraint", {})
+                      if c.get("subtype") == "AT_AddConstraint" and con.get("contype") == "CONSTR_FOREIGN" and con.get("conname"):
+                          acc.setdefault((rel_key(a.get("relation")), con["conname"]), []).append((i, j))
+              return acc
+
+
+          def policy_adds(stmts):
+              """Where each top-level CREATE POLICY sits: {(schema, table, name): [statement, ...]}."""
+              acc = {}
+              for i, s in enumerate(stmts):
+                  p = s.get("stmt", {}).get("CreatePolicyStmt")
+                  if p and p.get("policy_name"):
+                      acc.setdefault(rel_key(p.get("table")) + (p["policy_name"],), []).append(i)
+              return acc
+
+
+          def index_adds(stmts):
+              """Where each top-level CREATE INDEX sits: {name: [(schema, statement), ...]}."""
+              acc = {}
+              for i, s in enumerate(stmts):
+                  x = s.get("stmt", {}).get("IndexStmt")
+                  if x and x.get("idxname"):
+                      acc.setdefault(x["idxname"], []).append(((x.get("relation") or {}).get("schemaname", ""), i))
+              return acc
+
+
+          def is_null(d):
+              """DEFAULT NULL, or NULL cast to a type: the same as dropping the default."""
+              _, n = node_type(d)
+              if n is not None and "arg" in n and node_type(d)[0] == "TypeCast":
+                  return is_null(n["arg"])
+              return bool(n) and node_type(d)[0] == "A_Const" and n.get("isnull") is True
+
+
+          def const_str(d):
+              _, n = node_type(d)
+              v = (n or {}).get("sval", {}).get("sval") if node_type(d)[0] == "A_Const" else None
+              return v if isinstance(v, str) else None
+
+
+          class Walker:
+              def __init__(self, f, fks, pols=None, idxs=None):
+                  self.f, self.fks, self.pols, self.idxs, self.at = f, fks, pols or {}, idxs or {}, None  # self.at: (statement, command) of a top-level ALTER TABLE command
+                  self.top = None  # index of the top-level statement being walked; None inside a body or an EXECUTE string
+                  self.persist, self.fn_set = set(), set()  # ids of SET clauses on a database/role/system, and on a function
+
+              # ---- SQL ----
+              def sql(self, text, loc, where):
+                  """Parse SQL text (a function body or an EXECUTE string) and walk it; loc is the outer statement."""
+                  self.at = self.top = None
+                  try:
+                      tree = json.loads(parser.parse_sql_json(text))
+                  except Exception as e:  # noqa: BLE001 - anything the parser rejects fails closed
+                      self.unparseable(e, loc, where)
+                      return
+                  for s in tree.get("stmts", []):
+                      self.walk(s.get("stmt"), loc, where, text)
+
+              def unparseable(self, e, loc, where):
+                  msg = str(e).splitlines()[0] if str(e) else type(e).__name__
+                  if 'near "\\"' in msg:
+                      self.f.flag(loc, "guard-psql-meta-command", f"a backslash outside a string or comment is a psql meta-command ({msg}); psql -f would run it", where)
+                  else:
+                      self.f.flag(loc, "guard-unparseable", f"the Postgres parser cannot read this ({msg}), so the guard cannot tell what it does", where)
+
+              def walk(self, tree, loc, where, src):
+                  if isinstance(tree, list):
+                      for x in tree:
+                          self.walk(x, loc, where, src)
+                      return
+                  if not isinstance(tree, dict):
+                      return
+                  t, n = node_type(tree)
+                  if t:
+                      self.node(t, n, loc, where, src)
+                  for k, v in (n if t else tree).items():
+                      if k in TYPED_FIELDS and isinstance(v, dict) and node_type(v)[0] is None:
+                          self.node(TYPED_FIELDS[k], v, loc, where, src)
+                      self.walk(v, loc, where, src)
+
+              def node(self, t, n, loc, where, src):
+                  f = self.f
+                  if t in ("CreateFunctionStmt", "AlterFunctionStmt"):
+                      # A function's own SET search_path (Supabase's linter asks for one) applies only while it runs.
+                      for d in n.get("options" if t == "CreateFunctionStmt" else "actions", []):
+                          de = d.get("DefElem") or {}
+                          vs = (de.get("arg") or {}).get("VariableSetStmt") if de.get("defname") == "set" else None
+                          if vs and vs.get("name", "").lower() == "search_path":
+                              self.fn_set.add(id(vs))
+                  if t == "DropStmt":
+                      kind = n.get("removeType", "").replace("OBJECT_", "")
+                      if kind == "INDEX" and n.get("behavior") != "DROP_CASCADE":
+                          if self.top is not None and all(self.index_back(o) for o in n.get("objects", [])):
+                              return  # the same index built again under its name later in the file (a changed definition)
+                          f.flag(loc, "guard-drop-index", "DROP INDEX removes an index a query may depend on; show the reviewer its pg_stat_user_indexes.idx_scan and the query sites that use it.", where)
+                          return
+                      if kind == "POLICY" and self.top is not None and all(self.policy_back(o) for o in n.get("objects", [])):
+                          return  # a policy edit (supabase db diff): the same policy, created again on the same table later in the file
+                      f.flag(loc, "guard-drop", f"DROP {kind.replace('_', ' ')} removes an object.", where)
+                  elif t.startswith("Drop") and t.endswith("Stmt"):
+                      f.flag(loc, "guard-drop", f"{t[4:-4]} drop removes an object.", where)
+                  elif t == "TruncateStmt":
+                      f.flag(loc, "guard-truncate", "TRUNCATE removes every row.", where)
+                  elif t in ("DeleteStmt", "UpdateStmt", "MergeStmt"):
+                      f.flag(loc, "guard-row-change", f"{t[:-4].upper()} changes or removes rows.", where)
+                  elif t == "InsertStmt" and n.get("onConflictClause", {}).get("action") == "ONCONFLICT_UPDATE":
+                      f.flag(loc, "guard-row-change", "INSERT ... ON CONFLICT DO UPDATE changes existing rows.", where)
+                  elif t == "RenameStmt" and n.get("renameType") == "OBJECT_INDEX":
+                      # Postgres runs ALTER INDEX t RENAME on a table named t too, and the guard cannot tell which it is.
+                      f.flag(loc, "guard-rename", "ALTER INDEX ... RENAME also renames a table of that name, which breaks its readers.", where)
+                  elif t == "RenameStmt" or (t == "AlterEnumStmt" and n.get("oldVal")):
+                      f.flag(loc, "guard-rename", "a rename breaks every reader that uses the old name.", where)
+                  elif t == "AlterObjectSchemaStmt":
+                      f.flag(loc, "guard-set-schema", "SET SCHEMA moves an object away from the name its readers use.", where)
+                  elif t == "ReassignOwnedStmt":
+                      f.flag(loc, "guard-drop", "REASSIGN OWNED moves every object a role owns.", where)
+                  elif t == "AlterTableStmt":
+                      rel = rel_key(n.get("relation"))
+                      for j, c in enumerate(n.get("cmds", [])):
+                          self.cmd(c.get("AlterTableCmd", {}), rel, loc, where, None if self.at is None else (self.at, j))
+                  elif t == "AlterDomainStmt" and n.get("subtype") in ("X", "N", "O"):
+                      f.flag(loc, "guard-drop" if n["subtype"] != "O" else "guard-required-column", "ALTER DOMAIN drops a constraint or changes NOT NULL.", where)
+                  elif t == "AlterDomainStmt" and n.get("subtype") == "T" and ("def" not in n or is_null(n["def"])):
+                      f.flag(loc, "guard-drop", "ALTER DOMAIN ... DROP DEFAULT (or SET DEFAULT NULL) leaves every later insert into its columns NULL.", where)
+                  elif t == "CopyStmt" and n.get("is_program"):
+                      f.flag(loc, "guard-copy-program", "COPY ... PROGRAM runs a shell command on the database server.", where)
+                  elif t == "CopyStmt" and n.get("filename") and not n.get("is_from"):
+                      f.flag(loc, "guard-server-file", "COPY ... TO a file overwrites that file on the database server.", where)
+                  elif t == "RuleStmt" and n.get("instead"):
+                      ev = n.get("event", "CMD_").replace("CMD_", "")
+                      f.flag(loc, "guard-rule", f"a DO INSTEAD rule replaces every {ev} on the table with its action, so what it writes can vanish.", where)
+                  elif t in ("AlterDatabaseSetStmt", "AlterRoleSetStmt", "AlterSystemStmt"):
+                      self.persist.add(id(n.get("setstmt")))  # read below, when the walk reaches the setstmt field
+                  elif t == "VariableSetStmt":
+                      self.setting(n, loc, where)
+                  elif t == "FuncCall":
+                      name = strings(n.get("funcname"))
+                      if name and name[-1].lower() in RUNS_SQL:
+                          f.flag(loc, "guard-dynamic-sql", f"{name[-1]}() runs a SQL string the guard cannot read.", where)
+                      elif name and name[-1].lower() in LO_DROP:
+                          f.flag(loc, "guard-drop", f"{name[-1]}() deletes a large object.", where)
+                      elif name and name[-1].lower() in SERVER_FILE:
+                          f.flag(loc, "guard-server-file", f"{name[-1]}() overwrites a file on the database server.", where)
+                      elif name and name[-1].lower() == "set_config":
+                          args = n.get("args") or [{}]
+                          a, v = const_str(args[0]), const_str(args[1]) if len(args) > 1 else None
+                          if not isinstance(a, str) or (a.lower() in LEXER_SETTINGS and not self.safe(a, v)):
+                              f.flag(loc, "guard-lexer-setting", "set_config() of this setting changes how later SQL is read.", where)
+                  elif t == "DoStmt":
+                      lang = next((d["DefElem"]["arg"]["String"]["sval"] for d in n.get("args", []) if d.get("DefElem", {}).get("defname") == "language"), "plpgsql")
+                      if lang.lower() != "plpgsql":
+                          f.flag(loc, "guard-dynamic-sql", f"a DO block in LANGUAGE {lang} is code the guard cannot read.", where)
+                      else:
+                          self.plpgsql(src, loc, " (in a DO block)")
+                  elif t == "CreateFunctionStmt":
+                      opts = {d["DefElem"]["defname"]: d["DefElem"].get("arg") for d in n.get("options", []) if "DefElem" in d}
+                      lang = (opts.get("language") or {}).get("String", {}).get("sval", "sql").lower()
+                      body = strings((opts.get("as") or {}).get("List", {}).get("items"))
+                      what = "procedure" if n.get("is_procedure") else "function"
+                      if n.get("sql_body"):
+                          return  # BEGIN ATOMIC / RETURN: already in this tree, and the generic walk reads it
+                      if lang == "sql" and len(body) == 1:
+                          self.sql(body[0], loc, f" (in a SQL {what} body)")
+                      elif lang == "plpgsql" and len(body) == 1:
+                          self.plpgsql(src, loc, f" (in a plpgsql {what} body)")
+                      else:
+                          f.flag(loc, "guard-dynamic-sql", f"a {what} in LANGUAGE {lang} is code the guard cannot read.", where)
+
+              def index_back(self, o):
+                  """True if a dropped index is created again under the same name (and schema, if named) later in the file."""
+                  name = strings(o.get("List", {}).get("items"))
+                  if not name:
+                      return False
+                  schema = name[-2] if len(name) > 1 else None
+                  return any(i > self.top and (schema is None or sc == schema) for sc, i in self.idxs.get(name[-1], []))
+
+              def policy_back(self, o):
+                  """True if a DROP POLICY object is created again, same schema, table and name, later in the file."""
+                  name = strings(o.get("List", {}).get("items"))
+                  if len(name) < 2:
+                      return False
+                  key = ((name[-3] if len(name) > 2 else ""), name[-2], name[-1])
+                  return any(i > self.top for i in self.pols.get(key, []))
+
+              @staticmethod
+              def safe(name, value):
+                  return value is not None and value.lower().replace("-", "").replace("_", "") in SAFE_SESSION.get(name.lower(), ())
+
+              def setting(self, n, loc, where):
+                  name = n.get("name", "").lower()
+                  if id(n) in self.persist:
+                      if name in LEXER_SETTINGS or n.get("kind") == "VAR_RESET_ALL":
+                          what = name or "every setting"
+                          self.f.flag(loc, "guard-lexer-setting", f"ALTER DATABASE/ROLE/SYSTEM of {what} lasts into every later session, so it changes how later migrations are read.", where)
+                      return
+                  if name not in LEXER_SETTINGS or id(n) in self.fn_set:
+                      return
+                  args = n.get("args") or []
+                  value = const_str(args[0]) if n.get("kind") == "VAR_SET_VALUE" and len(args) == 1 else None
+                  if not self.safe(name, value):
+                      self.f.flag(loc, "guard-lexer-setting", f"SET {n['name']} changes how the rest of this file is read.", where)
+
+              def cmd(self, c, rel, loc, where, pos):
+                  f, st = self.f, c.get("subtype")
+                  if st in DROP_CMDS:
+                      if st == "AT_DropConstraint" and pos is not None and any(p > pos for p in self.fks.get((rel, c.get("name")), [])):
+                          return  # Prisma's relation change: the same table's foreign key, added back under its name later in the file
+                      f.flag(loc, "guard-drop", f"{DROP_CMDS[st]} removes part of a table.", where)
+                  elif st == "AT_ColumnDefault" and ("def" not in c or is_null(c["def"])):
+                      f.flag(loc, "guard-drop", "DROP DEFAULT (or SET DEFAULT NULL) breaks writers that omit the column.", where)
+                  elif st == "AT_AlterColumnType" and (c.get("def", {}).get("ColumnDef") or {}).get("collClause"):
+                      f.flag(loc, "guard-collation", "changing a column's collation changes how it sorts and compares, and its indexes must be rebuilt; plan the reindex.", where)
+                  elif st in OTHER_CMDS:
+                      f.flag(loc, *OTHER_CMDS[st], where)
+                  elif st == "AT_AddColumn":
+                      col = c.get("def", {}).get("ColumnDef", {})
+                      cons = [x.get("Constraint", {}).get("contype") for x in col.get("constraints", [])]
+                      typ = strings(col.get("typeName", {}).get("names"))
+                      if len(typ) == 1 and typ[0].lower() in SERIALS and not col["typeName"].get("arrayBounds"):
+                          cons.append("CONSTR_DEFAULT")  # serial is an integer with a sequence default: every row gets a value
+                      if ({"CONSTR_NOTNULL", "CONSTR_PRIMARY"} & set(cons)) and not ({"CONSTR_DEFAULT", "CONSTR_IDENTITY", "CONSTR_GENERATED"} & set(cons)):
+                          f.flag(loc, "guard-required-column", "ADD COLUMN ... NOT NULL with no default fails on a table with rows and breaks writers that omit it.", where)
+
+              # ---- PL/pgSQL ----
+              def plpgsql(self, src, loc, where):
+                  try:
+                      fns = json.loads(parser.parse_plpgsql_json(src))
+                  except Exception as e:  # noqa: BLE001
+                      self.unparseable(e, loc, where)
+                      return
+                  if not any("action" in (fn.get("PLpgSQL_function") or {}) for fn in fns):
+                      # libpg_query hands back an empty function when it did not read the body as plpgsql
+                      self.f.flag(loc, "guard-unparseable", "the plpgsql parser returned no body for this", where)
+                      return
+                  self.pl(fns, loc, where, dynamic=False)
+
+              def pl(self, tree, loc, where, dynamic):
+                  if isinstance(tree, list):
+                      for x in tree:
+                          self.pl(x, loc, where, dynamic)
+                      return
+                  if not isinstance(tree, dict):
+                      return
+                  if "PLpgSQL_expr" in tree:
+                      e = tree["PLpgSQL_expr"]
+                      self.expr(e.get("query", ""), e.get("parseMode", 0), loc, where, dynamic)
+                      return
+                  for k, v in tree.items():
+                      dyn = k in ("PLpgSQL_stmt_dynexecute", "PLpgSQL_stmt_dynfors") or k == "dynquery"
+                      if dyn and k != "dynquery":
+                          self.pl(v.get("query"), loc, where, True)
+                          rest = {kk: vv for kk, vv in v.items() if kk != "query"}
+                          self.pl(rest, loc, where, False)
+                      else:
+                          self.pl(v, loc, where, dynamic or dyn)
+
+              def expr(self, q, mode, loc, where, dynamic):
+                  if mode in (3, 4, 5):  # an assignment, "target := expr": read the expression after the operator
+                      try:
+                          toks = parser.scan(q)
+                      except Exception as e:  # noqa: BLE001
+                          self.unparseable(e, loc, where)
+                          return
+                      op = next((t for t in toks if t.name in ("COLON_EQUALS", "ASCII_61")), None)
+                      if op is None:
+                          self.f.flag(loc, "guard-unparseable", f"cannot read the plpgsql assignment {q[:80]!r}", where)
+                          return
+                      q, mode = q[op.end + 1:], 2
+                  text = q if mode == 0 else f"SELECT {q}"
+                  if not dynamic:
+                      self.sql(text, loc, where)
+                      return
+                  # EXECUTE: a constant string is SQL the guard can read; anything built at run time is not.
+                  try:
+                      stmts = json.loads(parser.parse_sql_json(text)).get("stmts", [])
+                      tl = stmts[0]["stmt"]["SelectStmt"]["targetList"] if len(stmts) == 1 else None
+                      const = tl[0]["ResTarget"]["val"]["A_Const"]["sval"]["sval"] if tl and len(tl) == 1 and set(tl[0]["ResTarget"]) <= {"val", "location"} else None
+                  except Exception:  # noqa: BLE001
+                      const = None
+                  if isinstance(const, str):
+                      self.sql(const, loc, where.replace(")", ", in an EXECUTE string)") if where else " (in an EXECUTE string)")
+                  else:
+                      self.f.flag(loc, "guard-dynamic-sql", "EXECUTE runs SQL built at run time, which the guard cannot read.", where)
+
+
+          def scan_file(path, data):
+              if data.startswith(b"\xef\xbb\xbf"):
+                  data = data[3:]  # a UTF-8 byte-order mark, which psql -f skips too
+              f = File(path, data)
+              if b"\0" in data:
+                  # The parser stops at a NUL; psql drops the rest of that line and reads on.
+                  f.flag(data.index(b"\0"), "guard-unparseable", "the file holds a NUL byte, which hides the rest of it from the parser")
+                  return f.out
+              try:
+                  text = data.decode("utf-8")
+              except UnicodeDecodeError as e:
+                  f.flag(e.start, "guard-unparseable", "the file is not UTF-8")
+                  return f.out
+              try:
+                  tree = json.loads(parser.parse_sql_json(text))
+              except Exception as e:  # noqa: BLE001
+                  m = re.search(r"at index (\d+)", str(e))
+                  loc = len(text[: int(m.group(1))].encode()) if m else 0
+                  Walker(f, {}).unparseable(e, loc, "")
+                  return f.out
+              stmts = tree.get("stmts", [])
+              w = Walker(f, fk_adds(stmts), policy_adds(stmts), index_adds(stmts))
+              for i, s in enumerate(stmts):
+                  start = s.get("stmt_location", 0)
+                  ln = s.get("stmt_len", 0)
+                  src = data[start: start + ln if ln else len(data)].decode("utf-8")
+                  w.top = i
+                  w.at = i if "AlterTableStmt" in s.get("stmt", {}) else None
+                  w.walk(s.get("stmt"), start, "", src)
+              return f.out
+
+
+          def main(argv):
+              paths = open(argv[1], "rb").read().decode("utf-8").split("\0")[:-1]
+              for i, name in enumerate(argv[2:]):
+                  with open(name, "rb") as fh:
+                      data = fh.read()
+                  try:
+                      out = scan_file(paths[i], data)
+                  except Exception as e:  # noqa: BLE001 - a file the guard cannot finish reading needs a human
+                      out = [f"> {paths[i]}:1 guard-unparseable: the guard could not finish reading this file ({type(e).__name__})"]
+                  for line in out:
+                      print(line)
+
+
+          if __name__ == "__main__":
+              main(sys.argv)
+          PY
+            # -I: the venv's python, with no PYTHONPATH, user site or current folder on the import path.
+            if ! (cd "$T/raw" && "${PGLAST_PY:-python3}" -I "$T/guard.py" "$T/paths" "${files[@]}") > "$T/found" 2> "$T/err"; then
+              hard="$hard"$'\n'"> the guard's parser did not run: $(head -c 500 "$T/err")"
+            fi
+          fi
+          if [ -n "$hard" ]; then
+            echo "::error::The squawk guard could not check this PR's migrations, and no review clears that. Make each migration a regular file in its folder and push again."
+            printf '%s\n' "$hard"
+            exit 1
+          fi
+          if [ ! -s "$T/found" ]; then echo "no destructive migration change"; exit 0; fi
+          echo "Findings that need a human (read by the Postgres parser; squawk-ignore comments and .squawk.toml do not apply):"
+          cat "$T/found"
+          # 4. The approval: an APPROVED review on the current head commit, from a person other than the PR's
+          #    author who can push to the repository. A user's latest APPROVED / CHANGES_REQUESTED / DISMISSED
+          #    review is their verdict, as GitHub counts it; a COMMENTED review does not change it. One GraphQL
+          #    query reads every review with its commit and GitHub's own authorCanPushToRepository for its author,
+          #    which this job's read-only token may ask (the REST collaborator-permission call needs push access).
+          #    Each review that does not count says why in the log.
+          approver() {
+            if [ -z "${PR_NUMBER:-}" ] || [ -z "${HEAD_SHA:-}" ] || [ -z "${REPO:-}" ]; then
+              echo "no pull request in this event, so no review can clear it" >&2
+              return 0
+            fi
+            cat > "$T/reviews.py" <<'RV'
+          import json, sys
+          raw, dec, i, nodes = open(sys.argv[1], encoding="utf-8").read(), json.JSONDecoder(), 0, []
+          while True:  # gh --paginate prints one JSON document per page
+              while i < len(raw) and raw[i].isspace():
+                  i += 1
+              if i >= len(raw):
+                  break
+              page, i = dec.raw_decode(raw, i)
+              if page.get("errors"):
+                  sys.exit("GraphQL: " + json.dumps(page["errors"])[:300])
+              nodes += page["data"]["repository"]["pullRequest"]["reviews"]["nodes"]
+          for r in nodes:
+              a = r.get("author") or {}
+              if a.get("__typename") == "User":
+                  print("\t".join([a["login"], r["state"], (r.get("commit") or {}).get("oid") or "-", "push" if r.get("authorCanPushToRepository") is True else "no-push"]))
+          RV
+            # shellcheck disable=SC2016 # $owner, $name, $number and $endCursor are GraphQL variables, not shell ones
+            q='query($owner: String!, $name: String!, $number: Int!, $endCursor: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviews(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { state authorCanPushToRepository author { __typename login } commit { oid } } } } } }'
+            if ! gh api graphql --paginate -f query="$q" -f owner="${REPO%%/*}" -f name="${REPO#*/}" -F number="$PR_NUMBER" > "$T/reviews.json" 2> "$T/reviews.err" \
+              || ! "${PGLAST_PY:-python3}" -I "$T/reviews.py" "$T/reviews.json" > "$T/reviews" 2>> "$T/reviews.err"; then
+              echo "::warning::could not read this PR's reviews, so no approval counts: $(head -c 300 "$T/reviews.err")" >&2
+              return 0
+            fi
+            awk -F'\t' '$2 == "APPROVED" || $2 == "CHANGES_REQUESTED" || $2 == "DISMISSED" { s[$1] = $2 "\t" $3 "\t" $4 } END { for (u in s) print u "\t" s[u] }' "$T/reviews" \
+              | while IFS=$'\t' read -r u state sha push; do
+                  if [ "$state" != APPROVED ]; then echo "not counted: $u's latest verdict is $state" >&2
+                  elif [ "$sha" != "$HEAD_SHA" ]; then echo "not counted: $u approved $sha, not the head commit $HEAD_SHA" >&2
+                  elif [ "$u" = "$PR_AUTHOR" ]; then echo "not counted: $u is the PR's author" >&2
+                  elif [ "$push" != push ]; then echo "not counted: $u cannot push to this repository" >&2
+                  else echo "$u"; break
+                  fi
+                done
+          }
+          who=$(approver) || who=""
+          if [ -n "$who" ]; then
+            echo "::notice::Destructive migration approved by $who on $HEAD_SHA."
+            exit 0
+          fi
+          echo "::error::This PR drops, truncates, deletes, updates, renames, retypes or adds a required column (or ships SQL the guard cannot read). A human must approve that: an approving review on the current head commit from someone who can push to this repository and is not the author. Or remove it and use expand/contract with a backup step."
+          exit 1
+      - name: Lint changed migrations
+        if: ${{ !cancelled() }}
+        run: |
+          set -f -uo pipefail
+          # squawk reads each path as a glob, and on Linux no escape makes `[0]x.sql` name only itself. A path
+          # holding [, * or ? is linted from a copy under a neutral name, so the repo's excluded_paths do not
+          # apply to it; every other path is passed as it is, so they do.
+          G() { git -c core.attributesFile=/dev/null -c core.quotePath=false "$@"; }
+          if [ "$LINT_ALL" = "true" ]; then
+            range=("$(G hash-object -t tree /dev/null)" HEAD)
+          else
+            [ -n "$BASE_REF" ] || { echo "::error::no pull request in this event"; exit 1; }
+            range=("origin/$BASE_REF...HEAD")
+          fi
+          T=$(mktemp -d "${RUNNER_TEMP:-/tmp}/squawk-lint.XXXXXX")
+          files=()
+          # shellcheck disable=SC2086 # $MIGRATION_GLOBS splits into pathspecs on purpose; set -f stops globbing
+          while IFS= read -r -d '' f; do
+            case "$f" in
+              *[[*?]*)
+                n="$T/l$(printf '%04d' $(( ${#files[@]} + 1 ))).sql"
+                cp -- "$f" "$n"
+                echo "linting $f as $n"
+                files+=("$n") ;;
+              *) files+=("$f") ;;
+            esac
+          done < <(G diff -z --name-only --no-renames --no-textconv --no-ext-diff --diff-filter=AM "${range[@]}" -- $MIGRATION_GLOBS)
+          if [ "${#files[@]}" -eq 0 ]; then echo "no migration files changed"; exit 0; fi
+          "${SQUAWK_BIN:?the Install squawk step did not run}" -c "$CONFIG_PATH" "${files[@]}"
