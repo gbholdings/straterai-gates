@@ -44,16 +44,20 @@ const GATES = [
     name: "datacontract",
     workflow: "datacontract.yml",
     fixtures: "datacontract",
-    steps: [
-      "Build the fixture repository",
-      "Did a contract change?",
-      "Lint every contract",
-      "Contracts match the schema",
-      "Every contract has an owner",
-      "Breaking changes, deletions and retirements",
-      "Tell the consumers",
-      "Record evidence",
-    ],
+    jobs: {
+      contracts: [
+        "Check the inputs",
+        "Build the fixture repository",
+        "Did a contract change?",
+        "Lint every contract",
+        "Contracts match the schema",
+        "Every contract has an owner",
+        "Breaking changes, deletions and retirements",
+        "Record evidence",
+      ],
+      notice: ["Tell the consumers"],
+    },
+    handoff: "datacontract-breaking",
     inputs: {},
     gates: true,
   },
@@ -214,11 +218,19 @@ function makeLookup(inputs, ctx) {
         return "";
       case "env":
         return ctx.env[parts[1]] ?? "";
+      case "needs": {
+        const n = ctx.needs?.[parts[1]];
+        if (!n) return "";
+        if (parts[2] === "result") return n.result;
+        if (parts[2] === "outputs") return n.outputs[parts[3]] ?? "";
+        return "";
+      }
       case "secrets":
         return ctx.secrets[parts[1]] ?? "";
+      case "runner":
+        return parts[1] === "temp" ? fwd(ctx.runnerTemp ?? "") : "";
       case "vars":
       case "job":
-      case "runner":
         return "";
     }
     throw new Error(`unsupported expression: ${name} in: ${src}`);
@@ -253,6 +265,10 @@ function buildRepo(caseDir, work) {
   git("init", "-q", "-b", "main");
   git("config", "core.autocrlf", "false");
   copyTree(path.join(caseDir, "base"), repo);
+  // base-rename: [{ from, to }] renames a base file to a name a Windows checkout cannot hold (a newline,
+  // `<`, a backtick), so a case can carry a hostile path without the repository carrying one.
+  const renames = path.join(caseDir, "base-rename.json");
+  if (fs.existsSync(renames)) for (const { from, to } of JSON.parse(fs.readFileSync(renames, "utf8"))) fs.renameSync(path.join(repo, from), path.join(repo, to));
   git("add", "-A");
   git("commit", "-q", "--allow-empty", "-m", "base");
   git("update-ref", "refs/remotes/origin/main", "HEAD");
@@ -311,67 +327,110 @@ function runCase(gate, wf, caseName) {
   const eventFile = path.join(caseDir, "event.json");
   const event = { event_name: "pull_request", pr_number: 7, ...(fs.existsSync(eventFile) ? JSON.parse(fs.readFileSync(eventFile, "utf8")) : {}) };
   const work = fs.mkdtempSync(path.join(os.tmpdir(), "blocks-"));
-  const runnerTemp = path.join(work, "runner-temp");
-  fs.mkdirSync(runnerTemp);
   const repo = buildRepo(caseDir, work);
-  if (gate.gates) fs.cpSync(path.join(ROOT, "scripts"), path.join(repo, ".gates", "scripts"), { recursive: true });
   const gh = fakeGh(work, caseDir);
 
   const secretsFile = path.join(caseDir, "secrets.json");
   const secrets = fs.existsSync(secretsFile) ? JSON.parse(fs.readFileSync(secretsFile, "utf8")) : {};
-  const ctx = { steps: {}, event, repo, env: {}, secrets };
-  let failed = false;
-  ctx.fns = { success: () => !failed, failure: () => failed, always: () => true, cancelled: () => false };
-  const exprCtx = { fns: ctx.fns, lookup: makeLookup(inputs, ctx) };
-
-  const jobEnv = {};
-  for (const [k, v] of Object.entries(wf.env)) jobEnv[k] = interpolate(v, exprCtx);
-  ctx.env = { ...jobEnv };
-  const carried = {};
+  // A gate names the steps to run per job; one with `steps` runs those of the workflow's first job.
+  const plan = gate.jobs ?? { [Object.keys(wf.jobs)[0]]: gate.steps };
+  const needs = {};
   let code = 0;
   let log = "";
   let outputs = "";
-  wf.steps.forEach((step, i) => {
-    if (!step.run || !gate.steps.includes(step.name)) return;
-    const id = step.id ?? `__step${i}`;
-    let run;
-    if (step.if) {
-      const cond = String(step.if).replace(/^\s*\$\{\{\s*/, "").replace(/\s*\}\}\s*$/, "");
+  let first = true;
+  let firstTemp = null;
+  for (const [jobName, stepNames] of Object.entries(plan)) {
+    const job = wf.jobs[jobName];
+    if (!job) throw new Error(`${gate.workflow} has no job ${jobName}`);
+    // The first job runs in the PR's checkout. A later job gets an empty workspace (it checks out only
+    // the gates) and its own runner temp, into which the handed-over folder is copied, as an artifact is.
+    const workspace = first ? repo : fs.mkdtempSync(path.join(work, `ws-${jobName}-`));
+    const runnerTemp = fs.mkdtempSync(path.join(work, `runner-temp-${jobName}-`));
+    if (first) firstTemp = runnerTemp;
+    else if (gate.handoff && fs.existsSync(path.join(firstTemp, gate.handoff))) fs.cpSync(path.join(firstTemp, gate.handoff), path.join(runnerTemp, gate.handoff), { recursive: true });
+    if (gate.gates) fs.cpSync(path.join(ROOT, "scripts"), path.join(workspace, ".gates", "scripts"), { recursive: true });
+    if (gate.gates && fs.existsSync(path.join(ROOT, "requirements"))) fs.cpSync(path.join(ROOT, "requirements"), path.join(workspace, ".gates", "requirements"), { recursive: true });
+    const ctx = { steps: {}, event, repo: workspace, runnerTemp, env: {}, secrets, needs };
+    let failed = false;
+    const needFailed = () => job.needs.some((n) => needs[n]?.result === "failure");
+    ctx.fns = { success: () => !failed && !needFailed(), failure: () => failed || needFailed(), always: () => true, cancelled: () => false };
+    const exprCtx = { fns: ctx.fns, lookup: makeLookup(inputs, ctx) };
+    if (job.if) {
+      const cond = String(job.if).replace(/^\s*\$\{\{\s*/, "").replace(/\s*\}\}\s*$/, "");
       const r = evaluate(cond, exprCtx);
-      run = r.usesStatus ? r.truthy : !failed && r.truthy;
-    } else run = !failed;
-    if (!run) {
-      ctx.steps[id] = { outcome: "skipped", outputs: {} };
-      log += `--- ${step.name} (skipped)\n`;
-      return;
+      const run = r.usesStatus ? r.truthy : !needFailed() && r.truthy;
+      if (!run) {
+        log += `=== job ${jobName} (skipped)\n`;
+        needs[jobName] = { result: "skipped", outputs: {} };
+        first = false;
+        continue;
+      }
     }
-    const out = path.join(work, `${id}.out`);
-    const envFile = path.join(work, `${id}.env`);
-    fs.writeFileSync(out, "");
-    fs.writeFileSync(envFile, "");
-    const env = { ...jobEnv, ...carried, GITHUB_OUTPUT: fwd(out), GITHUB_ENV: fwd(envFile), RUNNER_TEMP: fwd(runnerTemp), GITHUB_WORKSPACE: fwd(repo), PATH: `${gh.bin}${path.delimiter}${process.env.PATH}` };
-    ctx.env = env;
-    for (const [k, v] of Object.entries(step.env)) env[k] = interpolate(v, exprCtx);
-    const script = path.join(work, `${id}.sh`);
-    fs.writeFileSync(script, step.run);
-    const r = spawnSync("bash", ["-e", "-o", "pipefail", fwd(script)], { cwd: repo, env: { ...process.env, ...env }, encoding: "utf8", timeout: 300000 });
-    log += `--- ${step.name} (exit ${r.status})\n${r.stdout}${r.stderr}`;
-    const stepOutputs = {};
-    for (const l of lines(out)) {
+    log += `=== job ${jobName}\n`;
+    const jobEnv = {};
+    for (const [k, v] of Object.entries(job.env)) jobEnv[k] = interpolate(v, exprCtx);
+    ctx.env = { ...jobEnv };
+    // pre-env: GITHUB_ENV lines an earlier step of the first job is taken to have written ({repo} is the
+    // checkout), so a case can prove a planted BASH_ENV is never sourced.
+    const carried = {};
+    if (first) for (const l of lines(path.join(caseDir, "pre-env"))) {
       const eq = l.indexOf("=");
-      if (eq > 0) stepOutputs[l.slice(0, eq)] = l.slice(eq + 1);
+      carried[l.slice(0, eq)] = l.slice(eq + 1).replaceAll("{repo}", fwd(repo));
     }
-    outputs += fs.readFileSync(out, "utf8");
-    for (const l of lines(envFile)) {
-      const eq = l.indexOf("=");
-      if (eq > 0) carried[l.slice(0, eq)] = l.slice(eq + 1);
-    }
-    ctx.steps[id] = { outcome: r.status === 0 ? "success" : "failure", outputs: stepOutputs };
-    if (r.status !== 0) {
-      failed = true;
-      if (!code) code = r.status ?? 1;
-    }
-  });
+    const summary = path.join(work, `${jobName}.summary`);
+    fs.writeFileSync(summary, "");
+    job.steps.forEach((step, i) => {
+      if (!step.run || !stepNames.includes(step.name)) return;
+      const id = step.id ?? `__step${i}`;
+      let run;
+      if (step.if) {
+        const cond = String(step.if).replace(/^\s*\$\{\{\s*/, "").replace(/\s*\}\}\s*$/, "");
+        const r = evaluate(cond, exprCtx);
+        run = r.usesStatus ? r.truthy : !failed && r.truthy;
+      } else run = !failed;
+      if (!run) {
+        ctx.steps[id] = { outcome: "skipped", outputs: {} };
+        log += `--- ${step.name} (skipped)\n`;
+        return;
+      }
+      const out = path.join(work, `${jobName}-${id}.out`);
+      const envFile = path.join(work, `${jobName}-${id}.env`);
+      fs.writeFileSync(out, "");
+      fs.writeFileSync(envFile, "");
+      const env = { ...jobEnv, ...carried, GITHUB_OUTPUT: fwd(out), GITHUB_ENV: fwd(envFile), GITHUB_STEP_SUMMARY: fwd(summary), RUNNER_TEMP: fwd(runnerTemp), GITHUB_WORKSPACE: fwd(workspace), PATH: `${gh.bin}${path.delimiter}${process.env.PATH}` };
+      ctx.env = env;
+      for (const [k, v] of Object.entries(step.env)) env[k] = interpolate(v, exprCtx);
+      const script = path.join(work, `${jobName}-${id}.sh`);
+      fs.writeFileSync(script, step.run);
+      // The step's shell, else the job's default, else GitHub's bash; {0} is the script.
+      const shell = (step.shell ?? job.shell ?? "bash -e -o pipefail {0}").trim().split(/\s+/).map((a) => (a === "{0}" ? fwd(script) : a));
+      const r = spawnSync(shell[0], shell.slice(1), { cwd: workspace, env: { ...process.env, ...env }, encoding: "utf8", timeout: 300000 });
+      log += `--- ${step.name} (exit ${r.status})\n${r.stdout}${r.stderr}`;
+      const stepOutputs = {};
+      for (const l of lines(out)) {
+        const eq = l.indexOf("=");
+        if (eq > 0) stepOutputs[l.slice(0, eq)] = l.slice(eq + 1);
+      }
+      outputs += fs.readFileSync(out, "utf8");
+      for (const l of lines(envFile)) {
+        const eq = l.indexOf("=");
+        if (eq > 0) carried[l.slice(0, eq)] = l.slice(eq + 1);
+      }
+      ctx.steps[id] = { outcome: r.status === 0 ? "success" : "failure", outputs: stepOutputs };
+      if (r.status !== 0) {
+        failed = true;
+        if (!code) code = r.status ?? 1;
+      }
+    });
+    const s = fs.readFileSync(summary, "utf8");
+    if (s) log += `--- step summary\n${s}`;
+    const jobOutputs = {};
+    for (const [k, v] of Object.entries(job.outputs)) jobOutputs[k] = interpolate(v, exprCtx);
+    needs[jobName] = { result: failed ? "failure" : "success", outputs: jobOutputs };
+    first = false;
+  }
+  const runnerTemp = firstTemp;
   let expectOk = true;
   const want = (file, haystack, what) => {
     const missing = lines(path.join(caseDir, file)).filter((l) => !haystack.includes(l));
@@ -384,6 +443,16 @@ function runCase(gate, wf, caseName) {
   want("expect-log", log, "the log");
   const ghLog = fs.readFileSync(gh.log, "utf8");
   want("expect-gh", ghLog, "the gh calls");
+  // reject-log and reject-gh: lines that must appear nowhere (a planted script's marker, a token value).
+  const reject = (file, haystack, what) => {
+    const found = lines(path.join(caseDir, file)).filter((l) => haystack.includes(l));
+    if (found.length) {
+      expectOk = false;
+      log += `--- expected ${what} NOT to contain:\n${found.join("\n")}\n`;
+    }
+  };
+  reject("reject-log", log + ghLog, "the log or the gh calls");
+  reject("reject-gh", ghLog, "the gh calls");
   // A case that expects no gh call gets none: a notice on a passing PR is a bug.
   if (!fs.existsSync(path.join(caseDir, "expect-gh")) && ghLog) {
     expectOk = false;

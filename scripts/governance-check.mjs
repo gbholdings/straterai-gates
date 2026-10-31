@@ -8,7 +8,12 @@
 // Contracts are ODCS YAML. Node has no YAML parser and this script has no dependencies, so a .yaml/.yml
 // contract is read through Python's PyYAML (safe_load), which datacontract-cli installs. No Python with
 // PyYAML exits 2. A .json contract is read directly. Set GOVERNANCE_PYTHON to pick the interpreter.
+//
+// Python runs isolated (-I: no script or working directory on sys.path, no PYTHON* variables, no user
+// site-packages) from the system temp directory, so a yaml.py or json.py in the repository under review
+// is never the module that loads.
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 
@@ -129,8 +134,9 @@ export function readStructured(file, env = process.env) {
     }
   }
   let lastErr = "";
+  const pyEnv = Object.fromEntries(Object.entries(env).filter(([k]) => !/^PYTHON/i.test(k)));
   for (const py of pythonCandidates(env)) {
-    const r = spawnSync(py, ["-c", PY_LOAD, file], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    const r = spawnSync(py, ["-I", "-c", PY_LOAD, path.resolve(file)], { cwd: os.tmpdir(), env: pyEnv, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
     if (r.error) {
       lastErr = r.error.message;
       continue;
@@ -303,11 +309,15 @@ export function normPhysical(t) {
   if (typeof t !== "string") return null;
   let s = t.trim().toLowerCase().replace(/\s+/g, " ").replace(/\s*\(\s*/g, "(").replace(/\s*,\s*/g, ",").replace(/\s*\)/g, ")");
   if (!s) return null;
+  // A Postgres array (`text[]`, `varchar(20)[]`) normalizes its element type and keeps the brackets.
+  const arr = /(?:\s*\[\s*\d*\s*\])+$/.exec(s);
+  const dims = arr ? "[]".repeat((arr[0].match(/\[/g) ?? []).length) : "";
+  if (arr) s = s.slice(0, arr.index).trim();
   const m = /^([a-z0-9_ ]+?)(\(.*\))?((?: with| without) time zone)?$/.exec(s);
-  if (!m) return { base: s, args: null };
+  if (!m) return { base: s + dims, args: null };
   let base = (m[1] + (m[3] ?? "")).trim();
   for (const [re, to] of ALIASES) if (re.test(base)) base = to;
-  return { base, args: m[2] ? m[2].slice(1, -1) : null };
+  return { base: base + dims, args: m[2] ? m[2].slice(1, -1) : null };
 }
 
 // Equal when the base types match and, if both carry arguments (length, precision), those match too.
@@ -384,10 +394,8 @@ const PG_NATIVE = {
   Json: "json", JsonB: "jsonb", ByteA: "bytea",
 };
 
-export function parsePrisma(text) {
+function prismaBlocks(text, label, blocks) {
   const lines = text.replace(/\r\n/g, "\n").split("\n");
-  const blocks = [];
-  let provider = null;
   let cur = null;
   let depth = 0;
   for (const raw of lines) {
@@ -413,7 +421,17 @@ export function parsePrisma(text) {
     }
     cur.lines.push(line);
   }
-  if (cur) throw new Exit(2, `schema.prisma: block ${cur.kind} ${cur.name} is not closed`);
+  if (cur) throw new Exit(2, `${label}: block ${cur.kind} ${cur.name} is not closed`);
+}
+
+// `text` is one schema, or a list of { label, text } for the files of a multi-file schema
+// (prismaSchemaFolder): enums, models and the datasource may sit in different files. A model's `schema`
+// is its @@schema, or null without one.
+export function parsePrisma(text) {
+  const files = Array.isArray(text) ? text : [{ label: "schema.prisma", text }];
+  const blocks = [];
+  let provider = null;
+  for (const f of files) prismaBlocks(f.text, f.label, blocks);
   const enums = new Set(blocks.filter((b) => b.kind === "enum").map((b) => b.name));
   const composites = new Set(blocks.filter((b) => b.kind === "type").map((b) => b.name));
   const modelNames = new Set(blocks.filter((b) => b.kind === "model" || b.kind === "view").map((b) => b.name));
@@ -427,12 +445,15 @@ export function parsePrisma(text) {
   const models = [];
   for (const b of blocks.filter((x) => x.kind === "model" || x.kind === "view")) {
     let table = b.name;
+    let schema = null;
     let ignored = false;
     const columns = [];
     for (const l of b.lines) {
       if (l.startsWith("@@")) {
         const mm = /^@@map\(\s*(?:name\s*:\s*)?"([^"]+)"/.exec(l);
         if (mm) table = mm[1];
+        const sm = /^@@schema\(\s*(?:map\s*:\s*)?"([^"]+)"/.exec(l);
+        if (sm) schema = sm[1];
         if (/^@@ignore\b/.test(l)) ignored = true;
         continue;
       }
@@ -454,19 +475,27 @@ export function parsePrisma(text) {
         native: dbM ? { name: dbM[1], args: dbM[2] ?? null } : null,
       });
     }
-    if (!ignored) models.push({ model: b.name, table, columns });
+    if (!ignored) models.push({ model: b.name, table, schema, columns });
   }
   return { provider, models };
 }
 
+const isPostgres = (provider) => provider === "postgresql" || provider === "postgres";
+
+// A scalar list is a Postgres array: logical `array`, physical `<element>[]`. `element` holds the
+// element's logical types, so a contract that says `logicalType: string, physicalType: text[]` (what
+// `datacontract import sql` writes for a `TEXT[]` column) agrees with `String[]`.
 function prismaColumnTypes(col, provider) {
-  if (col.list) return { logical: ["array"], physical: null };
+  if (col.list) {
+    const el = prismaColumnTypes({ ...col, list: false }, provider);
+    return { logical: ["array"], physical: el.physical && isPostgres(provider) && !col.isEnum ? `${el.physical}[]` : null, element: el.logical };
+  }
   if (col.isEnum) return { logical: ["string"], physical: null };
   if (col.type === "Unsupported") return { logical: null, physical: null };
   const s = PRISMA_SCALARS[col.type];
   if (!s) return { logical: null, physical: null };
   let physical = null;
-  if (provider === "postgresql" || provider === "postgres") {
+  if (isPostgres(provider)) {
     if (col.native) {
       const base = PG_NATIVE[col.native.name];
       physical = base ? (col.native.args ? `${base}(${col.native.args})` : base) : null;
@@ -480,18 +509,39 @@ function prismaColumnTypes(col, provider) {
 // ---------------------------------------------------------------------------------------------------
 // contract-schema: the contract's columns and types against the real schema.
 
+// A contract object names its table as `physicalName` (or `name`), optionally schema-qualified
+// (`billing.orders`). Without a qualifier, the schema is the one the contract's servers give, when they
+// give exactly one (`datacontract test` queries `<server schema>.<name>`).
+const unquote = (s) => s.replace(/^["`[]|["`\]]$/g, "");
+
+function splitQualified(name) {
+  const parts = name.split(".").map((x) => unquote(x.trim()));
+  return parts.length > 1 ? { table: parts[parts.length - 1], schema: parts[parts.length - 2] } : { table: parts[0], schema: null };
+}
+
+function serverSchemas(contract) {
+  const servers = Array.isArray(contract?.servers) ? contract.servers : contract?.servers && typeof contract.servers === "object" ? Object.values(contract.servers) : [];
+  return [...new Set(servers.map((s) => s && typeof s === "object" && typeof s.schema === "string" ? s.schema.trim() : "").filter(Boolean))];
+}
+
 function contractObjects(contract, file) {
   if (!contract || typeof contract !== "object" || Array.isArray(contract)) throw new Exit(1, `${file}: not a mapping`);
   if (!Array.isArray(contract.schema) || !contract.schema.length) throw new Exit(1, `${file}: has no schema objects to compare`);
+  const fromServers = serverSchemas(contract);
   return contract.schema.map((o, i) => {
     if (!o || typeof o !== "object") throw new Exit(1, `${file}: schema[${i}] is not a mapping`);
     const name = (typeof o.physicalName === "string" && o.physicalName) || o.name;
     if (typeof name !== "string" || !name) throw new Exit(1, `${file}: schema[${i}] has no name`);
     const props = Array.isArray(o.properties) ? o.properties : [];
     if (!props.length) throw new Exit(1, `${file}: schema object ${name} lists no properties`);
+    const q = splitQualified(name);
     return {
       label: o.name ?? name,
       name,
+      table: q.table,
+      // The qualifier wins; otherwise the servers' schema when there is exactly one.
+      schema: q.schema ?? (fromServers.length === 1 ? fromServers[0] : null),
+      qualified: q.schema !== null,
       properties: props.map((p, j) => {
         const col = p && ((typeof p.physicalName === "string" && p.physicalName) || p.name);
         if (typeof col !== "string" || !col) throw new Exit(1, `${file}: ${name}.properties[${j}] has no name`);
@@ -501,7 +551,9 @@ function contractObjects(contract, file) {
   });
 }
 
-// Compares one contract object with one source table: [{ name, logical: [..]|null, physical|null, nullable|null }].
+const isArrayPhysical = (t) => typeof t === "string" && (/\[\s*\d*\s*\]\s*$/.test(t) || /^\s*array\b/i.test(t));
+
+// Compares one contract object with one source table: [{ name, logical: [..]|null, physical|null, nullable|null, element? }].
 function compareColumns(where, obj, sourceCols, problems, notes) {
   const byName = new Map(sourceCols.map((c) => [c.name, c]));
   const lower = new Map(sourceCols.map((c) => [c.name.toLowerCase(), c]));
@@ -513,9 +565,12 @@ function compareColumns(where, obj, sourceCols, problems, notes) {
       continue;
     }
     if (p.logicalType !== null) {
+      // An array column may be described by its element type when the contract's physicalType is the
+      // array type itself: `datacontract import sql` writes `TEXT[]` as logicalType string.
+      const accepts = s.logical && s.element && isArrayPhysical(p.physicalType) ? [...s.logical, ...s.element] : s.logical;
       if (!ODCS_LOGICAL.includes(p.logicalType)) problems.push(`${where}.${p.name}: logicalType ${JSON.stringify(p.logicalType)} is not an ODCS logical type`);
-      else if (!s.logical) problems.push(`${where}.${p.name}: the schema type ${s.typeLabel ?? "(none)"} cannot be compared with logicalType ${p.logicalType}`);
-      else if (!s.logical.map(logicalClass).includes(logicalClass(p.logicalType))) problems.push(`${where}.${p.name}: contract logicalType ${p.logicalType}, schema type ${s.typeLabel} (${s.logical.join("/")})`);
+      else if (!accepts) problems.push(`${where}.${p.name}: the schema type ${s.typeLabel ?? "(none)"} cannot be compared with logicalType ${p.logicalType}`);
+      else if (!accepts.map(logicalClass).includes(logicalClass(p.logicalType))) problems.push(`${where}.${p.name}: contract logicalType ${p.logicalType}, schema type ${s.typeLabel} (${s.logical.join("/")})`);
     }
     if (p.physicalType !== null && s.physical !== null && !physicalAgrees(p.physicalType, s.physical)) {
       problems.push(`${where}.${p.name}: contract physicalType ${p.physicalType}, schema type ${s.physical}`);
@@ -531,16 +586,50 @@ function compareColumns(where, obj, sourceCols, problems, notes) {
   if (extra.length) notes.push(`${where}: in the schema, not in the contract (not published, not a failure): ${extra.join(", ")}`);
 }
 
+// One file, or every *.prisma under a folder (Prisma's multi-file schema). The datasource must be among
+// them: without its provider no physical type can be checked, and a green over that would be a lie.
+function readPrismaFiles(p) {
+  if (!fs.existsSync(p)) throw new Exit(2, `--prisma ${p}: no such file or folder`);
+  const st = fs.statSync(p);
+  if (st.isFile()) return [{ label: p, text: fs.readFileSync(p, "utf8") }];
+  if (!st.isDirectory()) throw new Exit(2, `--prisma ${p}: not a file or folder`);
+  const out = [];
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const f = path.join(d, e.name);
+      if (e.isDirectory()) walk(f);
+      else if (e.isFile() && /\.prisma$/.test(e.name)) out.push({ label: f, text: fs.readFileSync(f, "utf8") });
+    }
+  };
+  walk(p);
+  if (!out.length) throw new Exit(2, `--prisma ${p}: no .prisma files under it`);
+  return out;
+}
+
 function prismaSource(file) {
-  if (!fs.existsSync(file)) throw new Exit(2, `--prisma ${file}: no such file`);
-  const { provider, models } = parsePrisma(fs.readFileSync(file, "utf8"));
+  const files = readPrismaFiles(file);
+  const { provider, models } = parsePrisma(files);
   if (!models.length) throw new Exit(2, `--prisma ${file}: no models`);
+  if (!provider) {
+    throw new Exit(2, `--prisma ${file}: no datasource provider. For a multi-file schema pass its folder (for example prisma/schema), so the file holding the datasource is read too.`);
+  }
+  // A model without @@schema lives in the connection's schema, which is `public` on Postgres unless the
+  // URL says otherwise; this script cannot see the URL, so it assumes `public` there.
+  const defaultSchema = isPostgres(provider) ? "public" : null;
   return {
     label: file,
-    find(name) {
-      const hits = models.filter((m) => m.table === name || m.model === name);
-      if (hits.length > 1) return { ambiguous: hits.map((h) => h.model) };
-      if (!hits.length) return null;
+    warning: isPostgres(provider) ? null : `provider ${provider}: physical types are NOT CHECKED (only Postgres types are known); logical types and columns are`,
+    find(obj) {
+      const named = models.filter((m) => m.table === obj.table);
+      if (!named.length) return null;
+      let hits = named;
+      if (obj.schema) {
+        hits = named.filter((m) => (m.schema ?? defaultSchema) === obj.schema || (m.schema === null && defaultSchema === null));
+        if (!hits.length) {
+          return { error: `the contract puts it in schema ${obj.schema}; the Prisma schema has it in ${named.map((m) => m.schema ?? defaultSchema ?? "(the connection's schema)").join(", ")}` };
+        }
+      }
+      if (hits.length > 1) return { ambiguous: hits.map((h) => `${h.model}${h.schema ? ` (@@schema ${h.schema})` : ""}`) };
       const m = hits[0];
       return {
         columns: m.columns.map((c) => {
@@ -549,7 +638,9 @@ function prismaSource(file) {
             name: c.name,
             logical: t.logical,
             physical: t.physical,
-            nullable: c.optional,
+            element: t.element ?? null,
+            // Postgres has no NOT NULL on a scalar list Prisma creates; the column takes NULL.
+            nullable: c.optional || c.list,
             typeLabel: `${c.type}${c.list ? "[]" : ""}${c.optional ? "?" : ""}${c.native ? ` @db.${c.native.name}${c.native.args ? `(${c.native.args})` : ""}` : ""}`,
           };
         }),
@@ -558,6 +649,10 @@ function prismaSource(file) {
   };
 }
 
+// dbt: a contract names the relation the warehouse holds, which is the model's alias (dbt sets it to
+// the model name, or `<name>_v<n>` for a version, when none is given). The model name alone is not a
+// table, so it does not match. A schema-qualified contract name is compared with the node's schema too;
+// an unqualified one is not, because CI often builds into a different schema than the contract's server.
 function manifestSource(manifestFile, catalogFile) {
   const m = readJson(manifestFile, "--manifest");
   if (!m || typeof m.nodes !== "object" || m.nodes === null) throw new Exit(2, `--manifest ${manifestFile}: no nodes; is it a dbt manifest.json?`);
@@ -566,19 +661,26 @@ function manifestSource(manifestFile, catalogFile) {
   const project = m.metadata?.project_name;
   const models = Object.entries(m.nodes).filter(([, n]) => n?.resource_type === "model" && (!project || n.package_name === project));
   if (!models.length) throw new Exit(2, `--manifest ${manifestFile}: no models of project ${project ?? "(unknown)"}`);
+  const relation = (n) => String(n.alias ?? n.name).toLowerCase();
   return {
     label: manifestFile,
-    find(name) {
-      const hits = models.filter(([, n]) => (n.alias ?? n.name) === name || n.name === name);
-      // A versioned model appears once per version; take the latest when it is declared.
-      let chosen = hits;
-      if (hits.length > 1) {
-        const latest = hits.filter(([, n]) => n.version != null && n.latest_version != null && String(n.version) === String(n.latest_version));
-        if (latest.length === 1) chosen = latest;
-        else return { ambiguous: hits.map(([id]) => id) };
+    warning: null,
+    find(obj) {
+      const table = obj.table.toLowerCase();
+      let hits = models.filter(([, n]) => relation(n) === table);
+      if (!hits.length) {
+        const byModel = models.filter(([, n]) => String(n.name).toLowerCase() === table);
+        if (byModel.length) return { error: `no relation is named ${obj.table}; that is a model name, and the warehouse holds ${byModel.map(([, n]) => relation(n)).join(", ")}. Name the table (the alias) in the contract` };
+        return null;
       }
-      if (!chosen.length) return null;
-      const [id, n] = chosen[0];
+      if (obj.qualified) {
+        const want = obj.schema.toLowerCase();
+        const inSchema = hits.filter(([, n]) => String(n.schema ?? "").toLowerCase() === want);
+        if (!inSchema.length) return { error: `the contract puts it in schema ${obj.schema}; the manifest builds it in ${hits.map(([, n]) => n.schema).join(", ")}` };
+        hits = inSchema;
+      }
+      if (hits.length > 1) return { ambiguous: hits.map(([id]) => id) };
+      const [id, n] = hits[0];
       const catCols = cat?.nodes?.[id]?.columns;
       if (cat && !catCols) return { error: `${id} is not in the catalog (${catalogFile}); run dbt docs generate after building it` };
       const decl = Object.values(n.columns ?? {});
@@ -589,7 +691,7 @@ function manifestSource(manifestFile, catalogFile) {
         if (!decl.length) return { error: `${id} declares no columns in the manifest; declare them (with data_type) or pass --catalog target/catalog.json` };
         columns = decl.map((c) => ({ name: c.name, logical: c.data_type ? logicalFromPhysical(c.data_type) : null, physical: c.data_type ?? null, nullable: null, typeLabel: c.data_type ?? "(no data_type)" }));
       }
-      // not_null tests and constraints say a column is not nullable; nothing in the manifest says it is.
+      // dbt does not say a column is nullable, so `required` is not checked against a manifest.
       return { columns };
     },
   };
@@ -604,7 +706,7 @@ function foldCase(cols) {
 export function contractSchemaCheck(argv, env = process.env) {
   const f = parseFlags(argv, ["contract", "prisma", "manifest", "catalog"]);
   if (!f.contract) throw new Exit(2, "contract-schema: --contract <file> is required");
-  if (Boolean(f.prisma) === Boolean(f.manifest)) throw new Exit(2, "contract-schema: give exactly one of --prisma <schema.prisma> or --manifest <manifest.json>");
+  if (Boolean(f.prisma) === Boolean(f.manifest)) throw new Exit(2, "contract-schema: give exactly one of --prisma <schema.prisma or folder> or --manifest <manifest.json>");
   if (f.catalog && !f.manifest) throw new Exit(2, "contract-schema: --catalog goes with --manifest");
   const contract = readStructured(f.contract, env);
   const objects = contractObjects(contract, f.contract);
@@ -613,13 +715,13 @@ export function contractSchemaCheck(argv, env = process.env) {
   const notes = [];
   let compared = 0;
   for (const obj of objects) {
-    const hit = source.find(obj.name);
+    const hit = source.find(obj);
     if (!hit) {
-      problems.push(`${obj.name}: the contract describes it, the schema (${source.label}) has no such table or model`);
+      problems.push(`${obj.name}: the contract describes it, the schema (${source.label}) has no such table`);
       continue;
     }
     if (hit.ambiguous) {
-      problems.push(`${obj.name}: matches more than one table or model (${hit.ambiguous.join(", ")}); set physicalName in the contract`);
+      problems.push(`${obj.name}: matches more than one table (${hit.ambiguous.join(", ")}); qualify it with its schema in the contract`);
       continue;
     }
     if (hit.error) {
@@ -635,17 +737,22 @@ export function contractSchemaCheck(argv, env = process.env) {
     compareColumns(obj.name, o, cols, problems, notes);
     compared += obj.properties.length;
   }
+  const head = source.warning ? `WARNING: ${source.warning}\n` : "";
   const tail = notes.length ? `\n${notes.map((n) => `  note: ${n}`).join("\n")}` : "";
-  if (problems.length) throw new Exit(1, `contract-schema: ${f.contract} disagrees with ${source.label} (${problems.length})\n${problems.map((p) => `  ${p}`).join("\n")}${tail}`);
-  return `contract-schema: ${f.contract} agrees with ${source.label} (${compared} column(s))${tail}`;
+  if (problems.length) throw new Exit(1, `${head}contract-schema: ${f.contract} disagrees with ${source.label} (${problems.length})\n${problems.map((p) => `  ${p}`).join("\n")}${tail}`);
+  return `${head}contract-schema: ${f.contract} agrees with ${source.label} (${compared} column(s))${tail}`;
 }
 
 // ---------------------------------------------------------------------------------------------------
 // consumers: the consumers a contract lists, as tab-separated `repo<TAB>team` lines, or as a Markdown
 // section for the breaking-change notice. Exit 1 when the list is malformed.
 
-function mdText(s) {
-  return String(s).replace(/[\u0000-\u001f\u007f]/g, " ").replace(/([\\`*_[\]<>|#!])/g, "\\$1").slice(0, 200);
+// Untrusted text (a path, an owner, a team) goes into the notice as a code span: GitHub renders no
+// Markdown or HTML inside one, and a mention or bare URL there is neither notified nor linked. Line
+// breaks, control characters and backticks are replaced first, so the span cannot be closed or broken.
+export function mdCode(s) {
+  const t = String(s).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029`]/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+  return `\`${t || "(empty)"}\``;
 }
 
 export function consumersCmd(argv, env = process.env) {
@@ -659,18 +766,18 @@ export function consumersCmd(argv, env = process.env) {
     if (problems.length) throw new Exit(1, `consumers: ${f.contract}\n${problems.map((p) => `  ${p}`).join("\n")}`);
     return consumers.map((x) => `${x.repo}\t${x.team}`).join("\n");
   }
-  const label = mdText(f.label ?? f.contract);
+  const label = mdCode(f.label ?? f.contract);
   const owners = contractOwners(c);
-  const out = [`#### \`${String(f.label ?? f.contract).replace(/`/g, "")}\``, ""];
-  if (owners.length) out.push(`Owner: ${owners.map(mdText).join(", ")}`, "");
+  const out = [`#### ${label}`, ""];
+  if (owners.length) out.push(`Owner: ${owners.map(mdCode).join(", ")}`, "");
   if (!consumers.length) out.push(`${label} lists no consumers, so nobody downstream can be told. Add them under \`customProperties\` → \`consumers\` (\`repo\`, \`team\`).`);
   for (const x of consumers) {
     const repo = x.repo ? `[${x.repo}](https://github.com/${x.repo})` : "";
     // A GitHub team reference (org/team, with or without @) is written as a mention, so the team is notified.
-    const team = x.team ? (/^@?[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(x.team) ? `@${x.team.replace(/^@/, "")}` : mdText(x.team)) : "";
+    const team = x.team ? (/^@?[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(x.team) ? `@${x.team.replace(/^@/, "")}` : mdCode(x.team)) : "";
     out.push(`- ${[repo, team].filter(Boolean).join(" · ")}`);
   }
-  for (const p of problems) out.push(`- (could not read a consumer: ${mdText(p)})`);
+  for (const p of problems) out.push(`- (could not read a consumer: ${mdCode(p)})`);
   return out.join("\n");
 }
 
@@ -688,7 +795,7 @@ export function main(argv, env = process.env) {
       "  version",
       "  evidence append --check <name> --result pass|fail|not_run [--run-link <url>] [--commit <sha>] [--detail <text>] [--file <path>]",
       "  owner (--contracts <dir> | --contract <file> ...) [--manifest <manifest.json>]",
-      "  contract-schema --contract <file> (--prisma <schema.prisma> | --manifest <manifest.json> [--catalog <catalog.json>])",
+      "  contract-schema --contract <file> (--prisma <schema.prisma or folder> | --manifest <manifest.json> [--catalog <catalog.json>])",
       "  consumers --contract <file> [--format lines|markdown] [--label <path>]",
     ].join("\n"),
   );

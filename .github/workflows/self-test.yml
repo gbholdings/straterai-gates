@@ -32,7 +32,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install datacontract-cli
-        run: pip install datacontract-cli==1.2.8
+        run: python3 -I -m pip install --disable-pip-version-check --require-hashes --no-deps -r requirements/datacontract-cli-1.2.8.txt
       - name: Script tests
         run: node --test test/*.test.mjs
       - name: Gate run blocks against fixtures
@@ -54,7 +54,8 @@ jobs:
     uses: ./.github/workflows/datacontract.yml
     with:
       lint_all: true
-      contracts_glob: test/fixtures/datacontract/passing/head/contracts/*.odcs.yaml
+      contracts_dir: test/fixtures/datacontract/passing/head/contracts
+      contracts_glob: test/fixtures/datacontract/passing/head/contracts/**/*.odcs.yaml
 
   call-datacontract-notice:
     if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
@@ -90,7 +91,7 @@ jobs:
           for want in "/actions/runs/$RUN_ID" \
             '#### `contracts/orders.odcs.yaml`' \
             '- [example-org/billing](https://github.com/example-org/billing) · @example-org/billing-team' \
-            '- Finance analysts' \
+            '- `Finance analysts`' \
             'Why: datacontract breaking reports a breaking change'; do
             printf '%s\n' "$body" | grep -Fq -- "$want" || { echo "::error::the notice does not contain: $want"; exit 1; }
           done

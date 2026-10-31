@@ -1,0 +1,22 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Orders, mapped onto the table the contract describes.
+model Order {
+  id         String   @id @map("order_id")
+  status     String
+  createdAt  DateTime @map("created_at") @db.Timestamptz(6)
+  customer   Customer @relation(fields: [customerId], references: [id])
+  customerId String   @map("customer_id")
+
+  @@map("orders")
+}
+
+model Customer {
+  id     String  @id
+  orders Order[]
+
+  @@map("customers")
+}
