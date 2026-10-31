@@ -168,9 +168,9 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          # This step holds a token, so bash must not source a startup file named by the environment.
-          BASH_ENV: ""
-          ENV: ""
+        # This step holds a token, so bash runs with BASH_ENV and ENV unset and sources no startup file, as in
+        # datacontract.yml.
+        shell: env -u BASH_ENV -u ENV bash --noprofile --norc -eo pipefail {0}
         run: |
           # -f: no pathname expansion, so $MIGRATION_GLOBS, $MIGRATION_DIRS and any other unquoted list reach
           # git and the loops as written and never match files in the checkout.

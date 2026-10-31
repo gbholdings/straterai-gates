@@ -1,92 +1,259 @@
-# Reusable gate: lint every data contract, and fail on breaking changes, deletions and retirements.
-# Lint and breaking-change checks only: neither touches data. Run `datacontract test` from the pipeline,
-# with a read-only credential, not from this job.
+# Reusable gate: lint every data contract, compare each with the real schema, require an owner, fail on
+# breaking changes, deletions and retirements, and tell the listed consumers on the PR when one breaks.
+# None of it touches data. Run `datacontract test` from the pipeline, with a read-only credential, not
+# from this job.
 #
-# Caller stub (make "contracts / contracts" the required check):
+# Caller stub (make "datacontract / contracts" the required check):
 #
 #   name: datacontract
 #   on: pull_request
 #   permissions:
 #     contents: read
+#     pull-requests: write # the consumer notice job only; a reusable workflow cannot exceed the caller
 #   jobs:
-#     contracts:
-#       uses: gbholdings/straterai-gates/.github/workflows/datacontract.yml@<40-char sha> # v1.0.0
+#     datacontract:
+#       uses: gbholdings/straterai-gates/.github/workflows/datacontract.yml@<40-char sha> # v1.2.0
+#       with:
+#         contracts_dir: contracts
+#         contracts_glob: "contracts/**/*.odcs.yaml"
+#         prisma_schema: prisma/schema.prisma   # or a multi-file folder, or dbt_manifest (and dbt_catalog, dbt_artifact)
 #
 # No `paths:` filter on purpose (a required check from a path-filtered workflow waits on "Expected" forever).
 # The job always runs; its first step works out whether a contract changed, and the rest are skipped
-# (the job still passes) when none did.
+# (the job still passes) when none did. With a schema source set, the contracts are compared with it on
+# every PR, because a schema change with no contract change is exactly the drift this catches. With no
+# schema source, the job warns that drift is NOT CHECKED and records contract-schema as not_run.
 #
-# Every contract must be a regular file. A symlink or submodule at or under the contracts folder, or a
-# file-type change there, fails the first step: lint and breaking would read whatever the link points at.
+# Contracts: `contracts_glob` (a git pathspec glob; `**/` descends into subfolders) picks the contract
+# files, and `contracts_dir` is the folder that holds them and RETIRED.md. Any tracked *.odcs.yaml,
+# *.odcs.yml or *.odcs.json under the folder that the glob misses fails the first step, and so does a
+# glob that matches nothing while a schema source is set: a gate over no contracts is no gate. Every
+# contract must be a regular file. A symlink or submodule at or under the folder, a file-type change
+# there, or a path with a control character in it fails the first step.
 #
-# Deleting a contract, renaming it, or setting its `status:` to retired is the most breaking change there
-# is, so the job fails for each unless RETIRED.md (in the contracts folder), as it stands on the BASE
-# branch, already lists the contract's path as the first word of a line (an optional leading "- " and
-# trailing ":" are fine). Git rename detection is off (--no-renames), so a rename is the old path deleted
-# and a new path added: the old path needs the RETIRED.md line, and the new file is linted as new.
-# The PR cannot approve its own deletion: the retirement goes in first, in a PR that edits only
-# RETIRED.md, which CODEOWNERS routes to a reviewer; the deletion follows once that has merged. The PR
-# description and the PR's own copy of RETIRED.md are not read, because whoever opens the PR writes both.
+# Owner: every contract names one, as a `team` member with `role: owner` and a `username` (ODCS v3.0.x:
+# `team` is a list of members; v3.1+: `team: { name, members }`). With dbt_manifest, every model of the
+# project needs `meta.owner` too. Consumers: a top-level `customProperties` entry `{ property: consumers,
+# value: [{ repo, team }] }`. `datacontract lint` 1.2.8 rejects a top-level `owner:` or `consumers:` key.
+#
+# Breaking: `datacontract breaking` against the base branch. Deleting a contract, renaming it, or setting
+# its `status:` to retired fails unless contracts_dir/RETIRED.md, as it stands on the BASE branch,
+# already lists the contract's path as the first word of a line (an optional leading "- " and trailing
+# ":" are fine). Git rename detection is off (--no-renames), so a rename is the old path deleted and a
+# new path added. The PR cannot approve its own deletion: the retirement goes in first, in a PR that
+# edits only RETIRED.md, which CODEOWNERS routes to a reviewer.
+#
+# Consumer notice: when any of those fails on a pull request, a second job, `notice`, posts one comment
+# on the PR (edited in place on later pushes) naming each consumer the base-branch copy of the contract
+# lists. With open_consumer_issues: true and the secret CONSUMER_ISSUES_TOKEN (issues: write on the
+# consumer repos), it also opens one issue per consumer repo, once per PR.
+#
+# Isolation. The `contracts` job reads the PR's tree and holds only `contents: read` and no secret.
+# The `notice` job alone holds `pull-requests: write` and the issues token; it never checks out the PR,
+# and reads only the base-branch contracts the first job hands it, as JSON. Every Python runs with -I
+# (no working directory on sys.path), so a yaml.py in the PR is never imported; every run step starts
+# bash with BASH_ENV and ENV unset; and pip installs from a lockfile with hashes.
+#
+# Evidence: the outcome of each gate is written as governance/evidence.json entries and uploaded as an
+# artifact. Nothing is written to a branch here; governance.yml does that on the default branch.
 name: datacontract
 on:
   workflow_call:
     inputs:
-      contracts_glob:
-        description: "Pathspec glob of contract files. Its folder holds RETIRED.md."
+      contracts_dir:
+        description: "Folder that holds the contracts and RETIRED.md. Every *.odcs.* file under it must match contracts_glob."
         type: string
-        default: "contracts/*.odcs.yaml"
+        default: "contracts"
+      contracts_glob:
+        description: "Pathspec glob of contract files, under contracts_dir. `**/` descends into subfolders."
+        type: string
+        default: "contracts/**/*.odcs.yaml"
       datacontract_cli:
-        description: "datacontract-cli version from PyPI."
+        description: "datacontract-cli version. It installs from requirements/datacontract-cli-<version>.txt (with hashes) in this repo; another version fails."
         type: string
         default: "1.2.8"
       lint_all:
         description: "Lint every matching tracked contract and skip the base comparison. For self-tests and first adoption."
         type: boolean
         default: false
+      prisma_schema:
+        description: "Path of schema.prisma, or of the folder of a multi-file schema. Every contract's columns and types are compared with it."
+        type: string
+        default: ""
+      dbt_manifest:
+        description: "Path of a dbt manifest.json. Every contract is compared with it, and every model needs meta.owner."
+        type: string
+        default: ""
+      dbt_catalog:
+        description: "Path of a dbt catalog.json (dbt docs generate). With it, types come from the warehouse instead of the YAML."
+        type: string
+        default: ""
+      dbt_artifact:
+        description: "Name of an artifact, uploaded by an earlier job of this run, that holds the manifest (and catalog). Downloaded into the workspace first."
+        type: string
+        default: ""
+      open_consumer_issues:
+        description: "On a breaking change, also open an issue in each consumer repo. Needs the secret CONSUMER_ISSUES_TOKEN."
+        type: boolean
+        default: false
+      evidence_artifact:
+        description: "Name of the evidence artifact. Change it when one run calls this workflow twice."
+        type: string
+        default: "datacontract-evidence"
+      gates_sha:
+        description: "Commit (40 hex characters) of straterai-gates to run the script from. Default: the called workflow's own commit (job.workflow_sha)."
+        type: string
+        default: ""
+      fixture:
+        description: "Self-test only. A folder with base/ and head/ trees, judged as a PR from head onto base instead of the caller's checkout."
+        type: string
+        default: ""
+    secrets:
+      CONSUMER_ISSUES_TOKEN:
+        description: "Token with issues: write on the consumer repos. Used only with open_consumer_issues, only in the notice job."
+        required: false
 permissions: {}
 jobs:
   contracts:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
+    defaults:
+      run:
+        shell: env -u BASH_ENV -u ENV bash --noprofile --norc -eo pipefail {0}
+    outputs:
+      notice: ${{ steps.breaking.outputs.notice }}
     env:
       BASE_REF: ${{ github.base_ref }}
+      CONTRACTS_DIR: ${{ inputs.contracts_dir }}
       CONTRACTS_GLOB: ${{ inputs.contracts_glob }}
       DATACONTRACT_CLI: ${{ inputs.datacontract_cli }}
       LINT_ALL: ${{ inputs.lint_all }}
+      PRISMA_SCHEMA: ${{ inputs.prisma_schema }}
+      DBT_MANIFEST: ${{ inputs.dbt_manifest }}
+      DBT_CATALOG: ${{ inputs.dbt_catalog }}
+      FIXTURE: ${{ inputs.fixture }}
+      GATES_SHA: ${{ inputs.gates_sha }}
+      GATES: ${{ github.workspace }}/.gates
+      GC: ${{ github.workspace }}/.gates/scripts/governance-check.mjs
     steps:
+      - name: Check the inputs
+        run: |
+          set -uo pipefail
+          bad=0
+          if [ -n "$GATES_SHA" ] && ! [[ "$GATES_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::gates_sha must be a full 40-character commit SHA, not a branch or tag"; bad=1
+          fi
+          case "$CONTRACTS_DIR" in
+            ""|/*|*..*|*[*?[]*|*/) echo "::error::contracts_dir must be a relative folder with no '..', no glob characters and no trailing slash"; bad=1 ;;
+          esac
+          case "$CONTRACTS_GLOB" in
+            "$CONTRACTS_DIR"/*) ;;
+            *) echo "::error::contracts_glob must sit under contracts_dir ($CONTRACTS_DIR/...)"; bad=1 ;;
+          esac
+          [[ "$DATACONTRACT_CLI" =~ ^[0-9]+(\.[0-9]+)*$ ]] || { echo "::error::datacontract_cli must be a version number"; bad=1; }
+          exit $bad
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Check out the gates
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ inputs.gates_sha || job.workflow_sha }}
+          path: .gates
+          persist-credentials: false
+      - name: Download the dbt artifact
+        if: inputs.dbt_artifact != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.dbt_artifact }}
+          path: .
+      - name: Build the fixture repository
+        if: inputs.fixture != ''
+        run: |
+          set -euo pipefail
+          case "$FIXTURE" in /*|*..*) echo "::error::fixture must be a relative path inside the repository"; exit 1 ;; esac
+          [ -d "$FIXTURE/head" ] || { echo "::error::$FIXTURE/head is missing"; exit 1; }
+          [ -n "$BASE_REF" ] || { echo "::error::fixture runs on pull_request only (no base ref)"; exit 1; }
+          R="$RUNNER_TEMP/fixture-repo"
+          rm -rf "$R"
+          mkdir -p "$R"
+          g() { git -C "$R" -c user.name=self-test -c user.email=self-test@example.invalid "$@"; }
+          g init -q -b "$BASE_REF"
+          if [ -d "$FIXTURE/base" ]; then cp -R "$FIXTURE/base/." "$R/"; fi
+          : > "$R/.gitkeep-base"
+          g add -A
+          g commit -qm base
+          g update-ref "refs/remotes/origin/$BASE_REF" HEAD
+          g checkout -q -b pr
+          find "$R" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -R "$FIXTURE/head/." "$R/"
+          : > "$R/.gitkeep-head"
+          g add -A
+          g commit -qm head
+          echo "DATACONTRACT_FIXTURE_REPO=$R" >> "$GITHUB_ENV"
       - name: Did a contract change?
         id: changes
         run: |
           set -uo pipefail
+          cd "${DATACONTRACT_FIXTURE_REPO:-.}"
           G() { git -c core.attributesFile=/dev/null -c core.quotePath=false "$@"; }
-          DIR="${CONTRACTS_GLOB%/*}"
+          DIR="$CONTRACTS_DIR"
+          under() { case "$1" in "$DIR"|"$DIR"/*) return 0 ;; *) return 1 ;; esac; }
+          # A path is printed shell-quoted, never raw: a newline in it must not start a workflow command.
+          q() { printf '%q' "$1"; }
           bad=0
-          # Symlinks and submodules at or under the contracts folder in the PR's tree, changed or not.
+          if [ -z "$PRISMA_SCHEMA$DBT_MANIFEST" ]; then
+            echo "::warning::contract-schema is NOT CHECKED: set prisma_schema or dbt_manifest, or contracts can drift from the schema unnoticed"
+            echo "### datacontract: schema drift NOT CHECKED (no prisma_schema or dbt_manifest input)" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          fi
+          # Every path under the folder in the PR's tree: no control characters, no symlinks or submodules,
+          # and every contract file matched by the glob.
+          declare -A M=()
+          matched=0
+          while IFS= read -r -d '' p; do M["$p"]=1; matched=$((matched + 1)); done < <(G ls-files -z -- ":(glob)$CONTRACTS_GLOB")
           while IFS= read -r -d '' e; do
             mode=${e%% *}; p=${e#*$'\t'}
-            case "$p" in "$DIR"|"$DIR"/*) ;; *) continue ;; esac
+            under "$p" || continue
+            if [[ "$p" == *[[:cntrl:]]* ]]; then echo "::error::$(q "$p") has a control character in its path. Rename it."; bad=1; continue; fi
             case "$mode" in 120000|160000) echo "::error::$p is a symlink or a submodule (mode $mode). A contract must be a regular file."; bad=1 ;; esac
           done < <(G ls-tree -r -z --full-tree HEAD)
+          while IFS= read -r -d '' p; do
+            [[ "$p" == *[[:cntrl:]]* ]] && continue
+            [[ "$p" =~ \.odcs\.(ya?ml|json)$ ]] || continue
+            if [ -z "${M["$p"]:-}" ]; then
+              echo "::error::$p is a contract under $DIR that contracts_glob ($CONTRACTS_GLOB) does not match, so no check would read it. Widen the glob (for example $DIR/**/*.odcs.yaml)."
+              bad=1
+            fi
+          done < <(G ls-files -z -- ":(literal)$DIR")
+          if [ "$matched" = 0 ] && [ -n "$PRISMA_SCHEMA$DBT_MANIFEST" ]; then
+            echo "::error::no contract file matches $CONTRACTS_GLOB, but a schema source is set: nothing would be compared with it"
+            bad=1
+          fi
           if [ "$LINT_ALL" = "true" ]; then
+            [ "$matched" != 0 ] || { echo "::error::lint_all is set and no contract file matches $CONTRACTS_GLOB"; bad=1; }
             [ "$bad" = 0 ] || exit 1
             echo "changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           BASE="origin/$BASE_REF"
           G rev-parse -q --verify "$BASE^{commit}" >/dev/null || { echo "::error::cannot resolve $BASE"; exit 1; }
-          # Any file-type change there.
+          # Any file-type change there, and any path (a deleted one too) with a control character.
           while IFS= read -r -d '' meta && IFS= read -r -d '' p; do
             read -r _ newmode _ _ status <<< "$meta"
-            case "$p" in "$DIR"|"$DIR"/*) ;; *) continue ;; esac
+            under "$p" || continue
+            if [[ "$p" == *[[:cntrl:]]* ]]; then echo "::error::$(q "$p") has a control character in its path. Rename it."; bad=1; continue; fi
             if [ "$status" = T ]; then echo "::error::$p changed file type (now mode $newmode). A contract must be a regular file."; bad=1; fi
           done < <(G diff --raw -z --no-renames --no-textconv --no-ext-diff "$BASE...HEAD")
           [ "$bad" = 0 ] || exit 1
+          if [ -n "$PRISMA_SCHEMA$DBT_MANIFEST" ]; then
+            echo "a schema source is set, so every contract is compared with it on every PR"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ -z "$(G diff --name-only --no-renames --no-textconv --no-ext-diff "$BASE...HEAD" -- ":(glob)$CONTRACTS_GLOB")" ]; then
             echo "no contract changed; the rest of this job is skipped"
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -99,28 +266,82 @@ jobs:
           python-version: "3.12"
       - name: Install
         if: steps.changes.outputs.changed == 'true'
-        run: pip install "datacontract-cli==$DATACONTRACT_CLI"
+        run: |
+          set -euo pipefail
+          lock="$GATES/requirements/datacontract-cli-$DATACONTRACT_CLI.txt"
+          [ -f "$lock" ] || { echo "::error::no lockfile for datacontract-cli $DATACONTRACT_CLI in the gates (requirements/datacontract-cli-<version>.txt)"; exit 2; }
+          cd "$RUNNER_TEMP" || exit 2
+          python3 -I -m pip install --disable-pip-version-check --require-hashes --no-deps -r "$lock"
       - name: Lint every contract
+        id: lint
         if: steps.changes.outputs.changed == 'true'
         run: |
           set -uo pipefail
+          cd "${DATACONTRACT_FIXTURE_REPO:-.}"
+          REPO=$PWD
+          fail=0
+          found=0
+          files=()
+          while IFS= read -r -d '' f; do files+=("$f"); done < <(git ls-files -z -- ":(glob)$CONTRACTS_GLOB")
+          # Run from outside the checkout, on absolute paths, so nothing in the PR's tree is on any path.
+          cd "$RUNNER_TEMP" || exit 2
+          for f in "${files[@]}"; do
+            found=1
+            datacontract lint "$REPO/$f" </dev/null || fail=1
+          done
+          [ "$found" = 1 ] || echo "no contract files match $CONTRACTS_GLOB"
+          exit $fail
+      - name: Contracts match the schema
+        id: schema
+        if: ${{ !cancelled() && steps.changes.outputs.changed == 'true' && (inputs.prisma_schema != '' || inputs.dbt_manifest != '') }}
+        run: |
+          set -uo pipefail
+          cd "${DATACONTRACT_FIXTURE_REPO:-.}"
+          if [ -n "$PRISMA_SCHEMA" ] && [ -n "$DBT_MANIFEST" ]; then echo "::error::set prisma_schema or dbt_manifest, not both"; exit 2; fi
+          if [ -n "$PRISMA_SCHEMA" ]; then src=(--prisma "$PRISMA_SCHEMA"); else src=(--manifest "$DBT_MANIFEST"); [ -z "$DBT_CATALOG" ] || src+=(--catalog "$DBT_CATALOG"); fi
           fail=0
           found=0
           while IFS= read -r -d '' f; do
             found=1
-            datacontract lint "$f" || fail=1
+            node "$GC" contract-schema --contract "$f" "${src[@]}" || fail=1
           done < <(git ls-files -z -- ":(glob)$CONTRACTS_GLOB")
-          [ "$found" = 1 ] || echo "no contract files match $CONTRACTS_GLOB"
+          [ "$found" = 1 ] || { echo "::error::no contract files match $CONTRACTS_GLOB; nothing was compared"; exit 2; }
           exit $fail
-      - name: Breaking changes, deletions and retirements
-        if: steps.changes.outputs.changed == 'true' && inputs.lint_all != true
+      - name: Every contract has an owner
+        id: owner
+        if: ${{ !cancelled() && steps.changes.outputs.changed == 'true' }}
         run: |
           set -uo pipefail
-          G() { git -c core.attributesFile=/dev/null -c core.quotePath=false "$@"; }
+          cd "${DATACONTRACT_FIXTURE_REPO:-.}"
+          args=()
+          while IFS= read -r -d '' f; do args+=(--contract "$f"); done < <(git ls-files -z -- ":(glob)$CONTRACTS_GLOB")
+          [ -z "$DBT_MANIFEST" ] || args+=(--manifest "$DBT_MANIFEST")
+          if [ "${#args[@]}" = 0 ]; then echo "no contracts and no manifest; nothing needs an owner"; exit 0; fi
+          node "$GC" owner "${args[@]}"
+      - name: Breaking changes, deletions and retirements
+        id: breaking
+        if: ${{ !cancelled() && steps.changes.outputs.changed == 'true' && inputs.lint_all != true }}
+        run: |
+          set -uo pipefail
+          cd "${DATACONTRACT_FIXTURE_REPO:-.}"
+          REPO=$PWD
+          G() { git -C "$REPO" -c core.attributesFile=/dev/null -c core.quotePath=false "$@"; }
           BASE="origin/$BASE_REF"
-          DIR="${CONTRACTS_GLOB%/*}"
+          DIR="$CONTRACTS_DIR"
           T=$(mktemp -d "${RUNNER_TEMP:-/tmp}/contracts.XXXXXX")
+          # One folder per broken contract: path, why, and the base copy (as JSON) whose consumers are told.
+          N="$RUNNER_TEMP/datacontract-breaking"
+          rm -rf "$N"
+          mkdir -p "$N"
+          n=0
+          # YAML in, JSON out, Python isolated (-I): the working directory is never on sys.path.
+          to_json() { python3 -I -c 'import sys, json, yaml; json.dump(yaml.safe_load(sys.stdin), sys.stdout, default=str)'; }
+          broke() {
+            n=$((n + 1)); mkdir "$N/$n"; printf '%s' "$1" > "$N/$n/path"; printf '%s' "$2" > "$N/$n/why"
+            to_json < "$3" > "$N/$n/old.odcs.json" || printf '{}' > "$N/$n/old.odcs.json"
+          }
           fail=0
+          MB=$(G merge-base "$BASE" HEAD)
           # Read from the base branch, never the working tree: the PR's own RETIRED.md is its author's word.
           retired() {
             G cat-file blob "$BASE:$DIR/RETIRED.md" 2>/dev/null \
@@ -128,24 +349,32 @@ jobs:
           }
           # The top-level `status:` of a contract on stdin, parsed as YAML, lowercased.
           status_of() {
-            python3 -c 'import sys, yaml; d = yaml.safe_load(sys.stdin); s = d.get("status") if isinstance(d, dict) else None; print("" if s is None else str(s).strip().lower())'
+            python3 -I -c 'import sys, yaml; d = yaml.safe_load(sys.stdin); s = d.get("status") if isinstance(d, dict) else None; print("" if s is None else str(s).strip().lower())'
           }
+          cd "$RUNNER_TEMP" || exit 2
           while IFS= read -r -d '' st && IFS= read -r -d '' p; do
             case "$st" in
               M)
-                G cat-file blob "$BASE:$p" > "$T/old.odcs.yaml"
-                datacontract breaking "$T/old.odcs.yaml" "$p" </dev/null || fail=1
-                if ! old=$(status_of < "$T/old.odcs.yaml") || ! new=$(G cat-file blob "HEAD:$p" | status_of); then
+                G cat-file blob "$MB:$p" > "$T/old.odcs.yaml"
+                G cat-file blob "HEAD:$p" > "$T/new.odcs.yaml"
+                if ! datacontract breaking "$T/old.odcs.yaml" "$T/new.odcs.yaml" </dev/null; then
+                  fail=1
+                  broke "$p" "breaking" "$T/old.odcs.yaml"
+                fi
+                if ! old=$(status_of < "$T/old.odcs.yaml") || ! new=$(status_of < "$T/new.odcs.yaml"); then
                   echo "::error::$p: could not read its status as YAML."
                   fail=1
                 elif [ "$new" = retired ] && [ "$old" != retired ] && ! retired "$p"; then
                   echo "::error::$p sets status: retired. Retire it first: a separate PR that adds its path to $DIR/RETIRED.md, reviewed and merged to the base branch, then rebase this one."
                   fail=1
+                  broke "$p" "retired" "$T/old.odcs.yaml"
                 fi ;;
               D)
                 if ! retired "$p"; then
                   echo "::error::$p was deleted or renamed. Retire it first: a separate PR that adds its path to $DIR/RETIRED.md, reviewed and merged to the base branch, then rebase this one."
                   fail=1
+                  G cat-file blob "$MB:$p" > "$T/old.odcs.yaml"
+                  broke "$p" "deleted" "$T/old.odcs.yaml"
                 fi ;;
               A) ;;
               *)
@@ -153,4 +382,131 @@ jobs:
                 fail=1 ;;
             esac
           done < <(G diff --name-status -z --no-renames --no-textconv --no-ext-diff "$BASE...HEAD" -- ":(glob)$CONTRACTS_GLOB")
+          [ "$n" = 0 ] || echo "notice=true" >> "$GITHUB_OUTPUT"
           exit $fail
+      - name: Hand the broken contracts to the notice job
+        if: ${{ !cancelled() && steps.breaking.outputs.notice == 'true' && github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.evidence_artifact }}-notice
+          path: ${{ runner.temp }}/datacontract-breaking
+          retention-days: 1
+      - name: Record evidence
+        id: evidence
+        if: ${{ !cancelled() && steps.changes.outcome != 'skipped' }}
+        env:
+          LINT: ${{ steps.lint.outcome }}
+          SCHEMA: ${{ steps.schema.outcome }}
+          OWNER: ${{ steps.owner.outcome }}
+          BREAKING: ${{ steps.breaking.outcome }}
+          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          RUN_LINK: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          export GOVERNANCE_EVIDENCE_FILE="$RUNNER_TEMP/datacontract-evidence/evidence.json"
+          cd "$RUNNER_TEMP" || exit 2
+          rc=0
+          for pair in "lint:$LINT" "contract-schema:$SCHEMA" "owner:$OWNER" "breaking:$BREAKING"; do
+            gate=${pair%%:*}
+            o=${pair#*:}
+            case "$o" in success) r=pass ;; failure) r=fail ;; *) r=not_run ;; esac
+            detail="step outcome: ${o:-none}"
+            if [ "$gate" = contract-schema ] && [ -z "$PRISMA_SCHEMA$DBT_MANIFEST" ]; then detail="NOT CHECKED: no prisma_schema or dbt_manifest input"; fi
+            node "$GC" evidence append --check "governance:data-contract/$gate" --result "$r" --run-link "$RUN_LINK" --commit "$COMMIT" --detail "$detail" || rc=$?
+          done
+          echo "file=$GOVERNANCE_EVIDENCE_FILE" >> "$GITHUB_OUTPUT"
+          exit $rc
+      - name: Upload the evidence
+        if: ${{ !cancelled() && steps.evidence.outputs.file != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.evidence_artifact }}
+          path: ${{ steps.evidence.outputs.file }}
+
+  # Holds the PR-comment permission and the issues token. It never checks out the PR: it reads only the
+  # base-branch contracts (as JSON) and the paths the contracts job wrote, and renders every one of them
+  # as an escaped code span.
+  notice:
+    needs: [contracts]
+    if: ${{ !cancelled() && needs.contracts.outputs.notice == 'true' && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    defaults:
+      run:
+        shell: env -u BASH_ENV -u ENV bash --noprofile --norc -eo pipefail {0}
+    env:
+      GC: ${{ github.workspace }}/.gates/scripts/governance-check.mjs
+    steps:
+      - name: Check out the gates
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ inputs.gates_sha || job.workflow_sha }}
+          path: .gates
+          persist-credentials: false
+      - name: Download the broken contracts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.evidence_artifact }}-notice
+          path: ${{ runner.temp }}/datacontract-breaking
+      - name: Tell the consumers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUES_TOKEN: ${{ secrets.CONSUMER_ISSUES_TOKEN }}
+          OPEN_ISSUES: ${{ inputs.open_consumer_issues }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_LINK: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          N="$RUNNER_TEMP/datacontract-breaking"
+          cd "$RUNNER_TEMP" || exit 2
+          MARKER="<!-- straterai-gates:datacontract-consumers -->"
+          entries=$(find "$N" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V)
+          [ -n "$entries" ] || { echo "no broken contract was handed over; no notice"; exit 0; }
+          body="$RUNNER_TEMP/datacontract-comment.md"
+          {
+            echo "$MARKER"
+            echo "### Breaking data contract change"
+            echo
+            echo "This pull request breaks the contracts below. Tell each consumer before it merges. Run: $RUN_LINK"
+            echo
+            for e in $entries; do
+              node "$GC" consumers --contract "$e/old.odcs.json" --format markdown --label "$(cat "$e/path")" || echo "(could not read the consumers of this contract)"
+              echo
+              case "$(cat "$e/why")" in
+                breaking) echo "Why: datacontract breaking reports a breaking change" ;;
+                retired) echo "Why: sets status: retired" ;;
+                deleted) echo "Why: deleted or renamed" ;;
+                *) echo "Why: a breaking change" ;;
+              esac
+              echo
+            done
+          } > "$body"
+          cat "$body"
+          rc=0
+          id=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- straterai-gates:datacontract-consumers -->"))) | .id' | head -n 1) || rc=1
+          if [ "$rc" = 0 ] && [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F "body=@$body" --jq .html_url || rc=1
+          elif [ "$rc" = 0 ]; then
+            gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -F "body=@$body" --jq .html_url || rc=1
+          fi
+          [ "$rc" = 0 ] || echo "::error::could not post the consumer notice on #$PR_NUMBER (a fork PR's token cannot comment)"
+          if [ "$OPEN_ISSUES" = "true" ]; then
+            if [ -z "$ISSUES_TOKEN" ]; then
+              echo "::error::open_consumer_issues is true, but the secret CONSUMER_ISSUES_TOKEN was not passed to this workflow"
+              exit 1
+            fi
+            title="Breaking data contract change in $REPO#$PR_NUMBER"
+            repos=$(for e in $entries; do node "$GC" consumers --contract "$e/old.odcs.json" --format lines | cut -f1; done | grep -v '^$' | sort -u)
+            for r in $repos; do
+              titles=$(GH_TOKEN="$ISSUES_TOKEN" gh issue list -R "$r" --state all --search "\"$title\" in:title" --json title --jq '.[].title') || { echo "::error::cannot read issues in $r"; rc=1; continue; }
+              if printf '%s\n' "$titles" | grep -Fxq -- "$title"; then echo "$r already has the issue"; continue; fi
+              GH_TOKEN="$ISSUES_TOKEN" gh issue create -R "$r" --title "$title" --body-file "$body" || { echo "::error::cannot open an issue in $r"; rc=1; }
+            done
+          fi
+          exit $rc

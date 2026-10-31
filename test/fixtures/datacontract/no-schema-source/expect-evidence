@@ -1,0 +1,2 @@
+"check": "governance:data-contract/contract-schema"
+"detail": "NOT CHECKED: no prisma_schema or dbt_manifest input"

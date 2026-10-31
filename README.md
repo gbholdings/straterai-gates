@@ -8,48 +8,35 @@ A repo calls a gate with a few lines and gets the same check every other repo ge
 
 | Workflow | What it checks | Inputs (defaults) |
 |---|---|---|
-| `squawk.yml` | A destructive-change guard, then [squawk](https://squawkhq.com/) lint, over the migration files a PR adds or changes. See [squawk](#squawk). | `migration_globs` and `migration_dirs` (Prisma at any depth, Supabase, Flyway, `db/migrate`, drizzle, any `migrations/`, any case), `squawk_version` (`2.71.0`), `squawk_sha256` (that release's Linux binaries), `config_path` (`.squawk.toml`), `lint_all` (`false`) |
+| `squawk.yml` | [squawk](https://squawkhq.com/) lint over the migration files a PR adds or changes. | `migration_globs` (Prisma and common raw-SQL folders), `squawk_version` (`2.70.0`), `config_path` (`.squawk.toml`), `lint_all` (`false`) |
 | `dbt.yml` | sqlfluff, then `dbt build --target ci` against a CI-only database. | `dbt_project_dir` (`.`), `adapter_package` (`dbt-bigquery==1.12.1`), `dbt_core` (`1.12.6`), `sqlfluff` (`4.4.0`), `auth` (`wif-google` or `none`), `workload_identity_provider`, `service_account`, `lint_all` |
-| `datacontract.yml` | [datacontract-cli](https://cli.datacontract.com/) lint of every contract, `breaking` against the base branch, and a block on deleting, renaming or retiring a contract that `RETIRED.md` on the base branch does not list. | `contracts_glob` (`contracts/*.odcs.yaml`), `datacontract_cli` (`1.2.8`), `lint_all` |
+| `datacontract.yml` | [datacontract-cli](https://cli.datacontract.com/) lint of every contract; each contract's columns and types against the real schema (`governance-check contract-schema`); an owner on every contract, and on every dbt model with a manifest (`governance-check owner`); `breaking` against the base branch, and a block on deleting, renaming or retiring a contract that `RETIRED.md` on the base branch does not list. When one of those breaks on a PR, one comment names each consumer the base copy of the contract lists. | `contracts_dir` (`contracts`), `contracts_glob` (`contracts/**/*.odcs.yaml`), `datacontract_cli` (`1.2.8`, installed from a hash-pinned lockfile), `lint_all`, `prisma_schema`, `dbt_manifest`, `dbt_catalog`, `dbt_artifact`, `open_consumer_issues` (`false`, needs the secret `CONSUMER_ISSUES_TOKEN`), `evidence_artifact` (`datacontract-evidence`), `gates_sha` (a 40-character commit), `fixture` (self-test only) |
 | `bq-dry-run.yml` | Compiles the dbt models a PR can change and dry-runs each on BigQuery (free; nothing runs). Fails when a model would process more bytes than its budget in `warehouse-budgets.yml` (`default` plus per-model bytes, e.g. `10 GiB`), or when the gate cannot measure it. See [bq-dry-run](#bq-dry-run). | `project_id` (required), `location` (`US`), `dbt_project_dir` (`.`), `budgets_path` (`warehouse-budgets.yml`), `adapter_package`, `dbt_core`, `workload_identity_provider`, `service_account`, `gates_sha`, `lint_all` |
 | `governance.yml` | Runs `scripts/governance-check.mjs` checks and records each result as an evidence entry. | `checks` (one `<plugin>:<skill>/<gate>=<arguments>` per line), `evidence_branch` (`governance-evidence`), `gates_sha` |
 
 `lint_all` lints every tracked file that matches instead of the PR's diff. The self-test uses it, and so can a repo adopting a gate for the first time.
 
+The squawk gate in this release is the lint step only. The destructive-change approval guard (a drop, truncate, rename or retype needs a reviewer's approval) arrives as a minor release.
+
 ### Caller stub
 
 ```yaml
 name: squawk
-on:
-  pull_request:
-  pull_request_review:
-    types: [submitted, dismissed]
+on: pull_request
 permissions:
   contents: read
-  pull-requests: read
-concurrency:
-  group: squawk-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
 jobs:
   squawk:
-    uses: gbholdings/straterai-gates/.github/workflows/squawk.yml@<40-char sha> # v1.2.0
+    uses: gbholdings/straterai-gates/.github/workflows/squawk.yml@<40-char sha> # v1.0.0
+    with:
+      migration_globs: ":(glob)prisma/migrations/**/migration.sql :(glob)migrations/**/*.sql"
 ```
 
 Each workflow's header comment has its own stub.
 
 - The required-check name is `<caller job> / <called job>`: `squawk / squawk`, not `squawk`. A repo that switches from a copied workflow to the stub updates its branch protection in the same change, or every PR waits on "Expected".
-- A reusable workflow cannot exceed the caller's permissions. `dbt.yml` and `bq-dry-run.yml` need `id-token: write` in the stub, and `governance.yml` needs `contents: write` (used only on push and schedule, only for the evidence branch).
+- A reusable workflow cannot exceed the caller's permissions. `dbt.yml` and `bq-dry-run.yml` need `id-token: write` in the stub, `datacontract.yml` needs `pull-requests: write` (from v1.2.0, for the consumer notice; only its `notice` job, which never checks out the PR, holds it), and `governance.yml` needs `contents: write` (used only on push and schedule, only for the evidence branch). A caller still on `contents: read` that bumps `datacontract.yml` to v1.2.0 fails to start until it adds `pull-requests: write`.
 - No workflow has a `paths:` filter, for the same "Expected" reason. Each job always runs and passes when there is nothing to check.
-
-## squawk
-
-The guard parses each added or changed migration with Postgres's own parser (libpg_query, through `pglast`, pinned by wheel hash) and fails the job on a destructive change: any DROP, a dropped column, constraint or default, TRUNCATE, DELETE and UPDATE anywhere, a rename, a type or collation change, a required column with no default, SQL it cannot read, and the rest listed in the workflow's header. Comments, string literals, `squawk-ignore` and the repo's squawk config never change what it finds. One thing clears a finding: an approving review on the PR's current head commit from someone who can push to the repository and is not the PR's author, read with one GraphQL query (`authorCanPushToRepository`). The red check is the cue for that person.
-
-- **The review trigger.** The stub runs on `pull_request_review` (submitted, dismissed), so an approval re-runs the check. The gate takes the base and head from the event's `pull_request` object, which both events carry (`github.base_ref` is empty on a review event), checks out the head commit itself, and refuses to run if the checkout is not that commit.
-- **The concurrency group** lets only the latest run per pull request report. A review submitted and then dismissed starts two runs on the same commit.
-- **`DROP INDEX` cues a human.** It holds no rows, but a query may depend on it, so it has its own rule (`guard-drop-index`): show the reviewer the index's `pg_stat_user_indexes.idx_scan` and the query sites. An index the same file builds again under the same name (a changed definition) does not count.
-- **A collation change** (`ALTER COLUMN ... TYPE ... COLLATE`) has its own rule (`guard-collation`): its indexes must be rebuilt.
-- **squawk is the release binary**, downloaded from GitHub and checked against `squawk_sha256`, so no package manager runs in the checkout. 2.71.0 is not on npm.
 
 ## bq-dry-run
 
@@ -74,11 +61,29 @@ Access: the service account needs `roles/bigquery.jobUser` in the job project an
 
 `governance/evidence.json` is a JSON array of `{ "check", "date" (ISO 8601 UTC), "result", "run_link" (URL or null), "commit", "detail" }`. It only grows: the script reads, appends, verifies no earlier entry changed, and writes through a temp file. A file it cannot parse exits 4 and is left untouched. Exit 2 is a usage error. On push and schedule `governance.yml` commits the file to the `governance-evidence` branch, touching nothing else; on a pull request it uploads the would-be file as an artifact and writes no branch. The file records what ran and what it found. It does not say a repo is compliant.
 
+## Contract checks
+
+```
+node scripts/governance-check.mjs owner (--contracts <dir> | --contract <file> ...) [--manifest target/manifest.json]
+node scripts/governance-check.mjs contract-schema --contract <file> (--prisma prisma/schema.prisma|prisma/schema | --manifest target/manifest.json [--catalog target/catalog.json])
+node scripts/governance-check.mjs consumers --contract <file> [--format lines|markdown] [--label <path>]
+```
+
+- **Owner** is an ODCS `team` member with `role: owner` and a `username`: `team: [{ username, role: owner }]` in ODCS v3.0.x, `team: { name, members: [...] }` from v3.1.0. A member whose `dateOut` has passed does not count. `datacontract lint` 1.2.8 rejects a top-level `owner:` key. With `--manifest`, every model of the project (not of installed packages) needs `meta.owner` or `config.meta.owner`.
+- **Consumers** are a top-level `customProperties` entry: `{ property: consumers, value: [{ repo: <owner/name>, team: <name or org/team> }] }`. `datacontract lint` 1.2.8 rejects a top-level `consumers:` key. A team written `org/team` is @-mentioned in the notice.
+- **contract-schema** fails when a contract column is missing from the table or model, when its `logicalType` cannot hold the schema's type, when its `physicalType` differs (Postgres for Prisma, including Prisma's defaults such as `DateTime` = `timestamp(3)`; the warehouse type for dbt), or when the contract says `required` and the schema allows null. A schema column the contract leaves out is a note, not a failure: a contract may publish a subset. For dbt, pass `--catalog` for the warehouse's real types; without it the YAML's `data_type` is used, and a typed contract column with no declared type fails as unverifiable.
+- **Which table.** A contract object names its table with `physicalName` (or `name`), optionally schema-qualified (`billing.orders`). Prisma matches the table (`@@map`, else the model name when unmapped) and its `@@schema`: the qualifier, or else the contract's server `schema` when its servers give exactly one, must equal the model's schema (`public` on Postgres without `@@schema`). A Prisma model name that is not the table does not match. dbt matches the relation (`alias`, which dbt sets to `<name>_v<n>` for a version), never the bare model name; a qualified name is also compared with the node's `schema`, an unqualified one is not, because CI often builds into another schema.
+- **Prisma.** `--prisma` takes a file or a multi-file schema folder (every `*.prisma` under it). The datasource must be among the files read: without its provider the check exits 2. Physical types are known for Postgres only; on another provider the output starts `WARNING: ... physical types are NOT CHECKED`. A scalar list (`String[]`) is a Postgres array that takes NULL, so `required: true` on it fails, and a contract may describe it the way `datacontract import sql` does (`logicalType: string`, `physicalType: TEXT[]`).
+- **dbt nullability is not checked.** A manifest does not say a column takes NULL, so `required` is not compared against dbt; put a `not_null` test on the model instead.
+- **No schema source** in `datacontract.yml`: drift is NOT CHECKED. The job warns, says so in the step summary, and records `contract-schema` as `not_run`.
+- YAML contracts are read with Python's PyYAML (installed with datacontract-cli), run isolated (`python3 -I`, from the temp directory), so a `yaml.py` in the repository is never imported. No PyYAML exits 2; `GOVERNANCE_PYTHON` picks the interpreter.
+- The notice renders every path, owner and team as a code span with line breaks, control characters and backticks removed, so none of them can add Markdown, HTML, a mention or a link. A path under the contracts folder with a control character in it fails the gate's first step.
+
 ## What is in this repo
 
 - `.github/workflows/`: the gates above, and `self-test`, `fact-scan`, `zizmor` and `release`.
 - `scripts/`: `governance-check.mjs` and `bq-dry-run-check.mjs` (Node 20+, no dependencies), `next-tag.mjs`, `publish-evidence.sh`.
-- `test/`: `bin/gh`, a stand-in `gh` that the squawk approval cases use; `governance-check.test.mjs` and `bq-dry-run-check.test.mjs` (`node --test test/*.test.mjs`) and `run-blocks.mjs`, which runs each gate's `run:` blocks against `test/fixtures/` in a temp git repo (needs `bash`, `git`, `node`, and Python with PyYAML; `datacontract-cli` for the contract cases).
+- `test/`: `governance-check.test.mjs` and `bq-dry-run-check.test.mjs` (`node --test test/*.test.mjs`) and `run-blocks.mjs`, which runs each gate's `run:` blocks against `test/fixtures/` in a temp git repo, evaluating each step's `if:` and putting a recording stand-in for `gh` on the PATH (needs `bash`, `git`, `node`, and Python with PyYAML; `datacontract-cli` for the contract cases). A failing fixture carries `expect-log`, so it must fail for its stated reason.
 
 ## Rules for changes here
 

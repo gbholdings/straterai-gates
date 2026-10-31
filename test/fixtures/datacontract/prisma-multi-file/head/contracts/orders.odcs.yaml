@@ -1,0 +1,50 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: urn:datacontract:example:orders
+name: orders
+version: 1.0.0
+status: active
+team:
+  - username: data-platform
+    role: owner
+customProperties:
+  - property: consumers
+    value:
+      - repo: example-org/billing
+        team: example-org/billing-team
+      - team: Finance analysts
+domain: example
+description:
+  purpose: One row per order placed.
+servers:
+  - server: staging
+    type: postgres
+    host: ${DATACONTRACT_POSTGRES_HOST}
+    port: 5432
+    database: example
+    schema: public
+schema:
+  - name: orders
+    physicalType: table
+    description: One row per order placed.
+    properties:
+      - name: order_id
+        logicalType: string
+        physicalType: text
+        description: Primary key.
+        required: true
+        unique: true
+        primaryKey: true
+      - name: status
+        logicalType: string
+        physicalType: text
+        description: Lifecycle state of the order.
+        required: true
+      - name: created_at
+        logicalType: date
+        physicalType: timestamptz
+        description: When the order was placed.
+        required: true
+      - name: customer_id
+        logicalType: string
+        physicalType: bigint

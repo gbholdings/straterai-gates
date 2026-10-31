@@ -1,0 +1,90 @@
+{
+ "metadata": {
+  "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+  "dbt_version": "1.12.6",
+  "project_name": "gates_fixture"
+ },
+ "nodes": {
+  "model.gates_fixture.stg_orders": {
+   "resource_type": "model",
+   "package_name": "gates_fixture",
+   "name": "stg_orders",
+   "alias": "stg_orders",
+   "original_file_path": "models/staging/stg_orders.sql",
+   "version": null,
+   "latest_version": null,
+   "meta": {
+    "owner": "data-platform"
+   },
+   "columns": {
+    "order_id": {
+     "name": "order_id",
+     "data_type": "integer"
+    }
+   },
+   "config": {
+    "meta": {
+     "owner": "data-platform"
+    },
+    "contract": {
+     "enforced": false,
+     "alias_types": true
+    }
+   }
+  },
+  "model.gates_fixture.stg_payments": {
+   "resource_type": "model",
+   "package_name": "gates_fixture",
+   "name": "stg_payments",
+   "alias": "stg_payments",
+   "original_file_path": "models/staging/stg_payments.sql",
+   "version": null,
+   "latest_version": null,
+   "meta": {
+    "owner": "data-platform"
+   },
+   "columns": {
+    "order_id": {
+     "name": "order_id",
+     "data_type": null
+    }
+   },
+   "config": {
+    "meta": {
+     "owner": "data-platform"
+    },
+    "contract": {
+     "enforced": false,
+     "alias_types": true
+    }
+   }
+  },
+  "model.gates_fixture.fct_orders": {
+   "resource_type": "model",
+   "package_name": "gates_fixture",
+   "name": "fct_orders",
+   "alias": "fct_orders",
+   "original_file_path": "models/marts/fct_orders.sql",
+   "version": null,
+   "latest_version": null,
+   "meta": {
+    "owner": "data-platform"
+   },
+   "columns": {
+    "order_id": {
+     "name": "order_id",
+     "data_type": null
+    }
+   },
+   "config": {
+    "meta": {
+     "owner": "data-platform"
+    },
+    "contract": {
+     "enforced": false,
+     "alias_types": true
+    }
+   }
+  }
+ }
+}

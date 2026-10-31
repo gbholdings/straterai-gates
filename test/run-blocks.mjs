@@ -3,18 +3,27 @@
 //
 // For each fixture case under test/fixtures/<dir>/<case>/ it builds a temp git repo: `base/` becomes
 // origin/main, `head/` becomes the PR branch on top. Then it runs the gate's named steps, in order, with
-// `bash -e -o pipefail` as GitHub does, using the workflow's own env and input defaults. The first nonzero step stops
-// the case, as on a runner. A case may carry `inputs.json` (input overrides), `links` (lines of
-// "<path> <target>" committed as symlinks in head) and `expect-output` (lines that must appear in
-// $GITHUB_OUTPUT), `expect-log` (lines that must appear in the steps' output, so a failing case proves which
-// check failed it), `event.json` (the pull request the event carries: {"number", "author", "repository"}) and
-// `reviews.json` (what `gh api graphql` returns for that pull request; "HEAD" in it becomes the head commit's
-// SHA). With reviews.json, test/bin goes first on PATH, so the gate's `gh` prints that file. Lines a step
-// appends to $GITHUB_ENV are in the environment of the steps after it, as on a runner.
+// `bash -e -o pipefail` as GitHub does, using the workflow's own env and input defaults. Each step's `if:` is
+// evaluated as GitHub would (success() by default, so a failed step skips the rest unless their `if:`
+// says otherwise), each step gets its own GITHUB_OUTPUT, and GITHUB_ENV carries into later steps. Every
+// case gets its own RUNNER_TEMP, and the repo gets this checkout's scripts/ under .gates/, as the
+// workflows' "Check out the gates" step does.
 //
-// Expressions are resolved the narrow way these workflows use them: inputs.<name>, github.base_ref and
-// github.event.pull_request.base.ref (main here), github.event.pull_request.head.sha (the head commit), the
-// event.json fields, and nothing else (vars.*, secrets.* and other github.* are empty).
+// A case may carry:
+//   expect          the job result: 0 passes, anything else fails (any nonzero step)
+//   inputs.json     input overrides
+//   event.json      { "event_name": ..., "pr_number": ... } (default pull_request, 7); the squawk cases use
+//                   { "number", "author", "repository" }, the pull request the review event carries
+//   links           lines of "<path> <target>" committed as symlinks in head
+//   expect-output   lines that must appear in some step's GITHUB_OUTPUT
+//   expect-log      lines that must each appear in the log, so a failing case fails for its stated reason
+//   expect-gh       lines that must each appear in the fake `gh` log (its argv, and any -F body=@file)
+//   secrets.json    secrets the workflow sees (default none)
+//   expect-evidence lines that must each appear in the datacontract evidence file
+//   gh-responses    lines of "<argv substring>\t<stdout>" the fake `gh` answers with (first match wins)
+//   reviews.json    what `gh api graphql` prints for the squawk guard's reviews query ("HEAD" becomes the head SHA)
+//
+// Expressions are resolved the narrow way these workflows use them; anything else throws.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -32,13 +41,30 @@ const GATES = [
     fixtures: "squawk",
     steps: ["Install the SQL parser", "Install squawk", "Destructive change needs an approving review", "Lint changed migrations"],
     inputs: { config_path: fwd(path.join(FIX, "squawk", "squawk.toml")) },
+    // The guard reads the PR's reviews with one read-only `gh api graphql` query on every PR; that read is
+    // not a gh call the "no gh calls" rule is about (a notice on a passing PR).
+    ghReads: true,
   },
   {
     name: "datacontract",
     workflow: "datacontract.yml",
     fixtures: "datacontract",
-    steps: ["Did a contract change?", "Lint every contract", "Breaking changes, deletions and retirements"],
+    jobs: {
+      contracts: [
+        "Check the inputs",
+        "Build the fixture repository",
+        "Did a contract change?",
+        "Lint every contract",
+        "Contracts match the schema",
+        "Every contract has an owner",
+        "Breaking changes, deletions and retirements",
+        "Record evidence",
+      ],
+      notice: ["Tell the consumers"],
+    },
+    handoff: "datacontract-breaking",
     inputs: {},
+    gates: true,
   },
   {
     name: "dbt (change detection)",
@@ -77,21 +103,158 @@ function load(workflow) {
   return JSON.parse(r.stdout);
 }
 
-function resolve(value, inputs, ctx = {}) {
+// ---------------------------------------------------------------------------------------------------
+// GitHub expressions, the subset these workflows use: literals ('x', true, false, numbers), context
+// paths (inputs.*, steps.<id>.outputs.<k>, steps.<id>.outcome, github.*, env.*, secrets.*, job.*,
+// runner.*), ==, !=, !, &&, ||, parentheses, and the status functions. && and || return an operand,
+// as GitHub's do. Equality is loose the way GitHub's is for these types: '' == false, 'true' != true.
+
+function tokenize(src) {
+  const toks = [];
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (/\s/.test(c)) { i++; continue; }
+    if (c === "'") {
+      let j = i + 1, s = "";
+      for (;;) {
+        if (j >= src.length) throw new Error(`unterminated string in: ${src}`);
+        if (src[j] === "'" && src[j + 1] === "'") { s += "'"; j += 2; continue; }
+        if (src[j] === "'") break;
+        s += src[j++];
+      }
+      toks.push({ t: "str", v: s });
+      i = j + 1;
+      continue;
+    }
+    const two = src.slice(i, i + 2);
+    if (["==", "!=", "&&", "||"].includes(two)) { toks.push({ t: "op", v: two }); i += 2; continue; }
+    if ("!()".includes(c)) { toks.push({ t: "op", v: c }); i++; continue; }
+    const m = /^[A-Za-z_][A-Za-z0-9_.-]*|^\d+(\.\d+)?/.exec(src.slice(i));
+    if (!m) throw new Error(`cannot read expression at "${src.slice(i)}"`);
+    toks.push({ t: "id", v: m[0] });
+    i += m[0].length;
+  }
+  return toks;
+}
+
+function evaluate(src, ctx) {
+  const toks = tokenize(src);
+  let p = 0;
+  const peek = () => toks[p];
+  const eat = (v) => {
+    const t = toks[p];
+    if (!t || t.v !== v) throw new Error(`expected ${v} in: ${src}`);
+    p++;
+  };
+  const truthy = (v) => !(v === false || v === null || v === undefined || v === "" || v === 0);
+  const eq = (a, b) => {
+    if (typeof a === typeof b) return a === b;
+    const num = (x) => (x === true ? 1 : x === false || x === null || x === "" ? 0 : Number(x));
+    return num(a) === num(b);
+  };
+  function primary() {
+    const t = peek();
+    if (!t) throw new Error(`unexpected end of: ${src}`);
+    if (t.v === "(") { p++; const v = or(); eat(")"); return v; }
+    if (t.v === "!") { p++; return !truthy(primary()); }
+    p++;
+    if (t.t === "str") return t.v;
+    if (t.v === "true") return true;
+    if (t.v === "false") return false;
+    if (t.v === "null") return null;
+    if (/^\d/.test(t.v)) return Number(t.v);
+    if (peek()?.v === "(") {
+      eat("(");
+      eat(")");
+      if (!(t.v in ctx.fns)) throw new Error(`unsupported function ${t.v}() in: ${src}`);
+      return ctx.fns[t.v]();
+    }
+    return ctx.lookup(t.v, src);
+  }
+  function cmp() {
+    let v = primary();
+    while (peek() && (peek().v === "==" || peek().v === "!=")) {
+      const op = toks[p++].v;
+      const r = primary();
+      v = op === "==" ? eq(v, r) : !eq(v, r);
+    }
+    return v;
+  }
+  function and() {
+    let v = cmp();
+    while (peek()?.v === "&&") { p++; const r = cmp(); v = truthy(v) ? r : v; }
+    return v;
+  }
+  function or() {
+    let v = and();
+    while (peek()?.v === "||") { p++; const r = and(); v = truthy(v) ? v : r; }
+    return v;
+  }
+  const v = or();
+  if (p !== toks.length) throw new Error(`trailing tokens in: ${src}`);
+  return { value: v, truthy: truthy(v), usesStatus: toks.some((t, i) => t.t === "id" && ["always", "failure", "cancelled", "success"].includes(t.v) && toks[i + 1]?.v === "(") };
+}
+
+function makeLookup(inputs, ctx) {
+  return (name, src) => {
+    const parts = name.split(".");
+    switch (parts[0]) {
+      case "inputs":
+        return inputs[parts[1]] ?? "";
+      case "steps": {
+        const s = ctx.steps[parts[1]];
+        if (!s) return "";
+        if (parts[2] === "outcome" || parts[2] === "conclusion") return s.outcome;
+        if (parts[2] === "outputs") return s.outputs[parts[3]] ?? "";
+        break;
+      }
+      case "github":
+        if (parts[1] === "base_ref") return "main";
+        if (parts[1] === "event_name") return ctx.event.event_name;
+        if (parts[1] === "repository") return ctx.event.repository ?? "example-org/gates-under-test";
+        if (parts[1] === "workspace") return fwd(ctx.repo);
+        if (parts[1] === "server_url") return "https://github.example.test";
+        if (parts[1] === "run_id") return "4242";
+        if (parts[1] === "sha") return "fake-head-sha";
+        if (parts[1] === "token") return "fake-token";
+        if (parts[1] === "event" && parts[2] === "pull_request" && parts[3] === "number") return String(ctx.event.number ?? ctx.event.pr_number);
+        if (parts[1] === "event" && parts[2] === "pull_request" && parts[3] === "base" && parts[4] === "ref") return "main";
+        if (parts[1] === "event" && parts[2] === "pull_request" && parts[3] === "head" && parts[4] === "sha") return ctx.head;
+        if (parts[1] === "event" && parts[2] === "pull_request" && parts[3] === "user" && parts[4] === "login") return ctx.event.author ?? "";
+        if (parts[1] === "event") return "";
+        return "";
+      case "env":
+        return ctx.env[parts[1]] ?? "";
+      case "needs": {
+        const n = ctx.needs?.[parts[1]];
+        if (!n) return "";
+        if (parts[2] === "result") return n.result;
+        if (parts[2] === "outputs") return n.outputs[parts[3]] ?? "";
+        return "";
+      }
+      case "secrets":
+        return ctx.secrets[parts[1]] ?? "";
+      case "runner":
+        return parts[1] === "temp" ? fwd(ctx.runnerTemp ?? "") : "";
+      case "vars":
+      case "job":
+        return "";
+    }
+    throw new Error(`unsupported expression: ${name} in: ${src}`);
+  };
+}
+
+// ${{ expr }} inside a string, as in env: values and with: inputs.
+function interpolate(value, lookupCtx) {
   if (typeof value !== "string") return String(value);
   return value.replace(/\$\{\{\s*([^}]*?)\s*\}\}/g, (_, expr) => {
-    let m;
-    if ((m = /^inputs\.(\w+)$/.exec(expr))) return String(inputs[m[1]] ?? "");
-    if (expr === "github.base_ref" || expr === "github.event.pull_request.base.ref") return "main";
-    if (expr === "github.event.pull_request.head.sha") return ctx.head ?? "";
-    if (expr === "github.event.pull_request.number") return String(ctx.event?.number ?? "");
-    if (expr === "github.event.pull_request.user.login") return ctx.event?.author ?? "";
-    if (expr === "github.repository") return ctx.event?.repository ?? "";
-    if (/^(vars|secrets|github)\./.test(expr)) return "";
-    // A composite such as "squawk-cli@${{ inputs.x }}" is handled by the outer replace; anything else is unsupported.
-    throw new Error(`unsupported expression: ${expr}`);
+    const v = evaluate(expr, lookupCtx).value;
+    return v === null || v === undefined ? "" : String(v);
   });
 }
+
+// ---------------------------------------------------------------------------------------------------
 
 function sh(cmd, args, cwd, env) {
   const r = spawnSync(cmd, args, { cwd, env: { ...process.env, ...env }, encoding: "utf8" });
@@ -103,12 +266,17 @@ function copyTree(from, to) {
   if (fs.existsSync(from)) fs.cpSync(from, to, { recursive: true });
 }
 
-function buildRepo(caseDir) {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "blocks-"));
+function buildRepo(caseDir, work) {
+  const repo = path.join(work, "repo");
+  fs.mkdirSync(repo);
   const git = (...a) => sh("git", a, repo, { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.test", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.test" });
   git("init", "-q", "-b", "main");
   git("config", "core.autocrlf", "false");
   copyTree(path.join(caseDir, "base"), repo);
+  // base-rename: [{ from, to }] renames a base file to a name a Windows checkout cannot hold (a newline,
+  // `<`, a backtick), so a case can carry a hostile path without the repository carrying one.
+  const renames = path.join(caseDir, "base-rename.json");
+  if (fs.existsSync(renames)) for (const { from, to } of JSON.parse(fs.readFileSync(renames, "utf8"))) fs.renameSync(path.join(repo, from), path.join(repo, to));
   git("add", "-A");
   git("commit", "-q", "--allow-empty", "-m", "base");
   git("update-ref", "refs/remotes/origin/main", "HEAD");
@@ -128,88 +296,216 @@ function buildRepo(caseDir) {
   return repo;
 }
 
+// A stand-in for the GitHub CLI: logs its argv (and the file behind any -F body=@file) and prints the
+// first canned response whose key is a substring of its argv, or nothing.
+// A case's reviews.json is what `gh api graphql` prints for the squawk guard's reviews query ("HEAD" in it
+// becomes the head commit's SHA).
+function fakeGh(work, caseDir, head) {
+  const bin = path.join(work, "bin");
+  fs.mkdirSync(bin);
+  const log = path.join(work, "gh.log");
+  const responses = path.join(caseDir, "gh-responses");
+  const reviewsIn = path.join(caseDir, "reviews.json");
+  const reviews = path.join(work, "reviews.json");
+  if (fs.existsSync(reviewsIn)) fs.writeFileSync(reviews, fs.readFileSync(reviewsIn, "utf8").replaceAll("HEAD", head));
+  const script = `#!/usr/bin/env node
+const fs = require("fs");
+const argv = process.argv.slice(2);
+let out = "gh " + argv.join(" ") + "\\n";
+for (const a of argv) { const m = /^body=@(.*)$/.exec(a); if (m) out += fs.readFileSync(m[1], "utf8") + "\\n"; }
+const bf = argv.indexOf("--body-file"); if (bf >= 0) out += fs.readFileSync(argv[bf + 1], "utf8") + "\\n";
+fs.appendFileSync(${JSON.stringify(fwd(log))}, out);
+const rv = ${JSON.stringify(fwd(reviews))};
+if (argv[0] === "api" && argv[1] === "graphql" && argv.some((a) => a.includes("reviews(")) && fs.existsSync(rv)) { process.stdout.write(fs.readFileSync(rv, "utf8")); process.exit(0); }
+const r = ${JSON.stringify(fwd(responses))};
+if (fs.existsSync(r)) {
+  for (const line of fs.readFileSync(r, "utf8").split("\\n").filter(Boolean)) {
+    const [key, ...rest] = line.split("\\t");
+    if (argv.join(" ").includes(key)) { process.stdout.write(rest.join("\\t").replace(/\\\\n/g, "\\n") + "\\n"); break; }
+  }
+}
+`;
+  fs.writeFileSync(path.join(bin, "gh"), script, { mode: 0o755 });
+  fs.writeFileSync(log, "");
+  return { bin, log };
+}
+
+function lines(file) {
+  return fs.existsSync(file) ? fs.readFileSync(file, "utf8").split("\n").map((l) => l.replace(/\r$/, "")).filter(Boolean) : [];
+}
+
 function runCase(gate, wf, caseName) {
   const caseDir = path.join(FIX, gate.fixtures, caseName);
   const inputs = { ...wf.inputs, ...gate.inputs };
   const overrides = path.join(caseDir, "inputs.json");
   if (fs.existsSync(overrides)) Object.assign(inputs, JSON.parse(fs.readFileSync(overrides, "utf8")));
-  const repo = buildRepo(caseDir);
-  const out = path.join(repo, "..", `${path.basename(repo)}.out`);
-  fs.writeFileSync(out, "");
-  const envFile = path.join(repo, "..", `${path.basename(repo)}.env`);
-  fs.writeFileSync(envFile, "");
-  const read = (f) => (fs.existsSync(path.join(caseDir, f)) ? fs.readFileSync(path.join(caseDir, f), "utf8") : null);
-  const ctx = { head: sh("git", ["rev-parse", "HEAD"], repo, {}).trim(), event: JSON.parse(read("event.json") ?? "null") };
-  const extra = {};
-  const reviews = read("reviews.json");
-  if (reviews !== null) {
-    const f = path.join(repo, "..", `${path.basename(repo)}.reviews.json`);
-    fs.writeFileSync(f, reviews.replaceAll("HEAD", ctx.head));
-    extra.GH_STUB_REVIEWS = fwd(f);
-    extra.PATH = `${path.join(ROOT, "test", "bin")}${path.delimiter}${process.env.PATH}`;
-  }
-  const baseEnv = {};
-  for (const [k, v] of Object.entries(wf.env)) baseEnv[k] = resolve(v, inputs, ctx);
+  const eventFile = path.join(caseDir, "event.json");
+  const event = { event_name: "pull_request", pr_number: 7, ...(fs.existsSync(eventFile) ? JSON.parse(fs.readFileSync(eventFile, "utf8")) : {}) };
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "blocks-"));
+  const repo = buildRepo(caseDir, work);
+  const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).stdout.trim();
+  const gh = fakeGh(work, caseDir, head);
+
+  const secretsFile = path.join(caseDir, "secrets.json");
+  const secrets = fs.existsSync(secretsFile) ? JSON.parse(fs.readFileSync(secretsFile, "utf8")) : {};
+  // A gate names the steps to run per job; one with `steps` runs those of the workflow's first job.
+  const plan = gate.jobs ?? { [Object.keys(wf.jobs)[0]]: gate.steps };
+  const needs = {};
   let code = 0;
   let log = "";
-  for (const step of wf.steps) {
-    if (!step.run || !gate.steps.includes(step.name)) continue;
-    const output = fs.readFileSync(out, "utf8");
-    if (step.if) {
-      if (step.if.includes("steps.changes.outputs.changed == 'true'") && !output.includes("changed=true")) continue;
-      if (step.if.includes("inputs.lint_all != true") && String(inputs.lint_all) === "true") continue;
+  let outputs = "";
+  let first = true;
+  let firstTemp = null;
+  for (const [jobName, stepNames] of Object.entries(plan)) {
+    const job = wf.jobs[jobName];
+    if (!job) throw new Error(`${gate.workflow} has no job ${jobName}`);
+    // The first job runs in the PR's checkout. A later job gets an empty workspace (it checks out only
+    // the gates) and its own runner temp, into which the handed-over folder is copied, as an artifact is.
+    const workspace = first ? repo : fs.mkdtempSync(path.join(work, `ws-${jobName}-`));
+    const runnerTemp = fs.mkdtempSync(path.join(work, `runner-temp-${jobName}-`));
+    if (first) firstTemp = runnerTemp;
+    else if (gate.handoff && fs.existsSync(path.join(firstTemp, gate.handoff))) fs.cpSync(path.join(firstTemp, gate.handoff), path.join(runnerTemp, gate.handoff), { recursive: true });
+    if (gate.gates) fs.cpSync(path.join(ROOT, "scripts"), path.join(workspace, ".gates", "scripts"), { recursive: true });
+    if (gate.gates && fs.existsSync(path.join(ROOT, "requirements"))) fs.cpSync(path.join(ROOT, "requirements"), path.join(workspace, ".gates", "requirements"), { recursive: true });
+    const ctx = { steps: {}, event, head, repo: workspace, runnerTemp, env: {}, secrets, needs };
+    let failed = false;
+    const needFailed = () => job.needs.some((n) => needs[n]?.result === "failure");
+    ctx.fns = { success: () => !failed && !needFailed(), failure: () => failed || needFailed(), always: () => true, cancelled: () => false };
+    const exprCtx = { fns: ctx.fns, lookup: makeLookup(inputs, ctx) };
+    if (job.if) {
+      const cond = String(job.if).replace(/^\s*\$\{\{\s*/, "").replace(/\s*\}\}\s*$/, "");
+      const r = evaluate(cond, exprCtx);
+      const run = r.usesStatus ? r.truthy : !needFailed() && r.truthy;
+      if (!run) {
+        log += `=== job ${jobName} (skipped)\n`;
+        needs[jobName] = { result: "skipped", outputs: {} };
+        first = false;
+        continue;
+      }
     }
-    const added = {};
-    for (const l of fs.readFileSync(envFile, "utf8").split("\n")) if (l.includes("=")) added[l.slice(0, l.indexOf("="))] = l.slice(l.indexOf("=") + 1);
-    const env = { ...baseEnv, ...added, ...extra, GITHUB_OUTPUT: fwd(out), GITHUB_ENV: fwd(envFile), RUNNER_TEMP: fwd(os.tmpdir()) };
-    for (const [k, v] of Object.entries(step.env)) env[k] = resolve(v, inputs, ctx);
-    const script = path.join(repo, "..", `${path.basename(repo)}.sh`);
-    fs.writeFileSync(script, step.run);
-    const r = spawnSync("bash", ["-e", "-o", "pipefail", fwd(script)], { cwd: repo, env: { ...process.env, ...env }, encoding: "utf8", timeout: 300000 });
-    log += `--- ${step.name} (exit ${r.status})\n${r.stdout}${r.stderr}`;
-    if (r.status !== 0) {
-      code = r.status ?? 1;
-      break;
+    log += `=== job ${jobName}\n`;
+    const jobEnv = {};
+    for (const [k, v] of Object.entries(job.env)) jobEnv[k] = interpolate(v, exprCtx);
+    ctx.env = { ...jobEnv };
+    // pre-env: GITHUB_ENV lines an earlier step of the first job is taken to have written ({repo} is the
+    // checkout), so a case can prove a planted BASH_ENV is never sourced.
+    const carried = {};
+    if (first) for (const l of lines(path.join(caseDir, "pre-env"))) {
+      const eq = l.indexOf("=");
+      carried[l.slice(0, eq)] = l.slice(eq + 1).replaceAll("{repo}", fwd(repo));
     }
+    const summary = path.join(work, `${jobName}.summary`);
+    fs.writeFileSync(summary, "");
+    job.steps.forEach((step, i) => {
+      if (!step.run || !stepNames.includes(step.name)) return;
+      const id = step.id ?? `__step${i}`;
+      let run;
+      if (step.if) {
+        const cond = String(step.if).replace(/^\s*\$\{\{\s*/, "").replace(/\s*\}\}\s*$/, "");
+        const r = evaluate(cond, exprCtx);
+        run = r.usesStatus ? r.truthy : !failed && r.truthy;
+      } else run = !failed;
+      if (!run) {
+        ctx.steps[id] = { outcome: "skipped", outputs: {} };
+        log += `--- ${step.name} (skipped)\n`;
+        return;
+      }
+      const out = path.join(work, `${jobName}-${id}.out`);
+      const envFile = path.join(work, `${jobName}-${id}.env`);
+      fs.writeFileSync(out, "");
+      fs.writeFileSync(envFile, "");
+      const env = { ...jobEnv, ...carried, GITHUB_OUTPUT: fwd(out), GITHUB_ENV: fwd(envFile), GITHUB_STEP_SUMMARY: fwd(summary), RUNNER_TEMP: fwd(runnerTemp), GITHUB_WORKSPACE: fwd(workspace), PATH: `${gh.bin}${path.delimiter}${process.env.PATH}` };
+      ctx.env = env;
+      for (const [k, v] of Object.entries(step.env)) env[k] = interpolate(v, exprCtx);
+      const script = path.join(work, `${jobName}-${id}.sh`);
+      fs.writeFileSync(script, step.run);
+      // The step's shell, else the job's default, else GitHub's bash; {0} is the script.
+      const shell = (step.shell ?? job.shell ?? "bash -e -o pipefail {0}").trim().split(/\s+/).map((a) => (a === "{0}" ? fwd(script) : a));
+      const r = spawnSync(shell[0], shell.slice(1), { cwd: workspace, env: { ...process.env, ...env }, encoding: "utf8", timeout: 300000 });
+      log += `--- ${step.name} (exit ${r.status})\n${r.stdout}${r.stderr}`;
+      const stepOutputs = {};
+      for (const l of lines(out)) {
+        const eq = l.indexOf("=");
+        if (eq > 0) stepOutputs[l.slice(0, eq)] = l.slice(eq + 1);
+      }
+      outputs += fs.readFileSync(out, "utf8");
+      for (const l of lines(envFile)) {
+        const eq = l.indexOf("=");
+        if (eq > 0) carried[l.slice(0, eq)] = l.slice(eq + 1);
+      }
+      ctx.steps[id] = { outcome: r.status === 0 ? "success" : "failure", outputs: stepOutputs };
+      if (r.status !== 0) {
+        failed = true;
+        if (!code) code = r.status ?? 1;
+      }
+    });
+    const s = fs.readFileSync(summary, "utf8");
+    if (s) log += `--- step summary\n${s}`;
+    const jobOutputs = {};
+    for (const [k, v] of Object.entries(job.outputs)) jobOutputs[k] = interpolate(v, exprCtx);
+    needs[jobName] = { result: failed ? "failure" : "success", outputs: jobOutputs };
+    first = false;
   }
-  const outputFile = path.join(caseDir, "expect-output");
-  let outputOk = true;
-  if (fs.existsSync(outputFile)) {
-    const got = fs.readFileSync(out, "utf8");
-    outputOk = fs.readFileSync(outputFile, "utf8").split("\n").filter(Boolean).every((l) => got.split("\n").includes(l));
-    if (!outputOk) log += `--- expected GITHUB_OUTPUT to contain:\n${fs.readFileSync(outputFile, "utf8")}got:\n${got}\n`;
-  }
-  const logFile = path.join(caseDir, "expect-log");
-  if (fs.existsSync(logFile)) {
-    const missing = fs.readFileSync(logFile, "utf8").split("\n").filter(Boolean).filter((l) => !log.includes(l));
+  const runnerTemp = firstTemp;
+  let expectOk = true;
+  const want = (file, haystack, what) => {
+    const missing = lines(path.join(caseDir, file)).filter((l) => !haystack.includes(l));
     if (missing.length) {
-      outputOk = false;
-      log += `--- expected the log to contain:\n${missing.join("\n")}\n`;
+      expectOk = false;
+      log += `--- expected ${what} to contain:\n${missing.join("\n")}\n`;
     }
+  };
+  want("expect-output", outputs.split("\n").map((l) => `${l}\n`).join(""), "a step's GITHUB_OUTPUT");
+  want("expect-log", log, "the log");
+  const ghLog = fs.readFileSync(gh.log, "utf8")
+    .split(/(?=^gh )/m)
+    .filter((c) => !(gate.ghReads && /^gh api graphql --paginate -f query=query\(/.test(c) && /reviews\(/.test(c)))
+    .join("");
+  want("expect-gh", ghLog, "the gh calls");
+  // reject-log and reject-gh: lines that must appear nowhere (a planted script's marker, a token value).
+  const reject = (file, haystack, what) => {
+    const found = lines(path.join(caseDir, file)).filter((l) => haystack.includes(l));
+    if (found.length) {
+      expectOk = false;
+      log += `--- expected ${what} NOT to contain:\n${found.join("\n")}\n`;
+    }
+  };
+  reject("reject-log", log + ghLog, "the log or the gh calls");
+  reject("reject-gh", ghLog, "the gh calls");
+  // A case that expects no gh call gets none: a notice on a passing PR is a bug.
+  if (!fs.existsSync(path.join(caseDir, "expect-gh")) && ghLog) {
+    expectOk = false;
+    log += `--- expected no gh calls, got:
+${ghLog}`;
   }
-  fs.rmSync(repo, { recursive: true, force: true });
-  return { code, outputOk, log };
+  if (fs.existsSync(path.join(caseDir, "expect-gh"))) log += `--- gh calls\n${ghLog}`;
+  const evidence = path.join(runnerTemp, "datacontract-evidence", "evidence.json");
+  if (fs.existsSync(evidence)) log += `--- evidence\n${fs.readFileSync(evidence, "utf8")}`;
+  want("expect-evidence", fs.existsSync(evidence) ? fs.readFileSync(evidence, "utf8") : "", "the evidence file");
+  fs.rmSync(work, { recursive: true, force: true });
+  return { code, expectOk, log };
 }
 
-let failed = 0;
+let failedCases = 0;
 const only = process.argv[2];
+const verbose = process.argv.includes("--verbose");
 for (const gate of GATES) {
-  if (only && !gate.name.startsWith(only)) continue;
+  if (only && only !== "--verbose" && !gate.name.startsWith(only)) continue;
   const wf = load(gate.workflow);
   for (const caseName of fs.readdirSync(path.join(FIX, gate.fixtures)).sort()) {
     if (!fs.statSync(path.join(FIX, gate.fixtures, caseName)).isDirectory()) continue;
     const want = Number(fs.readFileSync(path.join(FIX, gate.fixtures, caseName, "expect"), "utf8").trim());
     const r = runCase(gate, wf, caseName);
-    // Exit codes compare as pass or fail: a gate that fails may fail with any nonzero code.
-    const ok = (want === 0 ? r.code === 0 : r.code !== 0) && r.outputOk;
+    // Exit codes compare as pass or fail; expect-log pins down why a failing case failed.
+    const ok = (want === 0 ? r.code === 0 : r.code !== 0) && r.expectOk;
     console.log(`${ok ? "ok  " : "FAIL"} ${gate.name} / ${caseName} (want ${want}, got ${r.code})`);
-    if (!ok) {
-      failed++;
+    if (!ok || verbose) {
+      if (!ok) failedCases++;
       console.log(r.log);
     }
   }
 }
-if (failed) {
-  console.log(`${failed} fixture case(s) failed`);
+if (failedCases) {
+  console.log(`${failedCases} fixture case(s) failed`);
   process.exit(1);
 }

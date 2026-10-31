@@ -1,6 +1,6 @@
 Each case holds `base/` (optional, the base branch tree), `head/` (the PR's tree), `expect` (the exit code) and
 `expect-log` (lines the run must print, so a red case proves which check made it red). The approval cases add
-`event.json` (the pull request) and `reviews.json` (what `gh api graphql` returns; `test/bin/gh` prints it).
+`event.json` (the pull request) and `reviews.json` (what `gh api graphql` returns; the fake `gh` in `run-blocks.mjs` prints it).
 
 - `ordinary`, `no-migration`: pass. `dangerous`: the lint fails (`require-concurrent-index-creation`).
 - `destructive-ignore`, `bare-ignore`: a `squawk-ignore` does not get a DROP COLUMN past the guard.
