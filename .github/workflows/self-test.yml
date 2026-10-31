@@ -38,6 +38,43 @@ jobs:
       - name: Gate run blocks against fixtures
         run: node test/run-blocks.mjs
 
+  # governance-check monitors on what the real tools write: `dbt parse` of a dbt-duckdb project with the
+  # Elementary package, and GX Core file contexts. Every routed input passes and every break fails on its own
+  # line (test/monitors-engine.sh). No token beyond contents: read; pip runs isolated from outside the checkout.
+  monitors-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      DO_NOT_TRACK: "1"
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+      GX_ANALYTICS_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: dbt-duckdb and GX Core from hash-pinned lockfiles
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          for v in dbt gx; do python3 -I -m venv "$v"; done
+          env -u BASH_ENV -u ENV dbt/bin/python -I -m pip install --disable-pip-version-check --quiet --require-hashes -r "$GITHUB_WORKSPACE/requirements/dbt-duckdb-1.11.1.txt"
+          env -u BASH_ENV -u ENV gx/bin/python -I -m pip install --disable-pip-version-check --quiet --require-hashes -r "$GITHUB_WORKSPACE/requirements/great-expectations-1.24.1.txt"
+          dbt/bin/dbt --version
+          gx/bin/python -I -c "import great_expectations as g; print('great_expectations', g.__version__)"
+      - name: monitors passes routed monitors and fails each break on a real manifest and real GX contexts
+        env:
+          DBT: ${{ runner.temp }}/dbt/bin/dbt
+          GX_PYTHON: ${{ runner.temp }}/gx/bin/python
+        run: env -u BASH_ENV -u ENV bash test/monitors-engine.sh
+
   call-squawk:
     permissions:
       contents: read
@@ -114,15 +151,16 @@ jobs:
     with:
       checks: |
         gates:governance/version=version
+        gates:governance/monitors=monitors --repo test/fixtures/governance/monitors/elementary/project --manifest test/fixtures/governance/monitors/elementary/manifests/pass.json
 
   self-test:
     if: ${{ always() }}
-    needs: [unit, call-squawk, call-datacontract, call-datacontract-notice, verify-notice, call-dbt, call-governance]
+    needs: [unit, monitors-engine, call-squawk, call-datacontract, call-datacontract-notice, verify-notice, call-dbt, call-governance]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     permissions: {}
     env:
-      MUST_SUCCEED: ${{ needs.unit.result }} ${{ needs.call-squawk.result }} ${{ needs.call-datacontract.result }} ${{ needs.call-dbt.result }} ${{ needs.call-governance.result }}
+      MUST_SUCCEED: ${{ needs.unit.result }} ${{ needs.monitors-engine.result }} ${{ needs.call-squawk.result }} ${{ needs.call-datacontract.result }} ${{ needs.call-dbt.result }} ${{ needs.call-governance.result }}
       NOTICE: ${{ needs.call-datacontract-notice.result }}
       VERIFY: ${{ needs.verify-notice.result }}
       SAME_REPO_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}

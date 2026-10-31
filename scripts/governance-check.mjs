@@ -17,7 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 
-export const VERSION = "1.2.0";
+export const VERSION = "1.3.0";
 const RESULTS = ["pass", "fail", "not_run"];
 const DEFAULT_EVIDENCE = "governance/evidence.json";
 
@@ -158,6 +158,159 @@ function readJson(file, what) {
   } catch (e) {
     throw new Exit(2, `${what} ${file}: not valid JSON: ${e.message}`);
   }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// monitors: every run-time monitor reaches a person. Each Elementary test in a dbt manifest, and each GX
+// checkpoint in a file data context, must name an alert destination and an owner, and one repository must
+// not configure both Elementary and GX. A tool that is configured but whose input is not given, or an input
+// that holds no monitor, is NOT CHECKED (exit 2), never a pass.
+//
+// Elementary reads `channel` and `owner` from the test's meta over the model's, each at the top of meta or
+// under `alerts_config` (elementary/monitor/fetchers/alerts/schema/alert_data.py at
+// 54368c6381caa2d00569b4b49c512ff0a31e9457). dbt 1.10+ writes meta under `config.meta`; both are read.
+
+const SKIP_DIRS = new Set([".git", "node_modules", "dbt_packages", "dbt_modules", "target", ".venv", "venv", "site-packages", "__pycache__", ".gates"]);
+const REQ_FILE = /^(requirements[\w.-]*\.(txt|in)|pyproject\.toml|Pipfile|setup\.cfg|setup\.py|environment\.ya?ml)$/i;
+
+function repoFiles(root) {
+  const out = [];
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) {
+        if (!SKIP_DIRS.has(e.name)) walk(p);
+      } else if (e.isFile()) out.push(p);
+    }
+  };
+  walk(root);
+  return out;
+}
+
+// Which monitoring tools the repository configures, with the files that say so. Comments are ignored.
+export function detectMonitorTools(root) {
+  const found = { elementary: [], gx: [] };
+  for (const f of repoFiles(root)) {
+    const base = path.basename(f);
+    const rel = path.relative(root, f).split(path.sep).join("/");
+    if (base === "great_expectations.yml") found.gx.push(rel);
+    const isPackages = /^(packages|dependencies)\.ya?ml$/.test(base);
+    const isReq = REQ_FILE.test(base);
+    if (!isPackages && !isReq) continue;
+    const lines = fs.readFileSync(f, "utf8").split(/\r?\n/).map((l) => l.replace(/#.*$/, ""));
+    if (isPackages && lines.some((l) => /elementary-data\/(elementary|dbt-data-reliability)\b/i.test(l))) found.elementary.push(rel);
+    if (isReq) {
+      if (lines.some((l) => /(^|["'\s,[(])great[-_]expectations\b/i.test(l))) found.gx.push(rel);
+      if (lines.some((l) => /(^|["'\s,[(])elementary-data\b/i.test(l))) found.elementary.push(rel);
+    }
+  }
+  return found;
+}
+
+// A name or a list of names. Anything else (a number, an object, a list holding one) is not a name.
+const names = (v) => {
+  const list = Array.isArray(v) ? v : v === undefined || v === null ? [] : [v];
+  return list.every((x) => typeof x === "string") ? list.map((x) => x.trim()).filter(Boolean) : [];
+};
+
+// Elementary's view of a node's meta: config.meta over meta, then alerts_config flattened on top.
+function elementaryMeta(node) {
+  const m = { ...(node?.meta ?? {}), ...(node?.config?.meta ?? {}) };
+  const ac = m.alerts_config && typeof m.alerts_config === "object" ? m.alerts_config : {};
+  const flat = { ...m, ...ac };
+  delete flat.alerts_config;
+  return flat;
+}
+
+function elementaryMonitors(manifestFile, problems, counted) {
+  const m = readJson(manifestFile, "--manifest");
+  if (!/\/manifest\/v\d+/.test(m?.metadata?.dbt_schema_version ?? "")) throw new Exit(2, `--manifest ${manifestFile}: not a dbt manifest (no metadata.dbt_schema_version)`);
+  const nodes = m.nodes ?? {};
+  const sources = m.sources ?? {};
+  const tests = Object.entries(nodes).filter(([, n]) => n?.resource_type === "test" && n?.test_metadata?.namespace === "elementary");
+  if (!tests.length) throw new Exit(2, `monitors is NOT CHECKED: ${manifestFile} holds no Elementary test, so there is nothing to check`);
+  for (const [id, t] of tests) {
+    const parentId = t.attached_node ?? (t.depends_on?.nodes ?? []).find((x) => /^(model|source|seed|snapshot)\./.test(x));
+    const parent = parentId ? (nodes[parentId] ?? sources[parentId]) : undefined;
+    const tm = elementaryMeta(t);
+    const pm = elementaryMeta(parent);
+    const on = parent?.name ?? "(no model)";
+    const where = `${id} (elementary.${t.test_metadata.name} on ${on})`;
+    counted.push(where);
+    // the test's value wins, as in Elementary; an empty one on the test does not fall back to the model's
+    if (!names("channel" in tm ? tm.channel : pm.channel).length) problems.push(`${where}: no alert destination (set meta.channel on the test or on ${on})`);
+    if (!names("owner" in tm ? tm.owner : pm.owner).length) problems.push(`${where}: no owner (set meta.owner on ${on}; a monitor's owner is its dataset's)`);
+  }
+}
+
+// GX Core 1.x actions that send a notification, and the fields that say where it goes.
+const GX_ROUTES = {
+  slack: ["slack_webhook", "slack_channel"],
+  microsoft: ["teams_webhook"],
+  email: ["receiver_emails"],
+  opsgenie: ["api_key"],
+  api: ["url"],
+};
+
+function jsonFiles(dir) {
+  return fs.existsSync(dir) && fs.statSync(dir).isDirectory() ? fs.readdirSync(dir).filter((f) => f.endsWith(".json")).sort() : [];
+}
+
+function gxMonitors(gxDir, problems, counted) {
+  if (!fs.existsSync(gxDir) || !fs.statSync(gxDir).isDirectory()) throw new Exit(2, `--gx ${gxDir}: no such directory`);
+  const cpDir = path.join(gxDir, "checkpoints");
+  const files = jsonFiles(cpDir);
+  if (!files.length) throw new Exit(2, `monitors is NOT CHECKED: ${cpDir} holds no checkpoint (*.json), so there is nothing to check`);
+  const index = (sub) => new Map(jsonFiles(path.join(gxDir, sub)).map((f) => readJson(path.join(gxDir, sub, f), sub)).map((j) => [j?.name, j]));
+  const vds = index("validation_definitions");
+  const suites = index("expectations");
+  for (const f of files) {
+    const cp = readJson(path.join(cpDir, f), "checkpoint");
+    const where = `checkpoint ${cp?.name ?? f}`;
+    counted.push(where);
+    const routes = (Array.isArray(cp?.actions) ? cp.actions : []).filter((a) => {
+      const need = GX_ROUTES[a?.type];
+      if (!need || (a.notify_on ?? "all") === "success") return false;
+      return need.some((k) => names(a[k]).length);
+    });
+    if (!routes.length) problems.push(`${where}: no alert destination (an action of type ${Object.keys(GX_ROUTES).join(", ")} with its destination set and notify_on all or failure)`);
+    const refs = Array.isArray(cp?.validation_definitions) ? cp.validation_definitions : [];
+    if (!refs.length) problems.push(`${where}: validates nothing (no validation_definitions)`);
+    for (const ref of refs) {
+      const vd = vds.get(ref?.name);
+      const suite = vd && suites.get(vd?.suite?.name);
+      if (!vd) problems.push(`${where}: validation definition ${ref?.name ?? "(unnamed)"} is not in ${path.join(gxDir, "validation_definitions")}`);
+      else if (!suite) problems.push(`${where}: suite ${vd?.suite?.name ?? "(unnamed)"} is not in ${path.join(gxDir, "expectations")}`);
+      else if (!names(suite?.meta?.owner).length) problems.push(`${where}: suite ${suite.name} has no owner (set meta.owner on the suite to its dataset's owner)`);
+    }
+  }
+}
+
+export function monitorsCheck(argv) {
+  const f = parseFlags(argv, ["repo", "manifest", "gx"]);
+  const repo = f.repo ?? ".";
+  if (!fs.existsSync(repo) || !fs.statSync(repo).isDirectory()) throw new Exit(2, `--repo ${repo}: no such directory`);
+  const tools = detectMonitorTools(repo);
+  const both = (why) => new Exit(1, `monitors: ${why}; use Elementary in a dbt repo and GX elsewhere, never both`);
+  if (tools.elementary.length && tools.gx.length) throw both(`${repo} configures both Elementary (${tools.elementary.join(", ")}) and GX (${tools.gx.join(", ")})`);
+  if (f.manifest && f.gx) throw both("both --manifest (Elementary) and --gx (GX) were given");
+  if (f.manifest && tools.gx.length) throw both(`--manifest checks Elementary, and ${repo} configures GX (${tools.gx.join(", ")})`);
+  if (f.gx && tools.elementary.length) throw both(`--gx checks GX, and ${repo} configures Elementary (${tools.elementary.join(", ")})`);
+  if (!f.manifest && !f.gx) {
+    const which = tools.elementary.length
+      ? "Elementary is configured; pass --manifest target/manifest.json"
+      : tools.gx.length
+        ? "GX is configured; pass --gx <the gx directory>"
+        : `neither Elementary nor GX is configured in ${repo}`;
+    throw new Exit(2, `monitors is NOT CHECKED: ${which}`);
+  }
+  const problems = [];
+  const counted = [];
+  if (f.manifest) elementaryMonitors(f.manifest, problems, counted);
+  else gxMonitors(f.gx, problems, counted);
+  const tool = f.manifest ? "Elementary" : "GX";
+  if (problems.length) throw new Exit(1, `monitors: ${problems.length} problem(s) in ${counted.length} ${tool} monitor(s)\n${problems.map((p) => `  ${p}`).join("\n")}`);
+  return `monitors: ${counted.length} ${tool} monitor(s), each with an alert destination and an owner`;
 }
 
 const isContractFile = (name) => /\.odcs\.(ya?ml|json)$/i.test(name);
@@ -785,6 +938,7 @@ export function main(argv, env = process.env) {
   const [cmd, sub, ...rest] = argv;
   if (cmd === "version" || cmd === "--version") return VERSION;
   if (cmd === "evidence" && sub === "append") return evidenceAppend(rest, env);
+  if (cmd === "monitors") return monitorsCheck(argv.slice(1));
   if (cmd === "owner") return ownerCheck(argv.slice(1), env);
   if (cmd === "contract-schema") return contractSchemaCheck(argv.slice(1), env);
   if (cmd === "consumers") return consumersCmd(argv.slice(1), env);
@@ -794,6 +948,7 @@ export function main(argv, env = process.env) {
       "usage: governance-check.mjs <command>",
       "  version",
       "  evidence append --check <name> --result pass|fail|not_run [--run-link <url>] [--commit <sha>] [--detail <text>] [--file <path>]",
+      "  monitors [--repo <dir>] (--manifest <manifest.json> | --gx <gx directory>)",
       "  owner (--contracts <dir> | --contract <file> ...) [--manifest <manifest.json>]",
       "  contract-schema --contract <file> (--prisma <schema.prisma or folder> | --manifest <manifest.json> [--catalog <catalog.json>])",
       "  consumers --contract <file> [--format lines|markdown] [--label <path>]",
