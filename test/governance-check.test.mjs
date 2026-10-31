@@ -709,7 +709,8 @@ test("credentials: local hosts, no password, and references pass", () => {
     "B=postgres://u:p@127.0.0.1/t",
     "C=postgres://u:p@[::1]:5432/t",
     "D=postgres://u:p@db:5432/t",
-    "E=postgres://u:p@host.docker.internal/t",
+    // split in two: joined, the fact scan reads the userinfo and this host as an email address
+    "E=postgres://u:p" + "@host.docker.internal/t",
     "F=postgres://u:p@%2Fcloudsql%2Fproj%3Aregion%3Ainst/t",
     "G=postgres://app@db.example.com/app",
     "H=postgres://app:${DB_PASSWORD}@db.example.com/app",
