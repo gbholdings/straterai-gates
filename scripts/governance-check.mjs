@@ -18,7 +18,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 
-export const VERSION = "1.5.0";
+export const VERSION = "1.6.0";
 const RESULTS = ["pass", "fail", "not_run"];
 const DEFAULT_EVIDENCE = "governance/evidence.json";
 
@@ -31,16 +31,19 @@ class Exit extends Error {
 
 // `repeat` names flags that may be given more than once; they come back as arrays. A flag given twice
 // that is not repeatable is a usage error, so a typo cannot silently override the first value.
-function parseFlags(argv, known, repeat = []) {
+// bools: flags that take no value (`--all-tracked`). An argument is echoed in an error only masked: it may be
+// a connection string pasted where a path belongs.
+function parseFlags(argv, known, repeat = [], bools = []) {
   const out = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (!a.startsWith("--")) throw new Exit(2, `unexpected argument: ${a}`);
+    if (!a.startsWith("--")) throw new Exit(2, `unexpected argument: ${/^[\w./-]*$/.test(a) ? a : mdCode(redact(a))}`);
     const eq = a.indexOf("=");
     const name = eq === -1 ? a.slice(2) : a.slice(2, eq);
-    if (!known.includes(name)) throw new Exit(2, `unknown flag: --${name}`);
+    if (!known.includes(name)) throw new Exit(2, `unknown flag: ${/^[a-z][a-z0-9-]*$/.test(name) ? `--${name}` : mdCode(redact(`--${name}`))}`);
     let value;
     if (eq !== -1) value = a.slice(eq + 1);
+    else if (bools.includes(name)) value = "true";
     else if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) value = argv[++i];
     else throw new Exit(2, `--${name} needs a value`);
     if (value === "") throw new Exit(2, `--${name} needs a non-empty value`);
@@ -61,6 +64,35 @@ function headCommit() {
 
 // A14. The file is a JSON array that only grows. Read, validate, append, verify nothing earlier
 // changed, then write through a temp file so a crash never leaves half a file.
+function readEvidence(file) {
+  if (!fs.existsSync(file)) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (e) {
+    throw new Exit(4, `evidence file ${file} is not valid JSON and was left untouched: ${e.message}`);
+  }
+  if (!Array.isArray(parsed) || parsed.some((x) => x === null || typeof x !== "object" || Array.isArray(x))) {
+    throw new Exit(4, `evidence file ${file} is not a JSON array of entries and was left untouched`);
+  }
+  return parsed;
+}
+
+function writeEvidence(file, entries, added) {
+  const next = [...entries, ...added];
+  const text = JSON.stringify(next, null, 2) + "\n";
+  // Refuse to proceed if the write would alter or drop an earlier entry.
+  const back = JSON.parse(text);
+  if (back.length !== entries.length + added.length || entries.some((e, i) => JSON.stringify(e) !== JSON.stringify(back[i]))) {
+    throw new Exit(4, "refusing to write: an earlier entry would change");
+  }
+  fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, text);
+  fs.renameSync(tmp, file);
+  return next.length;
+}
+
 export function evidenceAppend(argv, env = process.env) {
   const f = parseFlags(argv, ["check", "result", "run-link", "commit", "detail", "file", "date", "from"]);
   if (f.from) {
@@ -72,20 +104,7 @@ export function evidenceAppend(argv, env = process.env) {
   const file = f.file ?? env.GOVERNANCE_EVIDENCE_FILE ?? DEFAULT_EVIDENCE;
   const date = f.date ?? new Date().toISOString();
   if (Number.isNaN(Date.parse(date))) throw new Exit(2, `evidence append: --date is not a date: ${date}`);
-
-  let entries = [];
-  if (fs.existsSync(file)) {
-    let parsed;
-    try {
-      parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-    } catch (e) {
-      throw new Exit(4, `evidence file ${file} is not valid JSON and was left untouched: ${e.message}`);
-    }
-    if (!Array.isArray(parsed) || parsed.some((x) => x === null || typeof x !== "object" || Array.isArray(x))) {
-      throw new Exit(4, `evidence file ${file} is not a JSON array of entries and was left untouched`);
-    }
-    entries = parsed;
-  }
+  const entries = readEvidence(file);
   const entry = {
     check: f.check,
     date,
@@ -94,18 +113,8 @@ export function evidenceAppend(argv, env = process.env) {
     commit: f.commit ?? headCommit(),
     detail: f.detail ?? "",
   };
-  const next = [...entries, entry];
-  const text = JSON.stringify(next, null, 2) + "\n";
-  // Refuse to proceed if the write would alter or drop an earlier entry.
-  const back = JSON.parse(text);
-  if (back.length !== entries.length + 1 || entries.some((e, i) => JSON.stringify(e) !== JSON.stringify(back[i]))) {
-    throw new Exit(4, "refusing to write: an earlier entry would change");
-  }
-  fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
-  const tmp = `${file}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, text);
-  fs.renameSync(tmp, file);
-  return `appended ${entry.check} ${entry.result} to ${file} (${next.length} entries)`;
+  const n = writeEvidence(file, entries, [entry]);
+  return `appended ${entry.check} ${entry.result} to ${file} (${n} entries)`;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -1195,6 +1204,259 @@ export function consumersCmd(argv, env = process.env) {
 }
 
 // ---------------------------------------------------------------------------------------------------
+// credentials: no committed config may carry a database connection string with a literal password for a
+// non-local host. Use IAM database authentication, or keep the whole connection string in a secret store
+// with a rotation date, and commit only the variable's name.
+//
+// What it reads: URL DSNs (postgres://, mysql://, mongodb+srv://, redis://, jdbc:..., sqlserver://, with
+// or without a `+driver` suffix), the password in their userinfo (also when it holds an unencoded `/`, `#`
+// or `?`) or in a `password=` / `pwd=` parameter, the host in the authority or in a `host=` parameter, and
+// key=value connection strings (libpq `host=... password=...`, ADO.NET `Server=...;Password=...`). UTF-8
+// and UTF-16 (with a BOM) files. It does not read a separate `DB_PASSWORD=` variable: that is not a
+// connection string, so a reviewer still has to look for one.
+//
+// Local: localhost, *.localhost, 127.0.0.0/8, ::1, 0.0.0.0, host.docker.internal, a socket path other than
+// a Cloud SQL one (/cloudsql/..., the Cloud Run to Cloud SQL path, is production), and a one-label name only
+// when it is a common compose or CI service name (db, postgres, mysql, redis, ...) or is named with
+// --local-host. Any other one-label name (`proddb`) is non-local. With --targets .claude/db-targets.json, a
+// variable named as the read_env or write_env of a target whose env is not local, dev or ci is non-local
+// whatever its host says; an unknown env counts as prod. The variable is read from `NAME=`, `NAME:`, a
+// `{"name": "NAME", "value": ...}` entry, and a `- name: NAME` line followed by `value:`.
+//
+// A password that is only a reference (`${NAME}`, `$NAME`, `${{ secrets.NAME }}`, `{{ ... }}`, `%NAME%`, a
+// Python `{name}`) is not a committed password and is listed as a note. A placeholder such as `<password>`
+// or `changeme` is a literal: it tells the next person to paste a password into the file.
+//
+// --all-tracked reads every committed file (git ls-files), skipping binaries and files over 2 MB.
+//
+// Exit 0 nothing found, 1 a finding, 2 nothing to read (a missing path, a glob that matches no committed
+// file, a directory): NOT CHECKED, never a pass. The password is never printed: every path, pattern, name
+// and host it prints has its userinfo and any password= value masked.
+
+const DSN_SCHEMES = "postgres(?:ql)?|mysql|mariadb|mongodb(?:\\+srv)?|redis|rediss|sqlserver|mssql|cockroach(?:db)?|oracle|clickhouse|snowflake|tidb";
+const URL_DSN = new RegExp(`(?<![\\w+.-])((?:jdbc:)?(?:${DSN_SCHEMES})(?:\\+[a-z0-9_]+)?):\\/\\/([^\\s'"\`]*)`, "gi");
+const LOCAL_ENVS = ["local", "dev", "ci"];
+const KNOWN_ENVS = ["local", "dev", "ci", "staging", "prod"];
+const SERVICE_NAMES = ["db", "database", "postgres", "postgresql", "pg", "pgbouncer", "mysql", "mariadb", "redis", "valkey", "mongo", "mongodb", "clickhouse", "cockroach", "cockroachdb", "mssql", "sqlserver", "oracle", "tidb"];
+const MAX_TRACKED_BYTES = 2 * 1024 * 1024;
+
+export function isReference(s) {
+  return /^(?:\$\{\{[^}]*\}\}|\$\{[A-Za-z_]\w*(?::?[-=?+][^}]*)?\}|\$[A-Za-z_]\w*|\{\{[^}]*\}\}|%[A-Za-z_]\w*%|\{[A-Za-z_][\w.]*\})$/.test(String(s).trim());
+}
+
+// Mask what could be a password in anything printed: a URL's userinfo, and a password= / pwd= value.
+export function redact(s) {
+  return String(s)
+    .replace(/(\/\/)[^\s]*@/g, "$1***@")
+    .replace(/((?:password|pwd)\s*=\s*)[^\s;&]+/gi, "$1***");
+}
+const shown = (s) => mdCode(redact(s));
+
+export function isLocalHost(host, extra = []) {
+  let h = decode(String(host ?? "").trim()).toLowerCase();
+  if (h.startsWith("[")) {
+    const close = h.indexOf("]");
+    h = close === -1 ? h.slice(1) : h.slice(1, close);
+  } else h = h.replace(/:\d*$/, "");
+  if (h.startsWith("/")) return !/^\/cloudsql\//.test(h);
+  if (h === "") return true;
+  if (h === "localhost" || h.endsWith(".localhost") || h === "::1" || h === "0.0.0.0" || h === "host.docker.internal") return true;
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+  return SERVICE_NAMES.includes(h) || extra.map((x) => String(x).toLowerCase()).includes(h);
+}
+
+function decode(s) {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+function kvValue(line, keys) {
+  const re = new RegExp(`(?:^|[\\s;=,("'])(?:${keys})\\s*=\\s*('[^']*'|"[^"]*"|[^\\s;"']+)`, "i");
+  const m = re.exec(line);
+  return m ? m[1].replace(/^['"]|['"]$/g, "") : undefined;
+}
+
+// Where the userinfo ends. Normally at the last `@` before the first `/`, `?` or `#`; when that part holds
+// no `@`, but the string starts `user:` and a later `@` is followed by a host, the password holds an
+// unencoded `/`, `?` or `#`, and the userinfo runs to the last such `@`.
+function splitUserinfo(rest) {
+  const end = rest.search(/[/?#]/);
+  if (end === -1 || rest.slice(0, end).includes("@")) return null;
+  if (!/^[^:/?#@]*:/.test(rest)) return null;
+  let best = -1;
+  for (let i = rest.indexOf("@"); i !== -1; i = rest.indexOf("@", i + 1)) {
+    if (/^(?:\[[^\]]*\]|[A-Za-z0-9%._-]+)(?::\d+)?(?:,|\/|\?|#|;|$)/.test(rest.slice(i + 1))) best = i;
+  }
+  return best === -1 ? null : best;
+}
+
+// Every connection string on a line, as { scheme, host, hosts, password } (password undefined when none).
+export function dsnsInLine(line) {
+  const out = [];
+  for (const m of line.matchAll(URL_DSN)) {
+    const scheme = m[1].toLowerCase();
+    let rest = m[2];
+    let userinfo = "";
+    const at = splitUserinfo(rest);
+    if (at !== null) {
+      userinfo = rest.slice(0, at);
+      rest = rest.slice(at + 1);
+    }
+    const end = rest.search(/[/?#]/);
+    let authority = end === -1 ? rest : rest.slice(0, end);
+    let params = end === -1 ? "" : rest.slice(end);
+    const semi = authority.indexOf(";");
+    if (semi !== -1) {
+      params = authority.slice(semi) + params;
+      authority = authority.slice(0, semi);
+    }
+    if (at === null) {
+      const a = authority.lastIndexOf("@");
+      userinfo = a === -1 ? "" : authority.slice(0, a);
+      authority = a === -1 ? authority : authority.slice(a + 1);
+    }
+    const hostport = authority.replace(/[),\]}>]+$/, "");
+    let password;
+    const colon = userinfo.indexOf(":");
+    if (colon !== -1 && colon < userinfo.length - 1) password = decode(userinfo.slice(colon + 1));
+    const pm = /(?:^|[?&;])(?:password|pwd)=([^&;#\s'"`]*)/i.exec(params);
+    if (password === undefined && pm && pm[1]) password = decode(pm[1]);
+    // libpq also takes the host from ?host= (a socket directory, or a name); it counts with the authority's
+    const qh = [...params.matchAll(/(?:^|[?&;])host=([^&;#\s'"`]*)/gi)].flatMap((x) => decode(x[1]).split(",")).filter(Boolean);
+    const hosts = [...hostport.split(",").filter((h) => h !== ""), ...qh];
+    if (!hosts.length) hosts.push("");
+    out.push({ scheme, host: hosts.find((h) => !isLocalHost(h)) ?? hosts[0], hosts, password });
+  }
+  if (!out.length) {
+    const password = kvValue(line, "password|pwd");
+    const host = kvValue(line, "host|hostaddr|server|data source|address|addr");
+    if (password && host !== undefined) {
+      const h = host.replace(/^tcp:/i, "").replace(/,(\d+)$/, ":$1");
+      out.push({ scheme: "key=value", host: h, hosts: [h], password });
+    }
+  }
+  return out;
+}
+
+function varName(line) {
+  const j = /"name"\s*:\s*"([A-Za-z_][A-Za-z0-9_]*)"/.exec(line);
+  if (j) return j[1];
+  const m = /^\s*(?:export\s+|-\s+)?["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*[:=]/.exec(line);
+  return m ? m[1] : null;
+}
+
+function readTargets(file) {
+  if (!fs.existsSync(file)) throw new Exit(2, `credentials: --targets ${shown(file)}: no such file. NOT CHECKED.`);
+  let cfg;
+  try {
+    cfg = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    // never the parser's message: it quotes the file's own text
+    throw new Exit(2, `credentials: --targets ${shown(file)} is not valid JSON. NOT CHECKED.`);
+  }
+  if (!cfg || typeof cfg.targets !== "object" || cfg.targets === null || Array.isArray(cfg.targets)) {
+    throw new Exit(2, `credentials: --targets ${shown(file)} has no "targets" object. NOT CHECKED.`);
+  }
+  const byVar = new Map();
+  for (const [name, t] of Object.entries(cfg.targets)) {
+    const env = KNOWN_ENVS.includes(t?.env) ? t.env : "prod";
+    for (const k of ["read_env", "write_env"]) {
+      if (typeof t?.[k] === "string" && t[k]) byVar.set(t[k], { name, env, local: LOCAL_ENVS.includes(env) });
+    }
+  }
+  return byVar;
+}
+
+function tracked(pattern) {
+  const r = spawnSync("git", ["ls-files", "-z", "--", ...(pattern === undefined ? [] : [`:(glob)${pattern}`])], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+  if (r.status !== 0) throw new Exit(2, "credentials: git ls-files failed (not a git checkout?). NOT CHECKED.");
+  return r.stdout.split("\0").filter(Boolean);
+}
+
+// The file's text, or null for a binary. UTF-16 with a BOM is decoded; a NUL byte otherwise means binary.
+function readText(file) {
+  const b = fs.readFileSync(file);
+  if (b[0] === 0xff && b[1] === 0xfe) return b.subarray(2).toString("utf16le");
+  if (b[0] === 0xfe && b[1] === 0xff) {
+    const s = Buffer.from(b.subarray(2));
+    s.swap16();
+    return s.toString("utf16le");
+  }
+  if (b.subarray(0, 8192).includes(0)) return null;
+  return b.toString("utf8");
+}
+
+export function credentialsCheck(argv) {
+  const f = parseFlags(argv, ["config", "targets", "all-tracked", "local-host"], ["config", "local-host"], ["all-tracked"]);
+  const all = f["all-tracked"] !== undefined;
+  if (!f.config?.length && !all) throw new Exit(2, "credentials: --config <file or glob> (repeatable) or --all-tracked is required. NOT CHECKED.");
+  const targets = f.targets ? readTargets(f.targets) : new Map();
+  const extra = f["local-host"] ?? [];
+  const files = [];
+  if (all) {
+    for (const t of tracked()) if (fs.existsSync(t) && fs.lstatSync(t).isFile() && fs.statSync(t).size <= MAX_TRACKED_BYTES) files.push(t);
+    if (!files.length) throw new Exit(2, "credentials: --all-tracked found no committed file. NOT CHECKED.");
+  }
+  for (const c of f.config ?? []) {
+    if (/[*?[]/.test(c) && !c.includes("://")) {
+      const hit = tracked(c);
+      if (!hit.length) throw new Exit(2, `credentials: --config ${shown(c)} matches no committed file. NOT CHECKED: fix the pattern.`);
+      files.push(...hit);
+      continue;
+    }
+    if (!fs.existsSync(c)) throw new Exit(2, `credentials: --config ${shown(c)}: no such file. NOT CHECKED.`);
+    files.push(c);
+  }
+  const unique = [...new Set(files)];
+  const findings = [];
+  const notes = [];
+  let seen = 0;
+  let read = 0;
+  for (const file of unique) {
+    if (!fs.lstatSync(file).isFile()) throw new Exit(2, `credentials: ${shown(file)}: not a regular file. NOT CHECKED.`);
+    const text = readText(file);
+    if (text === null) {
+      if (all) continue;
+      throw new Exit(2, `credentials: ${shown(file)} is binary. NOT CHECKED.`);
+    }
+    read++;
+    let pending = null; // a `- name: X` line, whose `value:` is on the next line
+    text.split(/\r?\n/).forEach((line, i) => {
+      let name = varName(line);
+      if (name === "value" && pending) name = pending;
+      const nm = /^\s*-?\s*["']?name["']?\s*:\s*["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*$/.exec(line);
+      pending = nm ? nm[1] : null;
+      const target = name ? targets.get(name) : undefined;
+      for (const d of dsnsInLine(line)) {
+        seen++;
+        const nonLocal = (target && !target.local) || !d.hosts.every((h) => isLocalHost(h, extra));
+        if (d.password === undefined || !nonLocal) continue;
+        const where = `${shown(file)}:${i + 1}`;
+        const what = `a ${d.scheme} connection string${name ? ` in ${shown(name)}` : ""}`;
+        const host = d.hosts.find((h) => !isLocalHost(h, extra)) ?? d.host;
+        const why = target && !target.local ? `target ${shown(target.name)} (env ${target.env})` : `host ${shown(host)}`;
+        if (isReference(d.password)) notes.push(`${where}: ${what} takes its password from a reference, not from the file (${why})`);
+        else findings.push(`${where}: ${what} has a literal password for the non-local ${why}`);
+      }
+    });
+  }
+  const tail = notes.length ? `\n${notes.map((n) => `  note: ${n}`).join("\n")}` : "";
+  if (findings.length) {
+    throw new Exit(
+      1,
+      `credentials: ${findings.length} committed connection string(s) carry a password for a non-local target (${read} file(s) read; no password is printed)\n` +
+        findings.map((x) => `  ${x}`).join("\n") +
+        "\n  fix: IAM database authentication (Cloud SQL, AlloyDB, RDS), or the whole connection string in a secret store with a rotation date and only its variable name committed. Rotate any real password that was committed." +
+        tail,
+    );
+  }
+  return `credentials: no literal password for a non-local target in ${read} file(s) (${seen} connection string(s) read)${tail}`;
+}
+
+// ---------------------------------------------------------------------------------------------------
 // Classification, deletion map, retention and exports (data-privacy). The tiers are the repository's own,
 // in governance/tiers.json; nothing here defines one. The file is required by every subcommand that
 // reads a tag, and a missing or malformed one exits 2:
@@ -2024,7 +2286,7 @@ function evidenceFrom(file, target) {
   const keys = ["check", "date", "result", "run_link", "commit", "detail"];
   for (const [i, e] of src.entries()) {
     const ok =
-      e && typeof e === "object" && !Array.isArray(e) && Object.keys(e).every((k) => keys.includes(k)) &&
+      e && typeof e === "object" && !Array.isArray(e) && Object.keys(e).length === keys.length && keys.every((k) => Object.hasOwn(e, k)) &&
       typeof e.check === "string" && e.check && RESULTS.includes(e.result) && typeof e.date === "string" && !Number.isNaN(Date.parse(e.date)) &&
       (e.run_link === null || typeof e.run_link === "string") && typeof e.commit === "string" && typeof e.detail === "string";
     if (!ok) throw new Exit(2, `--from ${file}: entry ${i} is not an evidence entry`);
@@ -2051,6 +2313,7 @@ export function main(argv, env = process.env) {
   if (cmd === "deletion-map") return deletionMap(argv.slice(1), env);
   if (cmd === "retention") return retentionCheck(argv.slice(1), env);
   if (cmd === "exports") return exportsCheck(argv.slice(1), env);
+  if (cmd === "credentials") return credentialsCheck(argv.slice(1));
   throw new Exit(
     2,
     [
@@ -2069,6 +2332,7 @@ export function main(argv, env = process.env) {
       "  deletion-map [--map governance/deletion-map.json] (--prisma <schema> | --manifest <m> [--repo <dbt project>]) [--tiers ...]",
       "  retention [--rules governance/retention.json] [--tiers ...]",
       "  exports --module <path or glob> ... (--prisma <schema> | --manifest <m> [--repo <dbt project>]) [--mask <fn> ...] [--strict true] [--tiers ...]",
+      "  credentials (--config <file or glob> ... | --all-tracked) [--targets .claude/db-targets.json]",
     ].join("\n"),
   );
 }

@@ -52,5 +52,6 @@ while IFS= read -r line; do
   node "$GC" evidence append --check "$name" --result "$result" "${meta[@]}" --detail "$result, exit $rc" || exit $?
   [ -z "${GITHUB_OUTPUT:-}" ] || echo "recorded=true" >> "$GITHUB_OUTPUT"
 done <<< "${CHECKS:-}"
-[ "$ran" = 1 ] || echo "::notice::no checks configured; nothing recorded"
+# A gate that ran nothing is NOT CHECKED, never a pass: an empty or all-comment `checks` fails the job.
+if [ "$ran" != 1 ]; then echo "::error::no checks configured: NOT CHECKED, nothing recorded"; exit 1; fi
 exit $failed

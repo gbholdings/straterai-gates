@@ -166,6 +166,7 @@ jobs:
         gates:data-privacy/exports=exports --module test/fixtures/governance/privacy/src/export/**/*.ts --prisma test/fixtures/governance/privacy/schema.prisma --tiers test/fixtures/governance/privacy/tiers.json
         gates:governance/monitors=monitors --repo test/fixtures/governance/monitors/elementary/project --manifest test/fixtures/governance/monitors/elementary/project/target/manifest.json
         gates:governance/monitors-gx=monitors --repo test/fixtures/governance/monitors/gx/routed --gx test/fixtures/governance/monitors/gx/routed/gx
+        gates:data-access/credentials=credentials --config test/fixtures/governance/credentials/pass/.env.example --config test/fixtures/governance/credentials/pass/**/*.json --targets test/fixtures/governance/credentials/pass/db-targets.json
       dbt_parse: |
         test/fixtures/governance/monitors/elementary/project
         test/fixtures/governance/privacy/dbt/project
@@ -215,9 +216,21 @@ jobs:
           PG: ${{ job.services.postgres.id }}
         run: bash test/emit-comments-pg.sh
 
+  # The credentials gate on the planted fixture, through the reusable workflow: it must FAIL. Pull
+  # requests only, so the planted failure is never published to the evidence branch.
+  call-governance-red:
+    if: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: write # the publish job declares it; it is skipped on a pull request
+    uses: ./.github/workflows/governance.yml
+    with:
+      evidence_artifact: governance-evidence-red
+      checks: |
+        gates:data-access/credentials=credentials --config test/fixtures/governance/credentials/fail/.env.example --targets test/fixtures/governance/credentials/fail/db-targets.json
+
   self-test:
     if: ${{ always() }}
-    needs: [unit, monitors-engine, call-squawk, call-datacontract, call-datacontract-notice, verify-notice, call-dbt, call-governance, call-governance-untagged, emit-comments]
+    needs: [unit, monitors-engine, call-squawk, call-datacontract, call-datacontract-notice, verify-notice, call-dbt, call-governance, call-governance-untagged, call-governance-red, emit-comments]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     permissions: {}
@@ -227,6 +240,7 @@ jobs:
       IS_PR: ${{ github.event_name == 'pull_request' }}
       NOTICE: ${{ needs.call-datacontract-notice.result }}
       VERIFY: ${{ needs.verify-notice.result }}
+      GOV_RED: ${{ needs.call-governance-red.result }}
       SAME_REPO_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - name: Every job ended the way it should
@@ -237,6 +251,12 @@ jobs:
             [ "$UNTAGGED" = failure ] || { echo "::error::the untagged-field fixture must fail the governance gate (got $UNTAGGED)"; exit 1; }
           elif [ "$UNTAGGED" != skipped ]; then
             echo "::error::the untagged-field call runs on pull requests only (got $UNTAGGED)"; exit 1
+          fi
+          echo "governance on the planted credentials fixture (must fail on a PR): $GOV_RED"
+          if [ "$IS_PR" = true ]; then
+            [ "$GOV_RED" = failure ] || { echo "::error::the planted credentials fixture must fail the governance gate (got $GOV_RED)"; exit 1; }
+          elif [ "$GOV_RED" != skipped ]; then
+            echo "::error::the planted credentials call should be skipped outside a pull request (got $GOV_RED)"; exit 1
           fi
           if [ "$SAME_REPO_PR" = true ]; then
             [ "$NOTICE" = failure ] || { echo "::error::the breaking fixture must fail the contract gate (got $NOTICE)"; exit 1; }
