@@ -1,0 +1,8 @@
+{
+  "stores": [
+    { "name": "app database", "kind": "primary", "holds": ["prisma:Person", "prisma:Note", "prisma:Session"], "delete": "src/privacy/delete-person.ts, proven by tests/delete-person.test.ts" },
+    { "name": "note embeddings", "kind": "embedding", "holds": ["prisma:NoteEmbedding"], "delete": "deleted by source_pk with the note, proven by tests/delete-person.test.ts" },
+    { "name": "warehouse copy", "kind": "warehouse", "holds": ["dbt:dim_people"], "delete": "the nightly load drops people the app deleted; tests/warehouse-delete.sql" },
+    { "name": "database backups", "kind": "backup", "holds": ["all"], "delete": "expires with the backups", "retention_days": 7, "after_restore": "reapply" }
+  ]
+}

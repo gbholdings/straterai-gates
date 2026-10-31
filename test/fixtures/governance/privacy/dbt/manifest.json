@@ -1,0 +1,85 @@
+{
+  "metadata": {
+    "project_name": "privacy_fixture"
+  },
+  "nodes": {
+    "model.privacy_fixture.dim_people": {
+      "resource_type": "model",
+      "package_name": "privacy_fixture",
+      "name": "dim_people",
+      "alias": "dim_people",
+      "database": "ANALYTICS",
+      "schema": "MARTS",
+      "original_file_path": "models/marts/dim_people.sql",
+      "config": {
+        "materialized": "table"
+      },
+      "columns": {
+        "person_id": {
+          "name": "person_id",
+          "data_type": "string",
+          "meta": {},
+          "config": {
+            "meta": {
+              "classification": "internal"
+            }
+          }
+        },
+        "email": {
+          "name": "email",
+          "data_type": "string",
+          "meta": {},
+          "config": {
+            "meta": {
+              "classification": "personal"
+            }
+          }
+        },
+        "tax_id": {
+          "name": "tax_id",
+          "data_type": "string",
+          "meta": {},
+          "config": {
+            "meta": {
+              "classification": "restricted"
+            }
+          }
+        }
+      }
+    },
+    "model.privacy_fixture.stg_people": {
+      "resource_type": "model",
+      "package_name": "privacy_fixture",
+      "name": "stg_people",
+      "alias": "stg_people",
+      "database": "ANALYTICS",
+      "schema": "STAGING",
+      "original_file_path": "models/staging/stg_people.sql",
+      "config": {
+        "materialized": "view"
+      },
+      "columns": {
+        "person_id": {
+          "name": "person_id",
+          "data_type": "string",
+          "meta": {},
+          "config": {
+            "meta": {
+              "classification": "internal"
+            }
+          }
+        },
+        "email": {
+          "name": "email",
+          "data_type": "string",
+          "meta": {},
+          "config": {
+            "meta": {
+              "classification": "personal"
+            }
+          }
+        }
+      }
+    }
+  }
+}

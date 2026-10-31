@@ -1,0 +1,26 @@
+{
+  "rules": [
+    {
+      "name": "sessions",
+      "tier": "restricted",
+      "keep_days": 30,
+      "enforcement": {
+        "kind": "scheduled-job",
+        "file": "test/fixtures/governance/privacy/infra/scheduler.tf",
+        "id": "purge-old-sessions"
+      },
+      "test": "test/fixtures/governance/privacy/tests/retention.test.ts"
+    },
+    {
+      "name": "people",
+      "tier": "personal",
+      "keep_days": 730,
+      "enforcement": {
+        "kind": "scheduled-job",
+        "file": "test/fixtures/governance/privacy/infra/scheduler.tf",
+        "id": "purge-inactive-people"
+      },
+      "test": "test/fixtures/governance/privacy/tests/retention.test.ts"
+    }
+  ]
+}
