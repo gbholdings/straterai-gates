@@ -12,12 +12,13 @@
 // Python runs isolated (-I: no script or working directory on sys.path, no PYTHON* variables, no user
 // site-packages) from the system temp directory, so a yaml.py or json.py in the repository under review
 // is never the module that loads.
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 
-export const VERSION = "1.3.0";
+export const VERSION = "1.6.0";
 const RESULTS = ["pass", "fail", "not_run"];
 const DEFAULT_EVIDENCE = "governance/evidence.json";
 
@@ -30,16 +31,19 @@ class Exit extends Error {
 
 // `repeat` names flags that may be given more than once; they come back as arrays. A flag given twice
 // that is not repeatable is a usage error, so a typo cannot silently override the first value.
-function parseFlags(argv, known, repeat = []) {
+// bools: flags that take no value (`--all-tracked`). An argument is echoed in an error only masked: it may be
+// a connection string pasted where a path belongs.
+function parseFlags(argv, known, repeat = [], bools = []) {
   const out = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (!a.startsWith("--")) throw new Exit(2, `unexpected argument: ${a}`);
+    if (!a.startsWith("--")) throw new Exit(2, `unexpected argument: ${/^[\w./-]*$/.test(a) ? a : mdCode(redact(a))}`);
     const eq = a.indexOf("=");
     const name = eq === -1 ? a.slice(2) : a.slice(2, eq);
-    if (!known.includes(name)) throw new Exit(2, `unknown flag: --${name}`);
+    if (!known.includes(name)) throw new Exit(2, `unknown flag: ${/^[a-z][a-z0-9-]*$/.test(name) ? `--${name}` : mdCode(redact(`--${name}`))}`);
     let value;
     if (eq !== -1) value = a.slice(eq + 1);
+    else if (bools.includes(name)) value = "true";
     else if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) value = argv[++i];
     else throw new Exit(2, `--${name} needs a value`);
     if (value === "") throw new Exit(2, `--${name} needs a non-empty value`);
@@ -90,7 +94,11 @@ function writeEvidence(file, entries, added) {
 }
 
 export function evidenceAppend(argv, env = process.env) {
-  const f = parseFlags(argv, ["check", "result", "run-link", "commit", "detail", "file", "date"]);
+  const f = parseFlags(argv, ["check", "result", "run-link", "commit", "detail", "file", "date", "from"]);
+  if (f.from) {
+    if (Object.keys(f).some((k) => !["from", "file"].includes(k))) throw new Exit(2, "evidence append: --from takes only --file beside it");
+    return evidenceFrom(f.from, f.file ?? env.GOVERNANCE_EVIDENCE_FILE ?? DEFAULT_EVIDENCE);
+  }
   if (!f.check) throw new Exit(2, "evidence append: --check <plugin>:<skill>/<gate> is required");
   if (!RESULTS.includes(f.result)) throw new Exit(2, `evidence append: --result must be one of ${RESULTS.join(", ")}`);
   const file = f.file ?? env.GOVERNANCE_EVIDENCE_FILE ?? DEFAULT_EVIDENCE;
@@ -107,35 +115,6 @@ export function evidenceAppend(argv, env = process.env) {
   };
   const n = writeEvidence(file, entries, [entry]);
   return `appended ${entry.check} ${entry.result} to ${file} (${n} entries)`;
-}
-
-// evidence merge: append every entry of --from (one run's entries, as governance.yml's check job
-// uploads them) to --file. The publish job runs it, so the job that read the caller's tree never holds
-// the write token. Each entry must have the A14 shape; one that does not exits 4 and nothing is written.
-const ENTRY_KEYS = ["check", "date", "result", "run_link", "commit", "detail"];
-export function evidenceMerge(argv, env = process.env) {
-  const f = parseFlags(argv, ["from", "file"]);
-  if (!f.from) throw new Exit(2, "evidence merge: --from <entries.json> is required");
-  if (!fs.existsSync(f.from)) throw new Exit(2, `evidence merge: ${f.from}: no such file`);
-  const file = f.file ?? env.GOVERNANCE_EVIDENCE_FILE ?? DEFAULT_EVIDENCE;
-  const added = readEvidence(f.from);
-  for (const [i, e] of added.entries()) {
-    const keys = Object.keys(e);
-    const bad =
-      keys.length !== ENTRY_KEYS.length ||
-      !ENTRY_KEYS.every((k) => keys.includes(k)) ||
-      typeof e.check !== "string" ||
-      !e.check ||
-      !RESULTS.includes(e.result) ||
-      typeof e.date !== "string" ||
-      Number.isNaN(Date.parse(e.date)) ||
-      !(e.run_link === null || typeof e.run_link === "string") ||
-      typeof e.commit !== "string" ||
-      typeof e.detail !== "string";
-    if (bad) throw new Exit(4, `evidence merge: entry ${i} of ${f.from} is not an evidence entry; nothing was written`);
-  }
-  const n = writeEvidence(file, readEvidence(file), added);
-  return `merged ${added.length} entr${added.length === 1 ? "y" : "ies"} into ${file} (${n} entries)`;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -193,6 +172,389 @@ function readJson(file, what) {
   } catch (e) {
     throw new Exit(2, `${what} ${file}: not valid JSON: ${e.message}`);
   }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// monitors: every run-time monitor reaches a person. Each Elementary test in a dbt manifest, and each GX
+// checkpoint in a file data context, must name a deliverable alert destination and a real owner, and one
+// repository must not configure both Elementary and GX. Every dbt project that uses Elementary and every GX
+// context under --repo must be covered by an input, each manifest must be this repository's and newer than
+// every project file, and each GX context must load in GX itself. Anything the check could not look at is
+// NOT CHECKED (exit 2), never a pass.
+//
+// Elementary reads `channel`, `owner` and `alert_suppression_interval` from the test's meta over the model's,
+// each at the top of meta or under `alerts_config` (elementary/monitor/fetchers/alerts/schema/alert_data.py
+// at 54368c6381caa2d00569b4b49c512ff0a31e9457). dbt 1.10+ writes meta under `config.meta`; both are read.
+
+const SKIP_DIRS = new Set([".git", "node_modules", "dbt_packages", "dbt_modules", "target", "logs", ".venv", "venv", "site-packages", "__pycache__", ".gates"]);
+const REQ_FILE = /^(requirements[\w.-]*\.(txt|in)|constraints[\w.-]*\.txt|pyproject\.toml|Pipfile|setup\.cfg|setup\.py|environment\.ya?ml)$/i;
+const DOCKER_FILE = /^(Dockerfile|Containerfile)([.-][\w.-]+)?$|\.(dockerfile|containerfile)$/i;
+// Hours. Past a week, a monitor that fired once stays silent through a week of further failures.
+export const MAX_SUPPRESSION_HOURS = 168;
+
+// Text from the repository (paths, model and test names) printed into the Actions log. A newline in a name
+// would start a new line, and a line that starts with `::` is a workflow command, so control characters are
+// written as escapes and nothing interpolated can begin a line.
+export const q = (v) => String(v).replace(/[\u0000-\u001f\u007f\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+
+function repoFiles(root) {
+  const out = [];
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) {
+        if (!SKIP_DIRS.has(e.name)) walk(p);
+      } else if (e.isFile()) out.push(p);
+    }
+  };
+  walk(root);
+  return out;
+}
+
+const relTo = (root, f) => path.relative(root, f).split(path.sep).join("/") || ".";
+// A dependency file: a requirements or constraints file wherever it sits (requirements/prod.txt too), a
+// Python project file, or a container build file.
+const isReqFile = (f, root) => {
+  const base = path.basename(f);
+  if (REQ_FILE.test(base) || DOCKER_FILE.test(base)) return true;
+  return /\.(txt|in)$/i.test(base) && relTo(root, path.dirname(f)).split("/").some((s) => /^(requirements|constraints)$/i.test(s));
+};
+
+const dbtProjectName = (file) => /^name:\s*["']?([A-Za-z_][\w]*)["']?\s*(#.*)?$/m.exec(fs.readFileSync(file, "utf8"))?.[1] ?? null;
+const usesElementary = (lines) => lines.some((l) => /elementary-data\/(elementary|dbt-data-reliability)\b/i.test(l));
+const stripComments = (text) => text.split(/\r?\n/).map((l) => l.replace(/#.*$/, ""));
+
+// What the repository configures: the tools, with the files that say so, every dbt project (and whether its
+// packages pull in Elementary) and every GX file context. Comments are ignored.
+export function detectMonitorTools(root) {
+  const found = { elementary: [], gx: [], dbtProjects: [], gxContexts: [] };
+  const files = repoFiles(root);
+  for (const f of files) {
+    const base = path.basename(f);
+    const rel = relTo(root, f);
+    if (base === "great_expectations.yml") {
+      found.gx.push(rel);
+      found.gxContexts.push({ dir: path.dirname(f), rel: relTo(root, path.dirname(f)) });
+    }
+    if (base === "dbt_project.yml") {
+      const dir = path.dirname(f);
+      const pk = ["packages.yml", "packages.yaml", "dependencies.yml", "dependencies.yaml"].map((n) => path.join(dir, n)).filter((p) => fs.existsSync(p));
+      found.dbtProjects.push({ dir, rel: relTo(root, dir), name: dbtProjectName(f), elementary: pk.some((p) => usesElementary(stripComments(fs.readFileSync(p, "utf8")))) });
+    }
+    const isPackages = /^(packages|dependencies)\.ya?ml$/.test(base);
+    const isReq = isReqFile(f, root);
+    if (!isPackages && !isReq) continue;
+    const lines = stripComments(fs.readFileSync(f, "utf8"));
+    if (isPackages && usesElementary(lines)) found.elementary.push(rel);
+    if (isReq) {
+      // great_expectations, great-expectations, and anything that pulls it in by name, such as
+      // apache-airflow-providers-great-expectations or `RUN pip install great_expectations`
+      if (lines.some((l) => /great[-_]expectations\b/i.test(l))) found.gx.push(rel);
+      if (lines.some((l) => /(^|[^\w/-])elementary-data\b/i.test(l))) found.elementary.push(rel);
+    }
+  }
+  return found;
+}
+
+// A name a person can be reached at, or a list of them. Placeholders are not names: empty, a bare `#` or
+// `@`, `<...>`, TODO, TBD, none, n/a, changeme, example, and the bare words owner and team.
+const PLACEHOLDER = /^(todo|tbd|tba|fixme|xxx+|none|null|nil|n\/?a|na|changeme|change[-_ ]?me|replace[-_ ]?me|placeholder|owner|team|channel|someone|unknown|default|\?+|-+|_+)$/i;
+export function isPlaceholder(s) {
+  const t = String(s).trim();
+  if (/^<.*>$/.test(t) || /example/i.test(t)) return true;
+  const bare = t.replace(/^[#@]+/, "").trim();
+  return bare === "" || PLACEHOLDER.test(bare) || /^(todo|tbd|fixme)\b/i.test(bare);
+}
+// The usable names in a value, and the placeholders found in it. Anything that is not a string or a list of
+// strings (a number, an object, a list holding one) holds no name.
+const names = (v) => {
+  const list = Array.isArray(v) ? v : v === undefined || v === null ? [] : [v];
+  if (!list.every((x) => typeof x === "string")) return { ok: [], bad: [] };
+  const trimmed = list.map((x) => x.trim()).filter(Boolean);
+  return { ok: trimmed.filter((x) => !isPlaceholder(x)), bad: trimmed.filter(isPlaceholder) };
+};
+const why = (n, what) => (n.bad.length ? `${what} is a placeholder (${n.bad.map((b) => JSON.stringify(q(b))).join(", ")})` : `no ${what}`);
+
+// Elementary's view of a node's meta: config.meta over meta, then alerts_config flattened on top.
+function elementaryMeta(node) {
+  const m = { ...(node?.meta ?? {}), ...(node?.config?.meta ?? {}) };
+  const ac = m.alerts_config && typeof m.alerts_config === "object" ? m.alerts_config : {};
+  const flat = { ...m, ...ac };
+  delete flat.alerts_config;
+  return flat;
+}
+
+const sha256 = (s) => crypto.createHash("sha256").update(s, "utf8").digest("hex");
+const PROJECT_EXT = /\.(sql|ya?ml|csv|py|md|jinja2?)$/i;
+
+// The files dbt reads for a project: its config files and everything under its resource paths
+// (dbt_project.yml's model-paths, seed-paths and the rest, each defaulting to dbt's own folder name). A
+// script, a README or a CI file beside the project is not an input, so editing one does not make the
+// manifest stale.
+const RESOURCE_PATHS = { "model-paths": ["models"], "seed-paths": ["seeds"], "test-paths": ["tests"], "analysis-paths": ["analyses"], "macro-paths": ["macros"], "snapshot-paths": ["snapshots"], "docs-paths": [] };
+const DBT_CONFIG_FILES = ["dbt_project.yml", "packages.yml", "packages.yaml", "dependencies.yml", "dependencies.yaml", "selectors.yml"];
+function dbtInputs(dir) {
+  const text = fs.readFileSync(path.join(dir, "dbt_project.yml"), "utf8");
+  const dirs = new Set();
+  for (const [key, def] of Object.entries(RESOURCE_PATHS)) {
+    const inline = new RegExp(`^${key}:[ \\t]*\\[([^\\]]*)\\]`, "m").exec(text);
+    const block = new RegExp(`^${key}:[ \\t]*(?:#.*)?\\r?\\n((?:[ \\t]+-[^\\n]*\\r?\\n?)+)`, "m").exec(text);
+    const list = inline ? inline[1].split(",") : block ? block[1].split(/\r?\n/).map((l) => l.replace(/^\s*-\s*/, "")) : def;
+    for (const v of list.map((x) => x.replace(/#.*$/, "").trim().replace(/^["']|["']$/g, "")).filter(Boolean)) dirs.add(v);
+  }
+  const out = DBT_CONFIG_FILES.map((f) => path.join(dir, f)).filter((f) => fs.existsSync(f));
+  for (const d of dirs) {
+    const p = path.resolve(dir, d);
+    if (p.startsWith(path.resolve(dir)) && fs.existsSync(p) && fs.statSync(p).isDirectory()) out.push(...repoFiles(p));
+  }
+  return [...new Set(out)];
+}
+
+// Why a manifest is not a current parse of the dbt project at `proj.dir`, or [] when it is. dbt checksums a
+// .sql file as sha256 of its stripped text; every .sql in the project is a node or a macro of the project's
+// package; and no project file is newer than the manifest's generated_at (a schema.yml carries no checksum,
+// so its mtime is what ties it).
+function manifestStaleness(m, proj) {
+  const pkg = m.metadata.project_name;
+  const reasons = [];
+  const listed = new Set();
+  const own = [m.nodes, m.sources, m.macros, m.exposures, m.metrics, m.semantic_models, m.saved_queries, m.unit_tests]
+    .flatMap((o) => Object.values(o ?? {}))
+    .filter((n) => n?.package_name === pkg);
+  for (const n of own) {
+    const files = [n.original_file_path, typeof n.patch_path === "string" ? n.patch_path.replace(/^[\w-]+:\/\//, "") : null].filter((x) => typeof x === "string" && x);
+    for (const rel of files) {
+      listed.add(rel.split(path.sep).join("/"));
+      const p = path.join(proj.dir, rel);
+      if (!fs.existsSync(p)) {
+        reasons.push(`${q(rel)} is in the manifest and not in ${q(proj.rel)}`);
+        continue;
+      }
+      if (rel === n.original_file_path && /\.sql$/i.test(rel) && n.checksum?.name === "sha256" && sha256(fs.readFileSync(p, "utf8").trim()) !== n.checksum.checksum)
+        reasons.push(`${q(rel)} has changed since the manifest was written`);
+    }
+  }
+  const files = dbtInputs(proj.dir);
+  for (const f of files) {
+    const rel = relTo(proj.dir, f);
+    if (/\.sql$/i.test(f) && !listed.has(rel)) reasons.push(`${q(rel)} is not in the manifest`);
+  }
+  const generated = Date.parse(m.metadata.generated_at ?? "");
+  if (!Number.isFinite(generated)) reasons.push("the manifest has no metadata.generated_at");
+  else {
+    const newer = files.filter((f) => PROJECT_EXT.test(f) && fs.statSync(f).mtimeMs > generated + 1).map((f) => relTo(proj.dir, f));
+    if (newer.length) reasons.push(`${newer.slice(0, 5).map(q).join(", ")}${newer.length > 5 ? ` and ${newer.length - 5} more` : ""} changed after the manifest was written (${q(m.metadata.generated_at)})`);
+  }
+  return [...new Set(reasons)];
+}
+
+function elementaryMonitors(manifestFile, tools, problems, counted, unchecked) {
+  const m = readJson(manifestFile, "--manifest");
+  const shown = q(manifestFile);
+  if (!/\/manifest\/v\d+/.test(m?.metadata?.dbt_schema_version ?? "")) throw new Exit(2, `--manifest ${shown}: not a dbt manifest (no metadata.dbt_schema_version)`);
+  const pkg = m.metadata.project_name;
+  const candidates = tools.dbtProjects.filter((p) => p.name && p.name === pkg);
+  if (!candidates.length) {
+    unchecked.push(`${shown} is the manifest of dbt project ${q(pkg ?? "(unnamed)")}, and --repo holds no dbt project of that name`);
+    return null;
+  }
+  const tried = candidates.map((p) => ({ p, reasons: manifestStaleness(m, p) }));
+  const tied = tried.find((t) => !t.reasons.length);
+  if (!tied) {
+    for (const t of tried) unchecked.push(`${shown} is not a current parse of ${q(t.p.rel)} (run dbt parse): ${t.reasons.slice(0, 5).join("; ")}`);
+    return null;
+  }
+  const nodes = m.nodes ?? {};
+  const sources = m.sources ?? {};
+  const tests = Object.entries(nodes).filter(([, n]) => n?.resource_type === "test" && n?.test_metadata?.namespace === "elementary");
+  if (!tests.length) {
+    unchecked.push(`${shown} holds no Elementary test, so there is nothing to check in ${q(tied.p.rel)}`);
+    return tied.p;
+  }
+  for (const [id, t] of tests) {
+    const parentId = t.attached_node ?? (t.depends_on?.nodes ?? []).find((x) => /^(model|source|seed|snapshot)\./.test(x));
+    const parent = parentId ? (nodes[parentId] ?? sources[parentId]) : undefined;
+    const tm = elementaryMeta(t);
+    const pm = elementaryMeta(parent);
+    const on = q(parent?.name ?? "(no model)");
+    const where = `${q(id)} (elementary.${q(t.test_metadata.name)} on ${on})`;
+    counted.push(where);
+    // the test's value wins, as in Elementary; an empty one on the test does not fall back to the model's
+    const pick = (k) => (k in tm ? tm[k] : pm[k]);
+    const channel = names(pick("channel"));
+    const owner = names(pick("owner"));
+    if (!channel.ok.length) problems.push(`${where}: ${why(channel, "alert destination")} (set meta.channel on the test or on ${on})`);
+    if (!owner.ok.length) problems.push(`${where}: ${why(owner, "owner")} (set meta.owner on ${on}; a monitor's owner is its dataset's)`);
+    const supp = pick("alert_suppression_interval");
+    if (supp !== undefined && supp !== null) {
+      const h = typeof supp === "number" ? supp : typeof supp === "string" && supp.trim() !== "" ? Number(supp) : NaN;
+      if (!Number.isFinite(h) || h < 0) problems.push(`${where}: alert_suppression_interval ${JSON.stringify(q(JSON.stringify(supp)))} is not a number of hours`);
+      else if (h > MAX_SUPPRESSION_HOURS) problems.push(`${where}: alert_suppression_interval ${h} hours silences the monitor for longer than ${MAX_SUPPRESSION_HOURS} after it fires`);
+    }
+  }
+  return tied.p;
+}
+
+// GX Core 1.x actions that send a notification, and the field sets that make one deliverable: each inner
+// list must be fully set. Slack takes a webhook, or a token with a channel; email takes the server, the port
+// and the receivers.
+const GX_ROUTES = {
+  slack: [["slack_webhook"], ["slack_token", "slack_channel"]],
+  microsoft: [["teams_webhook"]],
+  email: [["smtp_address", "smtp_port", "receiver_emails"]],
+  opsgenie: [["api_key"]],
+  api: [["url"]],
+};
+const isSet = (v) => (typeof v === "number" ? Number.isFinite(v) : names(v).ok.length > 0);
+
+function jsonFiles(dir) {
+  return fs.existsSync(dir) && fs.statSync(dir).isDirectory() ? fs.readdirSync(dir).filter((f) => f.endsWith(".json")).sort() : [];
+}
+
+// Loads the context and each checkpoint with GX itself, in a separate isolated Python, from a temp
+// directory. Prints {"error": <str|null>, "checkpoints": {<name>: <error|null>}}.
+const GX_LOAD = `
+import json, os, sys
+os.environ["GX_ANALYTICS_ENABLED"] = "false"
+out = {"error": None, "checkpoints": {}}
+try:
+    import great_expectations as gx
+    ctx = gx.get_context(mode="file", context_root_dir=sys.argv[1])
+except Exception as e:
+    out["error"] = (type(e).__name__ + ": " + str(e))[:400]
+else:
+    for name in sys.argv[2:]:
+        try:
+            ctx.checkpoints.get(name)
+            out["checkpoints"][name] = None
+        except Exception as e:
+            out["checkpoints"][name] = (type(e).__name__ + ": " + str(e))[:400]
+print("GATES-GX-LOAD " + json.dumps(out))
+`;
+
+function gxLoad(python, gxDir, cpNames) {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gates-gx-"));
+  try {
+    const env = { ...process.env, GX_ANALYTICS_ENABLED: "false" };
+    delete env.BASH_ENV;
+    delete env.ENV;
+    delete env.GH_TOKEN;
+    delete env.GITHUB_TOKEN;
+    const r = spawnSync(python, ["-I", "-c", GX_LOAD, path.resolve(gxDir), ...cpNames], { cwd, env, encoding: "utf8", timeout: 120000 });
+    const line = (r.stdout ?? "").split("\n").find((l) => l.startsWith("GATES-GX-LOAD "));
+    if (!line) return { fatal: `${q(python)} could not run GX (exit ${r.status ?? r.signal ?? r.error?.code}): ${q((r.stderr ?? "").trim().split("\n").slice(-1)[0] ?? "")}` };
+    return JSON.parse(line.slice("GATES-GX-LOAD ".length));
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+function gxMonitors(gxDir, python, problems, counted, unchecked) {
+  if (!fs.existsSync(gxDir) || !fs.statSync(gxDir).isDirectory()) throw new Exit(2, `--gx ${q(gxDir)}: no such directory`);
+  const cpDir = path.join(gxDir, "checkpoints");
+  const files = jsonFiles(cpDir);
+  if (!files.length) {
+    unchecked.push(`${q(cpDir)} holds no checkpoint (*.json), so there is nothing to check`);
+    return;
+  }
+  const index = (sub) => new Map(jsonFiles(path.join(gxDir, sub)).map((f) => readJson(path.join(gxDir, sub, f), sub)).map((j) => [j?.name, j]));
+  const vds = index("validation_definitions");
+  const suites = index("expectations");
+  const cps = files.map((f) => ({ f, cp: readJson(path.join(cpDir, f), "checkpoint") }));
+  for (const { f, cp } of cps) {
+    const where = `checkpoint ${q(cp?.name ?? f)}`;
+    counted.push(where);
+    const actions = (Array.isArray(cp?.actions) ? cp.actions : []).filter((a) => GX_ROUTES[a?.type] && (a.notify_on ?? "all") !== "success");
+    const deliverable = actions.filter((a) => GX_ROUTES[a.type].some((set) => set.every((k) => isSet(a[k]))));
+    if (!deliverable.length) {
+      const partial = actions.map((a) => `${q(a.type)} needs ${GX_ROUTES[a.type].map((s) => s.join(" + ")).join(" or ")}`);
+      problems.push(`${where}: no deliverable alert destination (${partial.length ? partial.join("; ") : `an action of type ${Object.keys(GX_ROUTES).join(", ")} with notify_on all or failure`})`);
+    }
+    for (const a of deliverable) {
+      for (const k of ["slack_channel", "receiver_emails"]) if (a[k] !== undefined && names(a[k]).bad.length) problems.push(`${where}: ${q(a.type)} ${k} is a placeholder`);
+    }
+    const refs = Array.isArray(cp?.validation_definitions) ? cp.validation_definitions : [];
+    if (!refs.length) problems.push(`${where}: validates nothing (no validation_definitions)`);
+    for (const ref of refs) {
+      const vd = vds.get(ref?.name);
+      const suite = vd && suites.get(vd?.suite?.name);
+      if (!vd) problems.push(`${where}: validation definition ${q(ref?.name ?? "(unnamed)")} is not in ${q(path.join(gxDir, "validation_definitions"))}`);
+      else if (!suite) problems.push(`${where}: suite ${q(vd?.suite?.name ?? "(unnamed)")} is not in ${q(path.join(gxDir, "expectations"))}`);
+      else {
+        const owner = names(suite?.meta?.owner);
+        if (!owner.ok.length) problems.push(`${where}: suite ${q(suite.name)} ${owner.bad.length ? "owner is a placeholder" : "has no owner"} (set meta.owner on the suite to its dataset's owner)`);
+      }
+    }
+  }
+  if (!python) {
+    unchecked.push(`GX context ${q(gxDir)} was not loaded in GX (pass --gx-python <python with great_expectations>, or set GATES_GX_PYTHON)`);
+    return;
+  }
+  const loaded = gxLoad(python, gxDir, cps.map(({ f, cp }) => cp?.name ?? f.replace(/\.json$/, "")));
+  if (loaded.fatal) unchecked.push(`GX context ${q(gxDir)}: ${loaded.fatal}`);
+  else if (loaded.error) problems.push(`GX context ${q(gxDir)}: GX refuses to load it: ${q(loaded.error)}`);
+  else for (const [n, err] of Object.entries(loaded.checkpoints ?? {})) if (err) problems.push(`checkpoint ${q(n)}: GX refuses to load it: ${q(err)}`);
+}
+
+const real = (p) => {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+};
+
+export function monitorsCheck(argv, env = process.env) {
+  const f = parseFlags(argv, ["repo", "manifest", "gx", "gx-python"], ["manifest", "gx"]);
+  const repo = f.repo ?? ".";
+  if (!fs.existsSync(repo) || !fs.statSync(repo).isDirectory()) throw new Exit(2, `--repo ${q(repo)}: no such directory`);
+  const manifests = f.manifest ?? [];
+  const gxDirs = f.gx ?? [];
+  const tools = detectMonitorTools(repo);
+  const both = (w) => new Exit(1, `monitors: ${w}; use Elementary in a dbt repo and GX elsewhere, never both`);
+  if (tools.elementary.length && tools.gx.length) throw both(`${q(repo)} configures both Elementary (${tools.elementary.map(q).join(", ")}) and GX (${tools.gx.map(q).join(", ")})`);
+  if (manifests.length && gxDirs.length) throw both("both --manifest (Elementary) and --gx (GX) were given");
+  if (manifests.length && tools.gx.length) throw both(`--manifest checks Elementary, and ${q(repo)} configures GX (${tools.gx.map(q).join(", ")})`);
+  if (gxDirs.length && tools.elementary.length) throw both(`--gx checks GX, and ${q(repo)} configures Elementary (${tools.elementary.map(q).join(", ")})`);
+  if (!manifests.length && !gxDirs.length) {
+    const which = tools.elementary.length
+      ? "Elementary is configured; pass --manifest target/manifest.json"
+      : tools.gx.length
+        ? "GX is configured; pass --gx <the gx directory>"
+        : `neither Elementary nor GX is configured in ${q(repo)}`;
+    throw new Exit(2, `monitors is NOT CHECKED: ${which}`);
+  }
+  const problems = [];
+  const counted = [];
+  const unchecked = [];
+  if (manifests.length) {
+    const covered = new Set();
+    for (const m of manifests) {
+      const p = elementaryMonitors(m, tools, problems, counted, unchecked);
+      if (p) covered.add(real(p.dir));
+    }
+    for (const p of tools.dbtProjects) if (p.elementary && !covered.has(real(p.dir))) unchecked.push(`dbt project ${q(p.rel)} uses Elementary and no --manifest covers it`);
+  } else {
+    const python = f["gx-python"] ?? env.GATES_GX_PYTHON ?? "";
+    const contexts = new Set(tools.gxContexts.map((c) => real(c.dir)));
+    const given = new Set();
+    for (const d of gxDirs) {
+      if (!contexts.has(real(d))) {
+        if (!fs.existsSync(d)) throw new Exit(2, `--gx ${q(d)}: no such directory`);
+        unchecked.push(`--gx ${q(d)} is not a GX context under --repo ${q(repo)} (no great_expectations.yml there)`);
+        continue;
+      }
+      given.add(real(d));
+      gxMonitors(d, python, problems, counted, unchecked);
+    }
+    for (const c of tools.gxContexts) if (!given.has(real(c.dir))) unchecked.push(`GX context ${q(c.rel)} is not covered by a --gx`);
+  }
+  const tool = manifests.length ? "Elementary" : "GX";
+  const lines = (xs) => xs.map((p) => `  ${p}`).join("\n");
+  const notChecked = unchecked.length ? `\nNOT CHECKED:\n${lines(unchecked)}` : "";
+  if (problems.length) throw new Exit(1, `monitors: ${problems.length} problem(s) in ${counted.length} ${tool} monitor(s)\n${lines(problems)}${notChecked}`);
+  if (unchecked.length) throw new Exit(2, `monitors is NOT CHECKED: ${unchecked.length} input(s) could not be checked (${counted.length} ${tool} monitor(s) were)${notChecked}`);
+  return `monitors: ${counted.length} ${tool} monitor(s), each with an alert destination and an owner`;
 }
 
 const isContractFile = (name) => /\.odcs\.(ya?ml|json)$/i.test(name);
@@ -429,17 +791,33 @@ const PG_NATIVE = {
   Json: "json", JsonB: "jsonb", ByteA: "bytea",
 };
 
+// `///` doc comments are kept per line: the ones above a field and one trailing it on the same line
+// (classification reads `/// @classification(<tier>)` from them). A `//` comment is dropped.
 function prismaBlocks(text, label, blocks) {
   const lines = text.replace(/\r\n/g, "\n").split("\n");
   let cur = null;
   let depth = 0;
+  let pending = [];
   for (const raw of lines) {
-    const line = stripComment(raw).trim();
-    if (!line) continue;
+    const t = raw.trim();
+    if (t.startsWith("///")) {
+      pending.push(t.slice(3));
+      continue;
+    }
+    const code = stripComment(raw);
+    const line = code.trim();
+    // A blank line or a `//` line ends a run of `///` lines: they no longer describe the next field.
+    if (!line) {
+      pending = [];
+      continue;
+    }
+    const after = raw.slice(code.length).trim();
+    const trailing = after.startsWith("///") ? [after.slice(3)] : [];
     if (!cur) {
+      pending = [];
       const m = /^(model|view|enum|type|datasource|generator)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{$/.exec(line);
       if (m) {
-        cur = { kind: m[1], name: m[2], lines: [] };
+        cur = { kind: m[1], name: m[2], lines: [], docs: [] };
         depth = 1;
         continue;
       }
@@ -452,17 +830,21 @@ function prismaBlocks(text, label, blocks) {
     if (depth <= 0) {
       blocks.push(cur);
       cur = null;
+      pending = [];
       continue;
     }
     cur.lines.push(line);
+    cur.docs.push([...pending, ...trailing]);
+    pending = [];
   }
   if (cur) throw new Exit(2, `${label}: block ${cur.kind} ${cur.name} is not closed`);
 }
 
 // `text` is one schema, or a list of { label, text } for the files of a multi-file schema
 // (prismaSchemaFolder): enums, models and the datasource may sit in different files. A model's `schema`
-// is its @@schema, or null without one.
-export function parsePrisma(text) {
+// is its @@schema, or null without one. With `{ all: true }`, @ignore fields and @@ignore models are kept
+// (marked `ignored`): Prisma's client skips them, but their columns still hold data.
+export function parsePrisma(text, opts = {}) {
   const files = Array.isArray(text) ? text : [{ label: "schema.prisma", text }];
   const blocks = [];
   let provider = null;
@@ -483,7 +865,7 @@ export function parsePrisma(text) {
     let schema = null;
     let ignored = false;
     const columns = [];
-    for (const l of b.lines) {
+    for (const [i, l] of b.lines.entries()) {
       if (l.startsWith("@@")) {
         const mm = /^@@map\(\s*(?:name\s*:\s*)?"([^"]+)"/.exec(l);
         if (mm) table = mm[1];
@@ -495,7 +877,8 @@ export function parsePrisma(text) {
       const fm = /^([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*(?:\("(?:[^"\\]|\\.)*"\))?)(\[\])?(\?)?(.*)$/.exec(l);
       if (!fm) continue;
       const [, field, typeRaw, list, opt, rest] = fm;
-      if (/(^|\s)@ignore\b/.test(rest)) continue;
+      const fieldIgnored = /(^|\s)@ignore\b/.test(rest);
+      if (fieldIgnored && !opts.all) continue;
       const type = typeRaw.replace(/\(.*$/, "");
       if (modelNames.has(type) || composites.has(type)) continue; // a relation or a composite, not a column
       const mapM = /(?:^|\s)@map\(\s*(?:name\s*:\s*)?"([^"]+)"/.exec(rest);
@@ -508,9 +891,13 @@ export function parsePrisma(text) {
         optional: Boolean(opt),
         isEnum: enums.has(type),
         native: dbM ? { name: dbM[1], args: dbM[2] ?? null } : null,
+        unsupported: type === "Unsupported" ? (/^Unsupported\("((?:[^"\\]|\\.)*)"\)/.exec(typeRaw)?.[1] ?? "") : null,
+        docs: b.docs[i] ?? [],
+        ...(opts.all ? { ignored: fieldIgnored } : {}),
       });
     }
     if (!ignored) models.push({ model: b.name, table, schema, columns });
+    else if (opts.all) models.push({ model: b.name, table, schema, columns, ignored: true });
   }
   return { provider, models };
 }
@@ -822,42 +1209,60 @@ export function consumersCmd(argv, env = process.env) {
 // with a rotation date, and commit only the variable's name.
 //
 // What it reads: URL DSNs (postgres://, mysql://, mongodb+srv://, redis://, jdbc:..., sqlserver://, with
-// or without a `+driver` suffix), the password in their userinfo or in a `password=` / `pwd=` parameter,
-// and key=value connection strings (libpq `host=... password=...`, ADO.NET `Server=...;Password=...`).
-// It does not read a separate `DB_PASSWORD=` variable: that is not a connection string, so a reviewer
-// still has to look for one.
+// or without a `+driver` suffix), the password in their userinfo (also when it holds an unencoded `/`, `#`
+// or `?`) or in a `password=` / `pwd=` parameter, the host in the authority or in a `host=` parameter, and
+// key=value connection strings (libpq `host=... password=...`, ADO.NET `Server=...;Password=...`). UTF-8
+// and UTF-16 (with a BOM) files. It does not read a separate `DB_PASSWORD=` variable: that is not a
+// connection string, so a reviewer still has to look for one.
 //
-// Local: localhost, *.localhost, 127.0.0.0/8, ::1, 0.0.0.0, host.docker.internal, a socket path, and a
-// one-label name such as `db` or `postgres` (a compose or CI service). With --targets
-// .claude/db-targets.json, a variable named as the read_env or write_env of a target whose env is not
-// local, dev or ci is non-local whatever its host says; an unknown env counts as prod.
+// Local: localhost, *.localhost, 127.0.0.0/8, ::1, 0.0.0.0, host.docker.internal, a socket path other than
+// a Cloud SQL one (/cloudsql/..., the Cloud Run to Cloud SQL path, is production), and a one-label name only
+// when it is a common compose or CI service name (db, postgres, mysql, redis, ...) or is named with
+// --local-host. Any other one-label name (`proddb`) is non-local. With --targets .claude/db-targets.json, a
+// variable named as the read_env or write_env of a target whose env is not local, dev or ci is non-local
+// whatever its host says; an unknown env counts as prod. The variable is read from `NAME=`, `NAME:`, a
+// `{"name": "NAME", "value": ...}` entry, and a `- name: NAME` line followed by `value:`.
 //
-// A password that is only a reference (`${NAME}`, `$NAME`, `${{ secrets.NAME }}`, `{{ ... }}`, `%NAME%`)
-// is not a committed password and is listed as a note. A placeholder such as `<password>` or `changeme`
-// is a literal: it tells the next person to paste a password into the file.
+// A password that is only a reference (`${NAME}`, `$NAME`, `${{ secrets.NAME }}`, `{{ ... }}`, `%NAME%`, a
+// Python `{name}`) is not a committed password and is listed as a note. A placeholder such as `<password>`
+// or `changeme` is a literal: it tells the next person to paste a password into the file.
+//
+// --all-tracked reads every committed file (git ls-files), skipping binaries and files over 2 MB.
 //
 // Exit 0 nothing found, 1 a finding, 2 nothing to read (a missing path, a glob that matches no committed
-// file, a directory): NOT CHECKED, never a pass. The password is never printed.
+// file, a directory): NOT CHECKED, never a pass. The password is never printed: every path, pattern, name
+// and host it prints has its userinfo and any password= value masked.
 
 const DSN_SCHEMES = "postgres(?:ql)?|mysql|mariadb|mongodb(?:\\+srv)?|redis|rediss|sqlserver|mssql|cockroach(?:db)?|oracle|clickhouse|snowflake|tidb";
 const URL_DSN = new RegExp(`(?<![\\w+.-])((?:jdbc:)?(?:${DSN_SCHEMES})(?:\\+[a-z0-9_]+)?):\\/\\/([^\\s'"\`]*)`, "gi");
 const LOCAL_ENVS = ["local", "dev", "ci"];
 const KNOWN_ENVS = ["local", "dev", "ci", "staging", "prod"];
+const SERVICE_NAMES = ["db", "database", "postgres", "postgresql", "pg", "pgbouncer", "mysql", "mariadb", "redis", "valkey", "mongo", "mongodb", "clickhouse", "cockroach", "cockroachdb", "mssql", "sqlserver", "oracle", "tidb"];
+const MAX_TRACKED_BYTES = 2 * 1024 * 1024;
 
 export function isReference(s) {
-  return /^(?:\$\{\{[^}]*\}\}|\$\{[A-Za-z_]\w*(?::?[-=?+][^}]*)?\}|\$[A-Za-z_]\w*|\{\{[^}]*\}\}|%[A-Za-z_]\w*%)$/.test(String(s).trim());
+  return /^(?:\$\{\{[^}]*\}\}|\$\{[A-Za-z_]\w*(?::?[-=?+][^}]*)?\}|\$[A-Za-z_]\w*|\{\{[^}]*\}\}|%[A-Za-z_]\w*%|\{[A-Za-z_][\w.]*\})$/.test(String(s).trim());
 }
 
-export function isLocalHost(host) {
-  let h = String(host ?? "").trim().toLowerCase();
+// Mask what could be a password in anything printed: a URL's userinfo, and a password= / pwd= value.
+export function redact(s) {
+  return String(s)
+    .replace(/(\/\/)[^\s]*@/g, "$1***@")
+    .replace(/((?:password|pwd)\s*=\s*)[^\s;&]+/gi, "$1***");
+}
+const shown = (s) => mdCode(redact(s));
+
+export function isLocalHost(host, extra = []) {
+  let h = decode(String(host ?? "").trim()).toLowerCase();
   if (h.startsWith("[")) {
     const close = h.indexOf("]");
     h = close === -1 ? h.slice(1) : h.slice(1, close);
   } else h = h.replace(/:\d*$/, "");
-  if (h === "" || h.startsWith("/") || h.startsWith("%2f")) return true;
+  if (h.startsWith("/")) return !/^\/cloudsql\//.test(h);
+  if (h === "") return true;
   if (h === "localhost" || h.endsWith(".localhost") || h === "::1" || h === "0.0.0.0" || h === "host.docker.internal") return true;
   if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
-  return /^[a-z0-9_-]+$/.test(h) && !/^\d+$/.test(h);
+  return SERVICE_NAMES.includes(h) || extra.map((x) => String(x).toLowerCase()).includes(h);
 }
 
 function decode(s) {
@@ -874,12 +1279,32 @@ function kvValue(line, keys) {
   return m ? m[1].replace(/^['"]|['"]$/g, "") : undefined;
 }
 
+// Where the userinfo ends. Normally at the last `@` before the first `/`, `?` or `#`; when that part holds
+// no `@`, but the string starts `user:` and a later `@` is followed by a host, the password holds an
+// unencoded `/`, `?` or `#`, and the userinfo runs to the last such `@`.
+function splitUserinfo(rest) {
+  const end = rest.search(/[/?#]/);
+  if (end === -1 || rest.slice(0, end).includes("@")) return null;
+  if (!/^[^:/?#@]*:/.test(rest)) return null;
+  let best = -1;
+  for (let i = rest.indexOf("@"); i !== -1; i = rest.indexOf("@", i + 1)) {
+    if (/^(?:\[[^\]]*\]|[A-Za-z0-9%._-]+)(?::\d+)?(?:,|\/|\?|#|;|$)/.test(rest.slice(i + 1))) best = i;
+  }
+  return best === -1 ? null : best;
+}
+
 // Every connection string on a line, as { scheme, host, hosts, password } (password undefined when none).
 export function dsnsInLine(line) {
   const out = [];
   for (const m of line.matchAll(URL_DSN)) {
     const scheme = m[1].toLowerCase();
-    const rest = m[2];
+    let rest = m[2];
+    let userinfo = "";
+    const at = splitUserinfo(rest);
+    if (at !== null) {
+      userinfo = rest.slice(0, at);
+      rest = rest.slice(at + 1);
+    }
     const end = rest.search(/[/?#]/);
     let authority = end === -1 ? rest : rest.slice(0, end);
     let params = end === -1 ? "" : rest.slice(end);
@@ -888,15 +1313,21 @@ export function dsnsInLine(line) {
       params = authority.slice(semi) + params;
       authority = authority.slice(0, semi);
     }
-    const at = authority.lastIndexOf("@");
-    const userinfo = at === -1 ? "" : authority.slice(0, at);
-    const hostport = (at === -1 ? authority : authority.slice(at + 1)).replace(/[),\]}>]+$/, "");
+    if (at === null) {
+      const a = authority.lastIndexOf("@");
+      userinfo = a === -1 ? "" : authority.slice(0, a);
+      authority = a === -1 ? authority : authority.slice(a + 1);
+    }
+    const hostport = authority.replace(/[),\]}>]+$/, "");
     let password;
     const colon = userinfo.indexOf(":");
     if (colon !== -1 && colon < userinfo.length - 1) password = decode(userinfo.slice(colon + 1));
     const pm = /(?:^|[?&;])(?:password|pwd)=([^&;#\s'"`]*)/i.exec(params);
     if (password === undefined && pm && pm[1]) password = decode(pm[1]);
-    const hosts = hostport.split(",");
+    // libpq also takes the host from ?host= (a socket directory, or a name); it counts with the authority's
+    const qh = [...params.matchAll(/(?:^|[?&;])host=([^&;#\s'"`]*)/gi)].flatMap((x) => decode(x[1]).split(",")).filter(Boolean);
+    const hosts = [...hostport.split(",").filter((h) => h !== ""), ...qh];
+    if (!hosts.length) hosts.push("");
     out.push({ scheme, host: hosts.find((h) => !isLocalHost(h)) ?? hosts[0], hosts, password });
   }
   if (!out.length) {
@@ -911,20 +1342,23 @@ export function dsnsInLine(line) {
 }
 
 function varName(line) {
+  const j = /"name"\s*:\s*"([A-Za-z_][A-Za-z0-9_]*)"/.exec(line);
+  if (j) return j[1];
   const m = /^\s*(?:export\s+|-\s+)?["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*[:=]/.exec(line);
   return m ? m[1] : null;
 }
 
 function readTargets(file) {
-  if (!fs.existsSync(file)) throw new Exit(2, `credentials: --targets ${file}: no such file. NOT CHECKED.`);
+  if (!fs.existsSync(file)) throw new Exit(2, `credentials: --targets ${shown(file)}: no such file. NOT CHECKED.`);
   let cfg;
   try {
     cfg = JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch (e) {
-    throw new Exit(2, `credentials: --targets ${file} is not valid JSON: ${e.message}`);
+  } catch {
+    // never the parser's message: it quotes the file's own text
+    throw new Exit(2, `credentials: --targets ${shown(file)} is not valid JSON. NOT CHECKED.`);
   }
   if (!cfg || typeof cfg.targets !== "object" || cfg.targets === null || Array.isArray(cfg.targets)) {
-    throw new Exit(2, `credentials: --targets ${file} has no "targets" object`);
+    throw new Exit(2, `credentials: --targets ${shown(file)} has no "targets" object. NOT CHECKED.`);
   }
   const byVar = new Map();
   for (const [name, t] of Object.entries(cfg.targets)) {
@@ -936,44 +1370,74 @@ function readTargets(file) {
   return byVar;
 }
 
-function trackedMatches(pattern) {
-  const r = spawnSync("git", ["ls-files", "-z", "--", `:(glob)${pattern}`], { encoding: "utf8" });
-  if (r.status !== 0) throw new Exit(2, `credentials: --config ${pattern} is a glob and git ls-files failed (not a git checkout?). NOT CHECKED.`);
+function tracked(pattern) {
+  const r = spawnSync("git", ["ls-files", "-z", "--", ...(pattern === undefined ? [] : [`:(glob)${pattern}`])], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+  if (r.status !== 0) throw new Exit(2, "credentials: git ls-files failed (not a git checkout?). NOT CHECKED.");
   return r.stdout.split("\0").filter(Boolean);
 }
 
+// The file's text, or null for a binary. UTF-16 with a BOM is decoded; a NUL byte otherwise means binary.
+function readText(file) {
+  const b = fs.readFileSync(file);
+  if (b[0] === 0xff && b[1] === 0xfe) return b.subarray(2).toString("utf16le");
+  if (b[0] === 0xfe && b[1] === 0xff) {
+    const s = Buffer.from(b.subarray(2));
+    s.swap16();
+    return s.toString("utf16le");
+  }
+  if (b.subarray(0, 8192).includes(0)) return null;
+  return b.toString("utf8");
+}
+
 export function credentialsCheck(argv) {
-  const f = parseFlags(argv, ["config", "targets"], ["config"]);
-  if (!f.config?.length) throw new Exit(2, "credentials: --config <file or glob> is required (repeatable). NOT CHECKED.");
+  const f = parseFlags(argv, ["config", "targets", "all-tracked", "local-host"], ["config", "local-host"], ["all-tracked"]);
+  const all = f["all-tracked"] !== undefined;
+  if (!f.config?.length && !all) throw new Exit(2, "credentials: --config <file or glob> (repeatable) or --all-tracked is required. NOT CHECKED.");
   const targets = f.targets ? readTargets(f.targets) : new Map();
+  const extra = f["local-host"] ?? [];
   const files = [];
-  for (const c of f.config) {
-    if (/[*?[]/.test(c)) {
-      const hit = trackedMatches(c);
-      if (!hit.length) throw new Exit(2, `credentials: --config ${c} matches no committed file. NOT CHECKED: fix the pattern.`);
+  if (all) {
+    for (const t of tracked()) if (fs.existsSync(t) && fs.lstatSync(t).isFile() && fs.statSync(t).size <= MAX_TRACKED_BYTES) files.push(t);
+    if (!files.length) throw new Exit(2, "credentials: --all-tracked found no committed file. NOT CHECKED.");
+  }
+  for (const c of f.config ?? []) {
+    if (/[*?[]/.test(c) && !c.includes("://")) {
+      const hit = tracked(c);
+      if (!hit.length) throw new Exit(2, `credentials: --config ${shown(c)} matches no committed file. NOT CHECKED: fix the pattern.`);
       files.push(...hit);
       continue;
     }
-    if (!fs.existsSync(c)) throw new Exit(2, `credentials: ${c}: no such file. NOT CHECKED.`);
+    if (!fs.existsSync(c)) throw new Exit(2, `credentials: --config ${shown(c)}: no such file. NOT CHECKED.`);
     files.push(c);
   }
   const unique = [...new Set(files)];
   const findings = [];
   const notes = [];
   let seen = 0;
+  let read = 0;
   for (const file of unique) {
-    if (!fs.lstatSync(file).isFile()) throw new Exit(2, `credentials: ${file}: not a regular file. NOT CHECKED.`);
-    const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
-    lines.forEach((line, i) => {
-      const name = varName(line);
+    if (!fs.lstatSync(file).isFile()) throw new Exit(2, `credentials: ${shown(file)}: not a regular file. NOT CHECKED.`);
+    const text = readText(file);
+    if (text === null) {
+      if (all) continue;
+      throw new Exit(2, `credentials: ${shown(file)} is binary. NOT CHECKED.`);
+    }
+    read++;
+    let pending = null; // a `- name: X` line, whose `value:` is on the next line
+    text.split(/\r?\n/).forEach((line, i) => {
+      let name = varName(line);
+      if (name === "value" && pending) name = pending;
+      const nm = /^\s*-?\s*["']?name["']?\s*:\s*["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*$/.exec(line);
+      pending = nm ? nm[1] : null;
       const target = name ? targets.get(name) : undefined;
       for (const d of dsnsInLine(line)) {
         seen++;
-        const nonLocal = (target && !target.local) || !d.hosts.every(isLocalHost);
+        const nonLocal = (target && !target.local) || !d.hosts.every((h) => isLocalHost(h, extra));
         if (d.password === undefined || !nonLocal) continue;
-        const where = `${file}:${i + 1}`;
-        const what = `a ${d.scheme} connection string${name ? ` in ${name}` : ""}`;
-        const why = target && !target.local ? `target ${target.name} (env ${target.env})` : `host ${mdCode(d.host)}`;
+        const where = `${shown(file)}:${i + 1}`;
+        const what = `a ${d.scheme} connection string${name ? ` in ${shown(name)}` : ""}`;
+        const host = d.hosts.find((h) => !isLocalHost(h, extra)) ?? d.host;
+        const why = target && !target.local ? `target ${shown(target.name)} (env ${target.env})` : `host ${shown(host)}`;
         if (isReference(d.password)) notes.push(`${where}: ${what} takes its password from a reference, not from the file (${why})`);
         else findings.push(`${where}: ${what} has a literal password for the non-local ${why}`);
       }
@@ -983,23 +1447,872 @@ export function credentialsCheck(argv) {
   if (findings.length) {
     throw new Exit(
       1,
-      `credentials: ${findings.length} committed connection string(s) carry a password for a non-local target (${unique.length} file(s) read; no password is printed)\n` +
+      `credentials: ${findings.length} committed connection string(s) carry a password for a non-local target (${read} file(s) read; no password is printed)\n` +
         findings.map((x) => `  ${x}`).join("\n") +
         "\n  fix: IAM database authentication (Cloud SQL, AlloyDB, RDS), or the whole connection string in a secret store with a rotation date and only its variable name committed. Rotate any real password that was committed." +
         tail,
     );
   }
-  return `credentials: no literal password for a non-local target in ${unique.length} file(s) (${seen} connection string(s) read)${tail}`;
+  return `credentials: no literal password for a non-local target in ${read} file(s) (${seen} connection string(s) read)${tail}`;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Classification, deletion map, retention and exports (data-privacy). The tiers are the repository's own,
+// in governance/tiers.json; nothing here defines one. The file is required by every subcommand that
+// reads a tag, and a missing or malformed one exits 2:
+//
+//   { "tiers": { "<name>": { "personal_data": true|false,
+//                            "model": "allow|mask|deny", "embedding": "...", "log": "...", "export": "...",
+//                            "retention_days": <days, optional>,
+//                            "bigquery_policy_tag": "projects/<p>/locations/<l>/taxonomies/<t>/policyTags/<id>" | null } } }
+//
+// `personal_data` says the tier holds data about a person, so its tables go on the deletion map.
+// `model`, `embedding`, `log` and `export` say whether a column of the tier may go there as it is (allow),
+// only masked (mask), or not at all (deny).
+
+const TIER_NAME = /^[a-z][a-z0-9_-]{0,62}$/;
+const USES = ["model", "embedding", "log", "export"];
+const USE_RULES = ["allow", "mask", "deny"];
+const POLICY_TAG = /^projects\/[^/\s]+\/locations\/[^/\s]+\/taxonomies\/[^/\s]+\/policyTags\/[^/\s]+$/;
+const DEFAULT_TIERS = "governance/tiers.json";
+
+export function readTiers(file = DEFAULT_TIERS) {
+  if (!fs.existsSync(file)) {
+    throw new Exit(2, `tiers ${file}: no such file. Create it in this repository (format: the README, "Classification"); the tiers are the repository's own and no default applies.`);
+  }
+  const j = readJson(file, "tiers");
+  if (!j || typeof j !== "object" || !j.tiers || typeof j.tiers !== "object" || Array.isArray(j.tiers)) {
+    throw new Exit(2, `tiers ${file}: want { "tiers": { "<name>": { rules } } }`);
+  }
+  const names = Object.keys(j.tiers);
+  if (!names.length) throw new Exit(2, `tiers ${file}: no tiers`);
+  const allowed = ["personal_data", ...USES, "retention_days", "bigquery_policy_tag"];
+  for (const n of names) {
+    const r = j.tiers[n];
+    if (!TIER_NAME.test(n)) throw new Exit(2, `tiers ${file}: tier name ${JSON.stringify(n)} must match ${TIER_NAME}`);
+    if (!r || typeof r !== "object" || Array.isArray(r)) throw new Exit(2, `tiers ${file}: ${n}: rules must be an object`);
+    for (const k of Object.keys(r)) if (!allowed.includes(k)) throw new Exit(2, `tiers ${file}: ${n}: unknown key ${k} (known: ${allowed.join(", ")})`);
+    if (typeof r.personal_data !== "boolean") throw new Exit(2, `tiers ${file}: ${n}: personal_data must be true or false`);
+    for (const u of USES) if (!USE_RULES.includes(r[u])) throw new Exit(2, `tiers ${file}: ${n}: ${u} must be one of ${USE_RULES.join(", ")}`);
+    if ("retention_days" in r && !(Number.isInteger(r.retention_days) && r.retention_days > 0)) throw new Exit(2, `tiers ${file}: ${n}: retention_days must be a whole number of days above 0`);
+    if ("bigquery_policy_tag" in r && r.bigquery_policy_tag !== null && !(typeof r.bigquery_policy_tag === "string" && POLICY_TAG.test(r.bigquery_policy_tag))) {
+      throw new Exit(2, `tiers ${file}: ${n}: bigquery_policy_tag must be a policy tag resource name (projects/.../policyTags/<id>) or null`);
+    }
+  }
+  return j.tiers;
+}
+
+// `@classification(<tier>)` in a field's doc comments. Returns { tier, problem }.
+const TAG_RE = /@classification\b(\(\s*([^()\s]*)\s*\))?/g;
+export function docTier(docs) {
+  const found = [];
+  for (const d of docs) {
+    for (const m of d.matchAll(TAG_RE)) {
+      if (!m[1] || !TIER_NAME.test(m[2])) return { tier: null, problem: `malformed tag ${JSON.stringify(m[0].slice(0, 60))}; write /// @classification(<tier>)` };
+      found.push(m[2]);
+    }
+  }
+  const distinct = [...new Set(found)];
+  if (distinct.length > 1) return { tier: null, problem: `two classifications (${distinct.join(", ")}); keep one` };
+  return { tier: distinct[0] ?? null, problem: null };
+}
+
+const quoteIdent = (s) => `"${String(s).replace(/"/g, '""')}"`;
+
+function git(args, opts = {}) {
+  return spawnSync("git", ["-c", "core.attributesFile=/dev/null", "-c", "core.quotePath=false", ...args], { encoding: opts.encoding ?? "utf8", maxBuffer: 64 * 1024 * 1024 });
+}
+
+// The fields (`Model.field`) of the schema at the base commit. A schema path that does not exist there
+// (a new schema) has no fields, so every field is new. A base that cannot be resolved exits 2: a shallow
+// checkout must not make every field look old, or new.
+// What makes a field the same column: its column name, type, list-ness and native type. A field whose
+// signature differs from the base's writes a different column, so it is new for classification.
+const fieldSignature = (c) => `${c.name} ${c.type}${c.unsupported !== null ? `("${c.unsupported}")` : ""}${c.list ? "[]" : ""}${c.native ? ` @db.${c.native.name}${c.native.args !== null ? `(${c.native.args})` : ""}` : ""}`;
+
+// A file whose folder holds other *.prisma files is one file of a multi-file schema (prismaSchemaFolder),
+// so the whole folder is the schema: every *.prisma under it, except a file with its own datasource, which
+// is a different schema. `files` are { label, text }; `main` is the label --schema named.
+const hasDatasource = (text) => /^\s*datasource\s+[A-Za-z_][A-Za-z0-9_]*\s*\{/m.test(text);
+function schemaOfFolder(files, main) {
+  const own = files.find((x) => x.label === main);
+  if (!own) return files.filter((x) => !hasDatasource(x.text));
+  return [own, ...files.filter((x) => x !== own && !hasDatasource(x.text))];
+}
+function classificationFiles(schemaPath) {
+  if (!fs.existsSync(schemaPath)) throw new Exit(2, `--schema ${schemaPath}: no such file or folder`);
+  if (fs.statSync(schemaPath).isDirectory()) return readPrismaFiles(schemaPath);
+  const all = readPrismaFiles(path.dirname(schemaPath)).map((x) => ({ ...x, label: path.resolve(x.label) === path.resolve(schemaPath) ? schemaPath : x.label }));
+  return schemaOfFolder(all, schemaPath);
+}
+
+function prismaFieldsAtBase(schemaPath, base) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._\/@{}^~-]*$/.test(base)) throw new Exit(2, `--base ${base}: not a revision name`);
+  const rev = git(["rev-parse", "-q", "--verify", "--end-of-options", `${base}^{commit}`]);
+  if (rev.status !== 0) throw new Exit(2, `--base ${base}: cannot resolve it to a commit. In CI, check out with fetch-depth: 0 (or fetch the base branch) so origin/<base> exists.`);
+  const commit = rev.stdout.trim();
+  const isDir = fs.existsSync(schemaPath) && fs.statSync(schemaPath).isDirectory();
+  const relOf = (p) => `./${path.relative(process.cwd(), path.resolve(p)).split(path.sep).join("/")}`;
+  const rel = relOf(schemaPath);
+  if (rel.startsWith("./../")) throw new Exit(2, `--schema ${schemaPath}: outside the working directory, so it cannot be read from --base`);
+  // The folder of a single file too: its siblings at the base are the rest of the same schema.
+  const ls = git(["ls-tree", "-r", "-z", "--name-only", commit, "--", isDir ? rel : relOf(path.dirname(schemaPath))]);
+  if (ls.status !== 0) throw new Exit(2, `--base ${base}: git ls-tree failed: ${ls.stderr.trim()}`);
+  const files = ls.stdout.split("\0").filter((p) => p && /\.prisma$/.test(p));
+  const texts = [];
+  for (const p of files) {
+    const b = git(["cat-file", "blob", `${commit}:./${p}`]);
+    if (b.status !== 0) throw new Exit(2, `--base ${base}: cannot read ${p}: ${b.stderr.trim()}`);
+    texts.push({ label: `./${p}`, text: b.stdout });
+  }
+  const own = isDir ? texts : schemaOfFolder(texts, rel);
+  const present = isDir ? texts.length > 0 : texts.some((x) => x.label === rel);
+  const fields = new Map();
+  if (own.length) for (const m of parsePrisma(own, { all: true }).models) for (const c of m.columns) fields.set(`${m.model}.${c.field}`, fieldSignature(c));
+  return { commit, fields, present };
+}
+
+function classifyPrisma(schemaPath, tiers) {
+  const files = classificationFiles(schemaPath);
+  const parsed = parsePrisma(files, { all: true });
+  if (!parsed.models.length) throw new Exit(2, `--schema ${schemaPath}: no models`);
+  const fields = [];
+  for (const m of parsed.models) {
+    for (const c of m.columns) {
+      const { tier, problem } = docTier(c.docs);
+      fields.push({ model: m, col: c, key: `${m.model}.${c.field}`, tier, problem, known: tier ? Object.hasOwn(tiers, tier) : null });
+    }
+  }
+  return { parsed, fields };
+}
+
+export function classificationPrisma(argv, env = process.env) {
+  const f = parseFlags(argv, ["schema", "base", "tiers", "emit-comments", "date"]);
+  const schemaPath = f.schema ?? "prisma/schema.prisma";
+  const tiers = readTiers(f.tiers);
+  const { parsed, fields } = classifyPrisma(schemaPath, tiers);
+  const base = f.base ? prismaFieldsAtBase(schemaPath, f.base) : null;
+  const problems = [];
+  const warnings = [];
+  let tagged = 0;
+  for (const x of fields) {
+    const where = `${x.key}${x.col.ignored ? " (@ignore)" : ""}`;
+    if (x.problem) problems.push(`${where}: ${x.problem}`);
+    else if (x.tier && !x.known) problems.push(`${where}: tier ${x.tier} is not in the tiers file (${Object.keys(tiers).join(", ")})`);
+    else if (x.tier) tagged++;
+    else if (!base || !base.fields.has(x.key)) problems.push(`${where}: new field with no /// @classification(<tier>)`);
+    else if (base.fields.get(x.key) !== fieldSignature(x.col)) problems.push(`${where}: changed (${base.fields.get(x.key)} on the base, ${fieldSignature(x.col)} now) with no /// @classification(<tier>); a changed column is a new one`);
+    else warnings.push(`${where}: no classification (it is on the base branch too; tag it)`);
+  }
+  const out = [];
+  if (!base) out.push("no --base: every field is treated as new and must be tagged");
+  else if (!base.present) out.push(`${schemaPath} is not on ${f.base}: every field is new`);
+  for (const w of warnings) out.push(`WARNING ${w}`);
+  if (problems.length) throw new Exit(1, [`classification prisma: ${problems.length} field(s) fail`, ...problems.map((p) => `  ${p}`), ...out].join("\n"));
+  out.push(`classification prisma: ${tagged} of ${fields.length} fields tagged with a known tier; ${warnings.length} older field(s) untagged`);
+  if (f["emit-comments"]) out.push(emitComments(f["emit-comments"], parsed, fields, f.date));
+  return out.join("\n");
+}
+
+// The classification comment each column holds once every migration has run, replayed statement by
+// statement in migration order (Prisma names each folder <timestamp>_<name>, so their sort order is the
+// order they apply in). Postgres drops a column's comment with the column, so a later DROP or CREATE of the
+// table, or an ALTER TABLE that names the column (DROP, ADD, a type change Prisma writes as DROP and ADD, a
+// rename), forgets what an earlier migration set: the next emit writes it again. Forgetting too much only
+// re-sets a comment, which COMMENT ON makes harmless; forgetting too little loses one.
+const SQL_IDENT = String.raw`(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)`;
+const SQL_QUALIFIED = String.raw`(${SQL_IDENT}(?:\s*\.\s*${SQL_IDENT}){0,2})`;
+const sqlUnquote = (id) => (id.startsWith('"') ? id.slice(1, -1).replace(/""/g, '"') : id.toLowerCase());
+const sqlParts = (q) => q.match(new RegExp(SQL_IDENT, "g")).map(sqlUnquote);
+const commentKey = (schema, table, col) => JSON.stringify([schema ?? "", table, col]);
+function emittedComments(dir) {
+  const last = new Map();
+  const forgetTable = (table, onlyCols) => {
+    for (const k of [...last.keys()]) {
+      const [, t, c] = JSON.parse(k);
+      if (t === table && (!onlyCols || onlyCols(c))) last.delete(k);
+    }
+  };
+  for (const e of fs.readdirSync(dir, { withFileTypes: true }).filter((x) => x.isDirectory()).map((x) => x.name).sort()) {
+    const file = path.join(dir, e, "migration.sql");
+    if (!fs.existsSync(file)) continue;
+    const sql = fs.readFileSync(file, "utf8").replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    for (const stmt of sql.split(";").map((x) => x.trim()).filter(Boolean)) {
+      let m = new RegExp(String.raw`^COMMENT\s+ON\s+COLUMN\s+${SQL_QUALIFIED}\s+IS\s+(NULL|'classification:([a-z][a-z0-9_-]*)'|'(?:[^']|'')*')$`, "i").exec(stmt);
+      if (m) {
+        const parts = sqlParts(m[1]);
+        if (parts.length < 2) continue;
+        const col = parts.pop();
+        const table = parts.pop();
+        last.set(commentKey(parts.pop(), table, col), m[3] ?? null);
+        continue;
+      }
+      m = new RegExp(String.raw`^(?:CREATE|DROP)\s+(?:UNLOGGED\s+)?TABLE\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?${SQL_QUALIFIED}`, "i").exec(stmt);
+      if (m) {
+        forgetTable(sqlParts(m[1]).pop());
+        continue;
+      }
+      m = new RegExp(String.raw`^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?${SQL_QUALIFIED}([\s\S]*)$`, "i").exec(stmt);
+      if (m) {
+        const table = sqlParts(m[1]).pop();
+        if (/\bRENAME\s+TO\b/i.test(m[2])) forgetTable(table);
+        else {
+          const named = new Set((m[2].match(new RegExp(SQL_IDENT, "g")) ?? []).map(sqlUnquote));
+          forgetTable(table, (c) => named.has(c));
+        }
+      }
+    }
+  }
+  return last;
+}
+
+function emitComments(dir, parsed, fields, date) {
+  if (!isPostgres(parsed.provider)) throw new Exit(2, `--emit-comments: the datasource is ${parsed.provider ?? "unknown"}; COMMENT ON COLUMN is Postgres`);
+  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new Exit(2, `--emit-comments ${dir}: not a migrations folder`);
+  const stamp = (date ?? new Date().toISOString()).replace(/[^0-9]/g, "").slice(0, 14);
+  if (stamp.length !== 14) throw new Exit(2, `--date ${date}: want an ISO 8601 date and time`);
+  const last = emittedComments(dir);
+  const want = new Map();
+  for (const x of fields) {
+    const table = x.model.schema ? `${quoteIdent(x.model.schema)}.${quoteIdent(x.model.table)}` : quoteIdent(x.model.table);
+    want.set(`${table}.${quoteIdent(x.col.name)}`, { tier: x.tier, key: commentKey(x.model.schema, x.model.table, x.col.name) });
+  }
+  const lines = [];
+  for (const [k, { tier, key }] of want) {
+    const prev = last.has(key) ? last.get(key) : undefined;
+    if (tier && prev !== tier) lines.push(`COMMENT ON COLUMN ${k} IS 'classification:${tier}';`);
+    else if (!tier && prev) lines.push(`COMMENT ON COLUMN ${k} IS NULL;`);
+  }
+  if (!lines.length) return "emit-comments: every column's comment already matches its tag; no migration written";
+  const folder = path.join(dir, `${stamp}_classification_comments`);
+  if (fs.existsSync(folder)) throw new Exit(2, `--emit-comments: ${folder} exists already`);
+  fs.mkdirSync(folder);
+  const body = ["-- Generated by governance-check classification prisma --emit-comments from the /// @classification tags.", "-- Do not edit by hand: change the tag and generate again.", ...lines, ""].join("\n");
+  fs.writeFileSync(path.join(folder, "migration.sql"), body);
+  return `emit-comments: wrote ${path.join(folder, "migration.sql")} (${lines.length} statement(s))`;
+}
+
+// dbt: the manifest must be a current parse of a dbt project under --repo (default: the working
+// directory), the same test monitors applies: an old manifest would classify the columns of an old commit.
+// A manifest whose project is not under --repo, or that is not current, exits 2 (NOT CHECKED).
+function currentManifest(manifestFile, repo = ".") {
+  const m = readJson(manifestFile, "--manifest");
+  const shown = q(manifestFile);
+  if (!m || typeof m.nodes !== "object" || m.nodes === null) throw new Exit(2, `--manifest ${shown}: no nodes; is it a dbt manifest.json?`);
+  if (!/\/manifest\/v\d+/.test(m?.metadata?.dbt_schema_version ?? "")) throw new Exit(2, `--manifest ${shown}: not a dbt manifest (no metadata.dbt_schema_version)`);
+  if (!fs.existsSync(repo) || !fs.statSync(repo).isDirectory()) throw new Exit(2, `--repo ${q(repo)}: no such directory`);
+  const pkg = m.metadata.project_name;
+  const candidates = detectMonitorTools(repo).dbtProjects.filter((x) => x.name && x.name === pkg);
+  if (!candidates.length) throw new Exit(2, `--manifest ${shown} is the manifest of dbt project ${q(pkg ?? "(unnamed)")}, and --repo ${q(repo)} holds no dbt project of that name, so it cannot be shown to be this commit's`);
+  const tried = candidates.map((x) => ({ x, reasons: manifestStaleness(m, x) }));
+  if (!tried.some((t) => !t.reasons.length)) {
+    throw new Exit(2, [`--manifest ${shown} is not a current parse (run dbt parse):`, ...tried.map((t) => `  ${q(t.x.rel)}: ${t.reasons.slice(0, 5).join("; ")}`)].join("\n"));
+  }
+  return m;
+}
+
+// The project's models, snapshots and seeds (a snapshot is a dated copy of its source's rows, a seed is
+// loaded as a table), optionally under some paths (original_file_path prefixes).
+const DBT_RELATIONS = ["model", "snapshot", "seed"];
+function dbtModels(manifestFile, prefixes, repo) {
+  const m = currentManifest(manifestFile, repo);
+  const project = m.metadata?.project_name;
+  let models = Object.entries(m.nodes).filter(([, n]) => DBT_RELATIONS.includes(n?.resource_type) && (!project || n.package_name === project));
+  if (!models.length) throw new Exit(2, `--manifest ${manifestFile}: no models, snapshots or seeds of project ${project ?? "(unknown)"}`);
+  for (const p of prefixes ?? []) {
+    if (!models.some(([, n]) => String(n.original_file_path ?? "").startsWith(p))) throw new Exit(2, `--path ${p}: no model of the project is under it`);
+  }
+  if (prefixes?.length) models = models.filter(([, n]) => prefixes.some((p) => String(n.original_file_path ?? "").startsWith(p)));
+  return models;
+}
+
+const dbtColumnTier = (c) => {
+  const v = c?.config?.meta?.classification ?? c?.meta?.classification;
+  return v === undefined || v === null ? null : String(v);
+};
+
+// The columns dbt adds to every snapshot: they hold dates and hashes, not the source row's data.
+const SNAPSHOT_META = /^dbt_(scd_id|updated_at|valid_from|valid_to|is_deleted)$/i;
+export function classificationDbt(argv, env = process.env) {
+  const f = parseFlags(argv, ["manifest", "catalog", "tiers", "path", "repo"], ["path"]);
+  if (!f.manifest) throw new Exit(2, "classification dbt: --manifest target/manifest.json is required");
+  const tiers = readTiers(f.tiers);
+  const models = dbtModels(f.manifest, f.path, f.repo);
+  const cat = f.catalog ? readJson(f.catalog, "--catalog") : null;
+  if (cat && (typeof cat.nodes !== "object" || cat.nodes === null)) throw new Exit(2, `--catalog ${f.catalog}: no nodes; is it a dbt catalog.json?`);
+  const problems = [];
+  let cols = 0;
+  for (const [id, n] of models) {
+    const decl = Object.values(n.columns ?? {});
+    const byName = new Map(decl.map((c) => [String(c.name).toLowerCase(), c]));
+    if (cat) {
+      const cc = cat.nodes[id]?.columns;
+      if (!cc) problems.push(`${id}: not in the catalog; run dbt docs generate after building it`);
+      for (const c of Object.values(cc ?? {})) if (!byName.has(String(c.name).toLowerCase()) && !(n.resource_type === "snapshot" && SNAPSHOT_META.test(c.name))) problems.push(`${id}.${c.name}: in the warehouse, not declared in the YAML, so it carries no classification`);
+    }
+    if (!decl.length && !cat) problems.push(`${id}: declares no columns, so none is classified; declare them with meta.classification (pass --catalog to compare with the warehouse)`);
+    for (const c of decl) {
+      cols++;
+      const t = dbtColumnTier(c);
+      if (!t) problems.push(`${id}.${c.name}: no meta.classification`);
+      else if (!Object.hasOwn(tiers, t)) problems.push(`${id}.${c.name}: tier ${t} is not in the tiers file (${Object.keys(tiers).join(", ")})`);
+    }
+  }
+  if (problems.length) throw new Exit(1, [`classification dbt: ${problems.length} problem(s)`, ...problems.map((p) => `  ${p}`)].join("\n"));
+  const head = `classification dbt: ${cols} column(s) in ${models.length} model(s), snapshot(s) and seed(s), each with a known tier`;
+  if (!cat) return `${head}\nNOT CHECKED: a warehouse column the YAML does not declare carries no classification and is not seen without --catalog target/catalog.json`;
+  return `${head}; every warehouse column is declared`;
+}
+
+function oneModel(models, want) {
+  const hits = models.filter(([id, n]) => id === want || n.name === want);
+  if (!hits.length) throw new Exit(2, `--model ${want}: no such model in the project`);
+  if (hits.length > 1) throw new Exit(2, `--model ${want}: ambiguous (${hits.map(([id]) => id).join(", ")}); give the unique_id`);
+  return hits[0];
+}
+
+const SF_IDENT = /^[A-Za-z_][A-Za-z0-9_$]*$/;
+// Every identifier is quoted, so a reserved word (`order`) is never bare. An unquoted dbt name resolves
+// upper-cased in Snowflake, so it is quoted upper-cased; a `quote: true` column, or a name that could only
+// have been created quoted, keeps its exact case.
+const sfIdent = (s, quoted) => quoteIdent(quoted === true || !SF_IDENT.test(s) ? s : String(s).toUpperCase());
+const sqlString = (s) => `'${String(s).replace(/'/g, "''")}'`;
+
+// Generated, never set by hand: BigQuery policy tags as the full table schema `bq update` takes, and
+// Snowflake tags as ALTER statements. Both are writes; apply them through the target guard.
+export function classificationEmit(argv, env = process.env) {
+  const [engine, ...rest] = argv;
+  if (engine === "bigquery") {
+    const f = parseFlags(rest, ["manifest", "tiers", "model", "current-schema", "repo"]);
+    if (!f.manifest || !f.model) throw new Exit(2, "classification emit bigquery: --manifest and --model are required");
+    if (!f["current-schema"]) throw new Exit(2, "classification emit bigquery: --current-schema <file> is required (bq show --schema --format=prettyjson <project>:<dataset>.<table>); bq update replaces the whole schema, so it starts from the current one");
+    const tiers = readTiers(f.tiers);
+    const [id, n] = oneModel(dbtModels(f.manifest, null, f.repo), f.model);
+    const current = readJson(f["current-schema"], "--current-schema");
+    const fieldsIn = Array.isArray(current) ? current : current?.fields;
+    if (!Array.isArray(fieldsIn) || fieldsIn.some((x) => !x || typeof x.name !== "string")) throw new Exit(2, `--current-schema ${f["current-schema"]}: want the JSON array bq show --schema prints`);
+    const decl = new Map(Object.values(n.columns ?? {}).map((c) => [String(c.name).toLowerCase(), c]));
+    const problems = [];
+    const paths = new Set();
+    // A RECORD (STRUCT) carries no policy tag; each leaf under it does. A leaf is declared in dbt as
+    // `parent.leaf`, or takes the tier of its declared parent.
+    const walk = (fields, prefix, parentCol) =>
+      fields.map((field) => {
+        const full = `${prefix}${field.name}`;
+        paths.add(full.toLowerCase());
+        const own = decl.get(full.toLowerCase());
+        if (field.type === "RECORD" || field.type === "STRUCT") return Array.isArray(field.fields) ? { ...field, fields: walk(field.fields, `${full}.`, own ?? parentCol) } : field;
+        const c = own ?? parentCol;
+        const t = c ? dbtColumnTier(c) : null;
+        if (!c || !t) {
+          problems.push(`${id}.${full}: no meta.classification`);
+          return field;
+        }
+        if (!Object.hasOwn(tiers, t)) {
+          problems.push(`${id}.${full}: tier ${t} is not in the tiers file`);
+          return field;
+        }
+        if (!("bigquery_policy_tag" in tiers[t])) {
+          problems.push(`tier ${t}: no bigquery_policy_tag in the tiers file; set a policy tag resource name, or null for none`);
+          return field;
+        }
+        const tag = tiers[t].bigquery_policy_tag;
+        // An empty list clears a tag set earlier: the tags in the repository are the whole truth.
+        return { ...field, policyTags: { names: tag ? [tag] : [] } };
+      });
+    const out = walk(fieldsIn, "", null);
+    for (const [k, c] of decl) if (!paths.has(k)) problems.push(`${id}.${c.name}: declared in dbt, not in the current BigQuery schema`);
+    if (problems.length) throw new Exit(1, [`classification emit bigquery: ${problems.length} problem(s); nothing emitted`, ...[...new Set(problems)].map((p) => `  ${p}`)].join("\n"));
+    return JSON.stringify(out, null, 2);
+  }
+  if (engine === "snowflake") {
+    const f = parseFlags(rest, ["manifest", "tiers", "tag", "model", "path", "repo"], ["model", "path"]);
+    if (!f.manifest || !f.tag) throw new Exit(2, "classification emit snowflake: --manifest and --tag <database.schema.tag> are required");
+    if (!/^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*){0,2}$/.test(f.tag)) throw new Exit(2, `--tag ${f.tag}: want an unquoted [database.][schema.]name`);
+    const tiers = readTiers(f.tiers);
+    let models = dbtModels(f.manifest, f.path, f.repo);
+    if (f.model) models = f.model.map((m) => oneModel(models, m));
+    const problems = [];
+    const lines = [
+      "-- Generated by governance-check classification emit snowflake from the dbt meta.classification tags.",
+      "-- DDL: run it through db-target-guard (--op ddl) with the role that owns the tag.",
+      `CREATE TAG IF NOT EXISTS ${f.tag} ALLOWED_VALUES ${Object.keys(tiers).map(sqlString).join(", ")};`,
+      // CREATE ... IF NOT EXISTS leaves an existing tag's list alone, so a tier added since would be refused.
+      ...Object.keys(tiers).map((t) => `ALTER TAG ${f.tag} ADD ALLOWED_VALUES ${sqlString(t)};`),
+    ];
+    for (const [id, n] of models) {
+      if (!n.database || !n.schema) {
+        problems.push(`${id}: no database or schema in the manifest`);
+        continue;
+      }
+      const kind = n.config?.materialized === "view" ? "VIEW" : "TABLE";
+      if (n.config?.materialized === "ephemeral") continue;
+      const quoting = n.quoting ?? n.config?.quoting ?? {};
+      const rel = [sfIdent(n.database, quoting.database), sfIdent(n.schema, quoting.schema), sfIdent(n.alias ?? n.name, quoting.identifier)].join(".");
+      const decl = Object.values(n.columns ?? {});
+      if (!decl.length) problems.push(`${id}: declares no columns`);
+      for (const c of decl) {
+        const t = dbtColumnTier(c);
+        if (!t) problems.push(`${id}.${c.name}: no meta.classification`);
+        else if (!Object.hasOwn(tiers, t)) problems.push(`${id}.${c.name}: tier ${t} is not in the tiers file`);
+        else lines.push(`ALTER ${kind} ${rel} MODIFY COLUMN ${sfIdent(c.name, c.quote)} SET TAG ${f.tag} = ${sqlString(t)};`);
+      }
+    }
+    if (problems.length) throw new Exit(1, [`classification emit snowflake: ${problems.length} problem(s); nothing emitted`, ...problems.map((p) => `  ${p}`)].join("\n"));
+    return lines.join("\n");
+  }
+  throw new Exit(2, "classification emit: bigquery or snowflake");
+}
+
+// An embedding column: a pgvector type in any shape, or a float list or bytes column named as one.
+// Prisma has no vector type, so `Float[]` and `Bytes` are how most schemas hold embeddings.
+const EMBED_NAME = /embed|vector|(^|_)vecs?(_|$)/i;
+const isPrismaEmbedding = (c) =>
+  (c.unsupported !== null && /^\s*(vector|halfvec|sparsevec)\b/i.test(c.unsupported)) ||
+  (((c.list && (c.type === "Float" || c.type === "Decimal")) || c.type === "Bytes") && (EMBED_NAME.test(c.field) || EMBED_NAME.test(c.name)));
+const isDbtEmbedding = (c) => {
+  const t = String(c?.data_type ?? "");
+  return /^\s*(vector|halfvec|sparsevec)\b/i.test(t) || (/(array|\[\])/i.test(t) && /float|double|real|numeric/i.test(t) && EMBED_NAME.test(c.name)) || (/^\s*(bytes|binary|bytea)\b/i.test(t) && EMBED_NAME.test(c.name));
+};
+
+// Tagged columns from a Prisma schema and/or a dbt manifest: { source, store, column, field, tier }.
+function taggedColumns(f, tiers) {
+  const cols = [];
+  const problems = [];
+  if (f.prisma) {
+    const { fields } = classifyPrisma(f.prisma, tiers);
+    for (const x of fields) {
+      if (x.problem || (x.tier && !x.known)) problems.push(`${x.key}: ${x.problem ?? `tier ${x.tier} is not in the tiers file`}`);
+      cols.push({ store: `prisma:${x.model.model}`, table: x.model.table, field: x.col.field, column: x.col.name, tier: x.known ? x.tier : null, vector: isPrismaEmbedding(x.col) });
+    }
+  }
+  if (f.manifest) {
+    for (const [, n] of dbtModels(f.manifest, null, f.repo)) {
+      for (const c of Object.values(n.columns ?? {})) {
+        const t = dbtColumnTier(c);
+        if (t && !Object.hasOwn(tiers, t)) problems.push(`dbt:${n.name}.${c.name}: tier ${t} is not in the tiers file`);
+        cols.push({ store: `dbt:${n.name}`, table: n.alias ?? n.name, field: c.name, column: c.name, tier: t && Object.hasOwn(tiers, t) ? t : null, vector: isDbtEmbedding(c) });
+      }
+    }
+  }
+  return { cols, problems };
+}
+
+const STORE_KINDS = ["primary", "replica", "warehouse", "export", "log", "embedding", "backup", "cache", "other"];
+
+// Every store holding a personal-data column (from the tags) is on the map, every model holding vectors is
+// on it as an embedding store, every entry names how it is deleted, and the backups state their window and
+// whether deletions are re-applied after a restore or expire with the backups.
+export function deletionMap(argv, env = process.env) {
+  const f = parseFlags(argv, ["map", "prisma", "manifest", "tiers", "repo"]);
+  const mapFile = f.map ?? "governance/deletion-map.json";
+  if (!f.prisma && !f.manifest) throw new Exit(2, "deletion-map: give --prisma <schema> and/or --manifest <manifest.json>; with neither, nothing can be compared");
+  const tiers = readTiers(f.tiers);
+  const map = readJson(mapFile, "--map");
+  if (!map || !Array.isArray(map.stores)) throw new Exit(2, `--map ${mapFile}: want { "stores": [ ... ] }`);
+  const { cols, problems } = taggedColumns(f, tiers);
+  const notes = [];
+  const held = new Map();
+  let backups = 0;
+  map.stores.forEach((s, i) => {
+    const label = `stores[${i}]${s?.name ? ` (${s.name})` : ""}`;
+    if (!s || typeof s !== "object") return problems.push(`${label}: not an object`);
+    if (typeof s.name !== "string" || !s.name.trim()) problems.push(`${label}: no name`);
+    if (!STORE_KINDS.includes(s.kind)) problems.push(`${label}: kind must be one of ${STORE_KINDS.join(", ")}`);
+    if (typeof s.delete !== "string" || !s.delete.trim()) problems.push(`${label}: no "delete" (the job, test or runbook that deletes a person here)`);
+    if (!Array.isArray(s.holds) || !s.holds.length) problems.push(`${label}: no "holds" (prisma:<Model>, dbt:<model> or all)`);
+    for (const h of Array.isArray(s.holds) ? s.holds : []) {
+      if (h === "all") continue;
+      const m = /^(prisma|dbt):([A-Za-z_][A-Za-z0-9_]*)$/.exec(String(h));
+      if (!m) {
+        problems.push(`${label}: holds ${JSON.stringify(h)}: want prisma:<Model>, dbt:<model> or all`);
+        continue;
+      }
+      if ((m[1] === "prisma" && !f.prisma) || (m[1] === "dbt" && !f.manifest)) {
+        notes.push(`NOT CHECKED: ${label} holds ${h}, and no --${m[1] === "prisma" ? "prisma" : "manifest"} was given`);
+        continue;
+      }
+      if (!cols.some((c) => c.store === h)) problems.push(`${label}: holds ${h}, which the schema does not have (stale entry)`);
+      held.set(h, [...(held.get(h) ?? []), s]);
+    }
+    if (s.kind === "backup") {
+      backups++;
+      if (!(Number.isInteger(s.retention_days) && s.retention_days >= 0)) problems.push(`${label}: a backup states retention_days, the window a deleted person survives in it`);
+      if (!["reapply", "expire"].includes(s.after_restore)) problems.push(`${label}: a backup states after_restore: "reapply" (deletions are re-applied after a restore) or "expire" (the data expires with the backups)`);
+    }
+  });
+  const personal = new Map();
+  const vectors = new Set();
+  for (const c of cols) {
+    if (c.tier && tiers[c.tier].personal_data) personal.set(c.store, [...(personal.get(c.store) ?? []), `${c.column} (${c.tier})`]);
+    // An embedding is derived from its source row, whatever tier the column is tagged with: it is
+    // personal data, so its store must be on the map (as an embedding store) and covered by the backups.
+    if (c.vector) {
+      vectors.add(c.store);
+      personal.set(c.store, [...(personal.get(c.store) ?? []), `${c.column} (embedding)`]);
+    }
+  }
+  for (const [store, list] of personal) if (!held.has(store)) problems.push(`${store} holds personal data (${list.slice(0, 5).join(", ")}${list.length > 5 ? ", ..." : ""}) and no store on the map holds it`);
+  for (const store of vectors) if (!(held.get(store) ?? []).some((s) => s.kind === "embedding")) problems.push(`${store} has a vector column and is not on the map as an embedding store; embeddings carry their source row's data and are deleted with it`);
+  if (personal.size && !backups) problems.push(`personal data is held and the map has no backup store; state the backup window and whether deletions are re-applied after a restore or expire`);
+  const untagged = cols.filter((c) => !c.tier).length;
+  if (untagged) notes.push(`NOT CHECKED: ${untagged} untagged column(s) are not known to hold personal data; classification prisma / dbt fails them`);
+  if (problems.length) throw new Exit(1, [`deletion-map: ${problems.length} problem(s)`, ...problems.map((p) => `  ${p}`), ...notes].join("\n"));
+  return [...notes, `deletion-map: ${personal.size} store(s) with personal data, each on the map; ${map.stores.length} map entries`].join("\n");
+}
+
+// A path in the repository: relative, no "..", a regular file.
+function repoFile(p, what) {
+  if (typeof p !== "string" || !p || path.isAbsolute(p) || p.split(/[\\/]/).includes("..")) return { problem: `${what} ${JSON.stringify(p)}: want a relative path inside the repository` };
+  const st = fs.lstatSync(p, { throwIfNoEntry: false });
+  if (!st) return { problem: `${what} ${p}: no such file` };
+  if (!st.isFile()) return { problem: `${what} ${p}: not a regular file` };
+  return { text: fs.readFileSync(p, "utf8") };
+}
+
+const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const ENFORCEMENT_KINDS = ["scheduled-job", "partition-expiration", "lifecycle-rule"];
+// What a scheduled job does must read as a deletion: its target, command or query.
+const DELETES = /delet|purg|prun|expir|retention|clean[-_ ]?up|truncat|\bdrop\b|eras|remov/i;
+
+// The file's text with comments removed (#, //, /* */, and YAML #), so a commented-out job is not one.
+function stripCode(text) {
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split(/\r?\n/)
+    .map((l) => l.replace(/(^|\s)(#|\/\/).*$/, "$1"))
+    .join("\n");
+}
+
+// Terraform blocks `resource "<type>" "<name>" { ... }` with their bodies, brace-matched.
+function tfResources(text) {
+  const out = [];
+  const re = /\bresource\s+"([^"]+)"\s+"([^"]+)"\s*\{/g;
+  for (let m; (m = re.exec(text)); ) {
+    let depth = 1;
+    let i = re.lastIndex;
+    for (; i < text.length && depth; i++) {
+      if (text[i] === "{") depth++;
+      else if (text[i] === "}") depth--;
+    }
+    out.push({ type: m[1], name: m[2], body: text.slice(re.lastIndex, i - 1) });
+  }
+  return out;
+}
+const tfAttr = (body, key) => new RegExp(`^\\s*${key}\\s*=\\s*"?([^"\\n]*?)"?\\s*$`, "m").exec(body)?.[1] ?? null;
+const tfNamed = (r, id) => r.name === id || [tfAttr(r.body, "name"), tfAttr(r.body, "table_id"), tfAttr(r.body, "job_id")].some((v) => v === id || (v && v.split("/").pop() === id));
+
+// Each enforcement kind: where it may live, and what makes it real. Returns null when found, or why not.
+function findEnforcement(kind, id, text) {
+  const code = stripCode(text);
+  const tf = tfResources(code);
+  if (kind === "scheduled-job") {
+    // Terraform: a Cloud Scheduler job, not paused, with a schedule, whose target reads as a deletion.
+    for (const r of tf.filter((x) => x.type === "google_cloud_scheduler_job" && tfNamed(x, id))) {
+      if (/^\s*paused\s*=\s*true\b/m.test(r.body)) return `${r.type}.${r.name} is paused (paused = true); a paused job deletes nothing`;
+      if (!tfAttr(r.body, "schedule")) return `${r.type}.${r.name} has no schedule`;
+      if (!DELETES.test(r.body)) return `${r.type}.${r.name} runs nothing that reads as a deletion`;
+      return null;
+    }
+    // Kubernetes: a CronJob of that name, not suspended, with a schedule and a deleting command.
+    for (const doc of code.split(/^---\s*$/m)) {
+      if (!/^kind:\s*CronJob\s*$/m.test(doc) || !new RegExp(`^\\s+name:\\s*["']?${escRe(id)}["']?\\s*$`, "m").test(doc)) continue;
+      if (/^\s*suspend:\s*true\b/m.test(doc)) return `CronJob ${id} is suspended (suspend: true)`;
+      if (!/^\s*schedule:\s*\S/m.test(doc)) return `CronJob ${id} has no schedule`;
+      if (!DELETES.test(doc.replace(new RegExp(escRe(id), "g"), ""))) return `CronJob ${id} runs nothing that reads as a deletion`;
+      return null;
+    }
+    // GitHub Actions: a workflow on a cron schedule with a job of that id whose steps delete.
+    if (/^on:/m.test(code) && /^\s+schedule:\s*$/m.test(code) && /^\s+-\s*cron:\s*\S/m.test(code)) {
+      const jm = new RegExp(`^  ${escRe(id)}:\\s*$([\\s\\S]*?)(?=^  [A-Za-z0-9_-]+:\\s*$|(?![\\s\\S]))`, "m").exec(code.slice(code.search(/^jobs:\s*$/m) + 1));
+      if (jm && /^jobs:\s*$/m.test(code)) return DELETES.test(jm[1]) ? null : `workflow job ${id} runs nothing that reads as a deletion`;
+    }
+    // crontab: five schedule fields, then a command that names the job and deletes.
+    for (const l of code.split("\n")) {
+      if (/^\s*(@(daily|hourly|weekly|monthly|yearly)|(\S+\s+){4}\S+)\s+\S/.test(l) && new RegExp(`(^|[^A-Za-z0-9_-])${escRe(id)}($|[^A-Za-z0-9_-])`).test(l) && !/^\s*[A-Za-z_]+\s*[:=]/.test(l)) {
+        return DELETES.test(l.replace(new RegExp(escRe(id), "g"), "")) || DELETES.test(id) ? null : `the crontab line for ${id} runs nothing that reads as a deletion`;
+      }
+    }
+    return `no scheduled job named ${id}: want a google_cloud_scheduler_job, a Kubernetes CronJob, a scheduled GitHub Actions job or a crontab line (a mention in prose or a TODO is not a job)`;
+  }
+  if (kind === "partition-expiration") {
+    for (const r of tf.filter((x) => x.type === "google_bigquery_table" && tfNamed(x, id))) {
+      const ms = /\bexpiration_ms\s*=\s*(\d+)/.exec(r.body);
+      if (ms && Number(ms[1]) > 0 && /time_partitioning\s*\{/.test(r.body)) return null;
+      return `${r.type}.${r.name} sets no time_partitioning expiration_ms above 0`;
+    }
+    for (const r of tf.filter((x) => x.type === "google_bigquery_dataset" && tfNamed(x, id))) {
+      const ms = /\bdefault_partition_expiration_ms\s*=\s*(\d+)/.exec(r.body);
+      return ms && Number(ms[1]) > 0 ? null : `${r.type}.${r.name} sets no default_partition_expiration_ms above 0`;
+    }
+    for (const st of code.split(";")) {
+      if (new RegExp(`(^|[^A-Za-z0-9_-])${escRe(id)}($|[^A-Za-z0-9_-])`).test(st) && /\b(CREATE|ALTER)\b[\s\S]*\bTABLE\b/i.test(st) && /partition_expiration_days\s*=\s*[0-9]*[1-9]/i.test(st)) return null;
+    }
+    return `no table named ${id} with a partition expiration above 0 (Terraform time_partitioning.expiration_ms, or partition_expiration_days in its DDL)`;
+  }
+  if (kind === "lifecycle-rule") {
+    for (const r of tf.filter((x) => x.type === "google_storage_bucket" && tfNamed(x, id))) {
+      const rules = r.body.split(/\blifecycle_rule\s*\{/).slice(1);
+      if (rules.some((b) => /\btype\s*=\s*"Delete"/.test(b) && /\b(age|days_since_noncurrent_time|days_since_custom_time)\s*=\s*\d+/.test(b))) return null;
+      return `${r.type}.${r.name} has no lifecycle_rule with action type "Delete" and an age`;
+    }
+    return `no google_storage_bucket named ${id} with a Delete lifecycle rule`;
+  }
+  return `unknown kind ${kind}`;
+}
+
+// A retention test is a test: a test file by its name, with a test in it, that names the job or the table.
+const TEST_NAME = /(\.(test|spec)\.[cm]?[jt]sx?|(^|\/)test_[^/]+\.py|_test\.(py|go)|\.test\.sql|(^|\/)tests?\/[^/]+\.sql)$/;
+const TEST_BODY = /\b(test|it|describe)\s*(\.\w+\s*)?\(|^\s*def\s+test_|^\s*func\s+Test|\bassert\b|\bexpect\s*\(/m;
+
+// Each retention rule names the thing that enforces it, and that thing exists in the repository: a
+// scheduled job (with its test), a partition expiration or a bucket lifecycle rule. With tiers, every tier
+// that states retention_days has a rule that keeps it no longer.
+export function retentionCheck(argv, env = process.env) {
+  const f = parseFlags(argv, ["rules", "tiers"]);
+  const rulesFile = f.rules ?? "governance/retention.json";
+  const j = readJson(rulesFile, "--rules");
+  if (!j || !Array.isArray(j.rules) || !j.rules.length) throw new Exit(2, `--rules ${rulesFile}: want { "rules": [ ... ] } with at least one rule`);
+  let tiers = null;
+  const notes = [];
+  if (f.tiers || fs.existsSync(DEFAULT_TIERS)) tiers = readTiers(f.tiers);
+  else notes.push(`NOT CHECKED: no ${DEFAULT_TIERS}, so no tier's retention_days is compared with the rules`);
+  const problems = [];
+  j.rules.forEach((r, i) => {
+    const label = `rules[${i}]${r?.name ? ` (${r.name})` : ""}`;
+    if (!r || typeof r !== "object") return problems.push(`${label}: not an object`);
+    if (typeof r.name !== "string" || !r.name.trim()) problems.push(`${label}: no name`);
+    if (!(Number.isInteger(r.keep_days) && r.keep_days > 0)) problems.push(`${label}: keep_days must be a whole number above 0`);
+    if (tiers && r.tier !== undefined && !Object.hasOwn(tiers, r.tier)) problems.push(`${label}: tier ${r.tier} is not in the tiers file`);
+    const e = r.enforcement;
+    if (!e || !ENFORCEMENT_KINDS.includes(e.kind)) return problems.push(`${label}: enforcement.kind must be one of ${ENFORCEMENT_KINDS.join(", ")}; a policy with no job is not retention`);
+    if (typeof e.id !== "string" || !e.id.trim()) return problems.push(`${label}: enforcement.id names the job, table or rule in enforcement.file`);
+    const file = repoFile(e.file, `${label}: enforcement.file`);
+    if (file.problem) return problems.push(file.problem);
+    if (!new RegExp(`(^|[^A-Za-z0-9_-])${escRe(e.id)}($|[^A-Za-z0-9_-])`).test(file.text)) problems.push(`${label}: ${e.file} does not mention ${e.id}; the enforcement it names does not exist there`);
+    else {
+      const why = findEnforcement(e.kind, e.id, file.text);
+      if (why) problems.push(`${label}: ${e.file}: ${why}`);
+    }
+    if (r.table !== undefined && (typeof r.table !== "string" || !r.table.trim())) problems.push(`${label}: table, when given, names the table the rule deletes from`);
+    if (e.kind === "scheduled-job") {
+      const t = repoFile(r.test, `${label}: test`);
+      const need = "(a scheduled delete needs a test that seeds an old row, runs the job and finds the row gone)";
+      if (t.problem) problems.push(`${t.problem} ${need}`);
+      else if (!TEST_NAME.test(r.test)) problems.push(`${label}: test ${r.test} is not a test file by its name (*.test.ts, *.spec.js, test_*.py, *_test.go, tests/*.sql) ${need}`);
+      else if (!TEST_BODY.test(stripCode(t.text))) problems.push(`${label}: test ${r.test} holds no test or assertion ${need}`);
+      else if (![e.id, r.table].filter((x) => typeof x === "string" && x).some((x) => new RegExp(`(^|[^A-Za-z0-9_-])${escRe(x)}($|[^A-Za-z0-9_-])`).test(stripCode(t.text)))) problems.push(`${label}: test ${r.test} names neither the job ${e.id}${r.table ? ` nor the table ${r.table}` : ""}, so it does not test this rule`);
+    }
+  });
+  if (tiers) {
+    for (const [name, t] of Object.entries(tiers)) {
+      if (!t.retention_days) continue;
+      const rs = j.rules.filter((r) => r?.tier === name);
+      if (!rs.length) problems.push(`tier ${name} keeps data ${t.retention_days} days, and no rule enforces it`);
+      for (const r of rs) if (Number.isInteger(r.keep_days) && r.keep_days > t.retention_days) problems.push(`${r.name ?? "a rule"}: keeps ${name} ${r.keep_days} days; the tier allows ${t.retention_days}`);
+    }
+  }
+  if (problems.length) throw new Exit(1, [`retention: ${problems.length} problem(s)`, ...problems.map((p) => `  ${p}`), ...notes].join("\n"));
+  return [...notes, `retention: ${j.rules.length} rule(s), each with an enforcement that exists`].join("\n");
+}
+
+// A glob over the working tree: `**` crosses folders, `*` and `?` do not. .git and node_modules are skipped.
+function globFiles(pattern) {
+  if (path.isAbsolute(pattern) || pattern.split("/").includes("..")) throw new Exit(2, `--module ${pattern}: want a relative path or glob inside the repository`);
+  const re = new RegExp(
+    `^${pattern
+      .split("/")
+      .map((seg) => (seg === "**" ? "(?:.*/)?" : `${seg.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]")}/`))
+      .join("")
+      .replace(/\/$/, "")
+      .replace(/\(\?:\.\*\/\)\?$/, ".*")}$`,
+  );
+  const out = [];
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d || ".", { withFileTypes: true })) {
+      if (e.name === ".git" || e.name === "node_modules") continue;
+      const p = d ? `${d}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile() && re.test(p)) out.push(p);
+    }
+  };
+  walk("");
+  return out.sort();
+}
+
+const WAIVER = /governance:\s*export-ok\b(.*)$/;
+const COMMENT_ONLY = /^\s*(\/\/|#|\/\*|\*|<!--|--)/;
+
+// The [open, close] index pairs of each mask call's parentheses on a line.
+function maskedSpans(line, maskRe) {
+  const spans = [];
+  for (const m of line.matchAll(new RegExp(maskRe.source, "g"))) {
+    const open = m.index + m[0].length - 1;
+    let depth = 0;
+    let close = line.length;
+    for (let i = open; i < line.length; i++) {
+      if (line[i] === "(") depth++;
+      else if (line[i] === ")" && --depth === 0) {
+        close = i;
+        break;
+      }
+    }
+    spans.push([open, close]);
+  }
+  return spans;
+}
+
+// Advisory: an export module that writes a column whose tier does not allow export, with no mask call on
+// that line. A waiver comment with a reason silences one line; a waiver with no reason fails.
+export function exportsCheck(argv, env = process.env) {
+  const f = parseFlags(argv, ["module", "prisma", "manifest", "tiers", "mask", "strict", "repo"], ["module", "mask"]);
+  if (!f.module?.length) throw new Exit(2, "exports: --module <path or glob> is required (the modules that write exports)");
+  if (!f.prisma && !f.manifest) throw new Exit(2, "exports: give --prisma <schema> and/or --manifest <manifest.json> for the tags");
+  if (f.strict !== undefined && !["true", "false"].includes(f.strict)) throw new Exit(2, "--strict true|false");
+  const tiers = readTiers(f.tiers);
+  const { cols, problems: tagProblems } = taggedColumns(f, tiers);
+  const guarded = new Map();
+  const guardedStores = new Set();
+  for (const c of cols) {
+    if (!c.tier || tiers[c.tier].export === "allow") continue;
+    guardedStores.add(c.store);
+    // Any length: a two-letter column (`ip`) is guarded like a long one.
+    for (const n of new Set([c.field, c.column])) if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(n)) guarded.set(n, { tier: c.tier, rule: tiers[c.tier].export, store: c.store });
+  }
+  // Prisma client accessors (`prisma.person`) of models with a guarded column.
+  const guardedAccessors = new Set([...guardedStores].filter((x) => x.startsWith("prisma:")).map((x) => x.slice(7)).map((m) => m[0].toLowerCase() + m.slice(1)));
+  const knownAccessors = new Set(cols.filter((c) => c.store.startsWith("prisma:")).map((c) => c.store.slice(7)).map((m) => m[0].toLowerCase() + m.slice(1)));
+  const masks = f.mask?.length ? f.mask : ["mask"];
+  for (const m of masks) if (!/^[A-Za-z_$][A-Za-z0-9_$.]*$/.test(m)) throw new Exit(2, `--mask ${m}: want a function name`);
+  const maskRe = new RegExp(`(?:^|[^A-Za-z0-9_$.])(?:${masks.map(escRe).join("|")})\\s*\\(`);
+  const files = new Set();
+  for (const g of f.module) {
+    const hit = globFiles(g);
+    if (!hit.length) throw new Exit(2, `--module ${g}: matches no file, so no export was read`);
+    hit.forEach((x) => files.add(x));
+  }
+  const findings = [];
+  const errors = [...tagProblems];
+  for (const file of files) {
+    const text = fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
+    const lines = text.split("\n");
+    // A waiver trailing a line covers that line; a waiver on a line of its own (a comment and nothing
+    // else) covers the next one. A trailing waiver never covers the line after it.
+    const waived = (i) => {
+      const w = WAIVER.exec(lines[i]) ?? (i > 0 && COMMENT_ONLY.test(lines[i - 1]) ? WAIVER.exec(lines[i - 1]) : null);
+      return Boolean(w && w[1].replace(/^[\s:-]+|\s*(\*\/|-->)?\s*$/g, ""));
+    };
+    // Whole-row reads: a Prisma find with no `select` returns every column of the model.
+    if (guarded.size) {
+      for (const m of text.matchAll(/\b([A-Za-z_$][\w$]*)\s*\.\s*(findMany|findFirst|findUnique|findFirstOrThrow|findUniqueOrThrow)\s*\(/g)) {
+        if (knownAccessors.has(m[1]) && !guardedAccessors.has(m[1])) continue;
+        let depth = 0;
+        let end = text.length;
+        for (let k = m.index + m[0].length - 1; k < text.length; k++) {
+          if (text[k] === "(") depth++;
+          else if (text[k] === ")" && --depth === 0) {
+            end = k;
+            break;
+          }
+        }
+        if (/\bselect\s*:/.test(text.slice(m.index, end))) continue;
+        const ln = text.slice(0, m.index).split("\n").length - 1;
+        if (!waived(ln)) findings.push(`${file}:${ln + 1}: whole-row read (${m[1]}.${m[2]} with no select): every column goes out, guarded ones included; select the columns the export needs`);
+      }
+    }
+    lines.forEach((line, i) => {
+      const w = WAIVER.exec(line) ?? (i > 0 && COMMENT_ONLY.test(lines[i - 1]) ? WAIVER.exec(lines[i - 1]) : null);
+      if (WAIVER.test(line) && !WAIVER.exec(line)[1].replace(/^[\s:-]+|\s*(\*\/|-->)?\s*$/g, "")) errors.push(`${file}:${i + 1}: a waiver needs a reason (governance: export-ok <why>)`);
+      if (w && w[1].replace(/^[\s:-]+|\s*(\*\/|-->)?\s*$/g, "")) return;
+      // Whole-row writes: the row itself goes out, not named columns.
+      if (guarded.size) {
+        const rowOut = [
+          [/\bObject\s*\.\s*(values|entries)\s*\(\s*[A-Za-z_$][\w$]*\s*\)/, "Object.values / Object.entries of a row"],
+          [/\bJSON\s*\.\s*stringify\s*\(\s*[A-Za-z_$][\w$]*\s*[,)]/, "JSON.stringify of a row"],
+          [/(?:\{|,)\s*\.\.\.\s*[A-Za-z_$][\w$]*/, "an object spread of a row"],
+          [/\bselect\s+(?:distinct\s+)?(?:[A-Za-z_][\w]*\.)?\*/i, "SELECT *"],
+        ];
+        for (const [re, what] of rowOut) {
+          const m = re.exec(line);
+          if (!m) continue;
+          if (what === "an object spread of a row") {
+            // An array spread (`[...rows]`) copies a list, not a row's columns.
+            let depth = 0;
+            let opener = null;
+            for (let k = m.index + m[0].indexOf("...") - 1; k >= 0; k--) {
+              const ch = line[k];
+              if (ch === ")" || ch === "]" || ch === "}") depth++;
+              else if (ch === "(" || ch === "[" || ch === "{") {
+                if (depth === 0) {
+                  opener = ch;
+                  break;
+                }
+                depth--;
+              }
+            }
+            if (opener !== "{") continue;
+          }
+          findings.push(`${file}:${i + 1}: whole-row export (${what}): every column goes out, guarded ones included; write the columns the export needs`);
+        }
+      }
+      const masked = maskedSpans(line, maskRe);
+      for (const [name, g] of guarded) {
+        let written = false;
+        for (const m of line.matchAll(new RegExp(`(?<![A-Za-z0-9_$])${escRe(name)}(?![A-Za-z0-9_$])`, "g"))) {
+          // An object key or a type annotation (`email: string`, `email?: string`) names the column; it
+          // does not write it. A column inside a mask call's parentheses is masked.
+          if (/^\s*\??:(?!:)/.test(line.slice(m.index + name.length))) continue;
+          if (g.rule === "mask" && masked.some(([a, b]) => m.index > a && m.index < b)) continue;
+          written = true;
+        }
+        if (!written) continue;
+        findings.push(`${file}:${i + 1}: ${name} (${g.store}, tier ${g.tier}, export ${g.rule}) ${g.rule === "deny" ? "is in an export" : "is exported with no mask call"}`);
+      }
+    });
+  }
+  const strict = f.strict === "true";
+  const head = `exports: ${files.size} module(s), ${guarded.size} column name(s) whose tier does not allow export`;
+  if (errors.length || (strict && findings.length)) throw new Exit(1, [head, ...errors.map((e) => `  ERROR ${e}`), ...findings.map((x) => `  ${x}`)].join("\n"));
+  return [head, ...findings.map((x) => `WARNING ${x}`), findings.length ? "advisory: mask each one, or waive the line with `governance: export-ok <reason>`" : "no unmasked export of a guarded column"].join("\n");
+}
+
+// `evidence append --from <entries.json>`: append every entry of another evidence file, in order, each
+// validated as `evidence append` would build it. The publishing job uses it to add the entries the check
+// job recorded without ever running the check job's code with a write token.
+function evidenceFrom(file, target) {
+  const src = readJson(file, "--from");
+  if (!Array.isArray(src)) throw new Exit(2, `--from ${file}: not a JSON array`);
+  const keys = ["check", "date", "result", "run_link", "commit", "detail"];
+  for (const [i, e] of src.entries()) {
+    const ok =
+      e && typeof e === "object" && !Array.isArray(e) && Object.keys(e).length === keys.length && keys.every((k) => Object.hasOwn(e, k)) &&
+      typeof e.check === "string" && e.check && RESULTS.includes(e.result) && typeof e.date === "string" && !Number.isNaN(Date.parse(e.date)) &&
+      (e.run_link === null || typeof e.run_link === "string") && typeof e.commit === "string" && typeof e.detail === "string";
+    if (!ok) throw new Exit(2, `--from ${file}: entry ${i} is not an evidence entry`);
+  }
+  let n = 0;
+  for (const e of src) {
+    evidenceAppend(["--file", target, "--check", e.check, "--result", e.result, "--date", e.date, "--commit", e.commit || "unknown", ...(e.run_link ? ["--run-link", e.run_link] : []), ...(e.detail ? ["--detail", e.detail] : [])]);
+    n++;
+  }
+  return `appended ${n} entr${n === 1 ? "y" : "ies"} from ${file} to ${target}`;
 }
 
 export function main(argv, env = process.env) {
   const [cmd, sub, ...rest] = argv;
   if (cmd === "version" || cmd === "--version") return VERSION;
   if (cmd === "evidence" && sub === "append") return evidenceAppend(rest, env);
-  if (cmd === "evidence" && sub === "merge") return evidenceMerge(rest, env);
+  if (cmd === "monitors") return monitorsCheck(argv.slice(1), env);
   if (cmd === "owner") return ownerCheck(argv.slice(1), env);
   if (cmd === "contract-schema") return contractSchemaCheck(argv.slice(1), env);
   if (cmd === "consumers") return consumersCmd(argv.slice(1), env);
+  if (cmd === "classification" && sub === "prisma") return classificationPrisma(rest, env);
+  if (cmd === "classification" && sub === "dbt") return classificationDbt(rest, env);
+  if (cmd === "classification" && sub === "emit") return classificationEmit(rest, env);
+  if (cmd === "deletion-map") return deletionMap(argv.slice(1), env);
+  if (cmd === "retention") return retentionCheck(argv.slice(1), env);
+  if (cmd === "exports") return exportsCheck(argv.slice(1), env);
   if (cmd === "credentials") return credentialsCheck(argv.slice(1));
   throw new Exit(
     2,
@@ -1007,25 +2320,48 @@ export function main(argv, env = process.env) {
       "usage: governance-check.mjs <command>",
       "  version",
       "  evidence append --check <name> --result pass|fail|not_run [--run-link <url>] [--commit <sha>] [--detail <text>] [--file <path>]",
-      "  evidence merge --from <entries.json> [--file <path>]",
+      "  evidence append --from <entries.json> [--file <path>]",
+      "  monitors [--repo <dir>] (--manifest <manifest.json> ... | --gx <gx directory> ... [--gx-python <python>])",
       "  owner (--contracts <dir> | --contract <file> ...) [--manifest <manifest.json>]",
       "  contract-schema --contract <file> (--prisma <schema.prisma or folder> | --manifest <manifest.json> [--catalog <catalog.json>])",
       "  consumers --contract <file> [--format lines|markdown] [--label <path>]",
-      "  credentials --config <file or glob> [--config ...] [--targets .claude/db-targets.json]",
+      "  classification prisma [--schema prisma/schema.prisma] [--base origin/<base>] [--tiers governance/tiers.json] [--emit-comments <migrations dir>]",
+      "  classification dbt --manifest target/manifest.json [--repo <dbt project>] [--catalog target/catalog.json] [--path models/marts ...] [--tiers ...]",
+      "  classification emit bigquery --manifest <m> --model <name> --current-schema <bq show --schema json> [--tiers ...]",
+      "  classification emit snowflake --manifest <m> --tag <db.schema.tag> [--model <name> ...] [--tiers ...]",
+      "  deletion-map [--map governance/deletion-map.json] (--prisma <schema> | --manifest <m> [--repo <dbt project>]) [--tiers ...]",
+      "  retention [--rules governance/retention.json] [--tiers ...]",
+      "  exports --module <path or glob> ... (--prisma <schema> | --manifest <m> [--repo <dbt project>]) [--mask <fn> ...] [--strict true] [--tiers ...]",
+      "  credentials (--config <file or glob> ... | --all-tracked) [--targets .claude/db-targets.json]",
     ].join("\n"),
   );
 }
 
-if (process.argv[1] && path.basename(process.argv[1]) === "governance-check.mjs") {
+// The check's own status, from what it found, never from how it exited: a check that looked at
+// everything and found nothing is pass, one that found a problem is fail, and one that could not look at
+// some input (any line of its output that starts NOT CHECKED, even with nothing else wrong) is not_run.
+// A usage error or a missing input is not_run too. The runner records this status.
+export const NOT_CHECKED_LINE = /^\s*NOT CHECKED\b/m;
+export function checkStatus(argv, env = process.env) {
   try {
-    const out = main(process.argv.slice(2));
-    if (out) console.log(out);
+    const out = String(main(argv, env) ?? "");
+    if (NOT_CHECKED_LINE.test(out)) return { status: "not_run", code: 2, out: "", err: out };
+    return { status: "pass", code: 0, out, err: "" };
   } catch (e) {
-    if (e instanceof Exit) {
-      console.error(`governance-check: ${e.message}`);
-      process.exit(e.code);
-    }
-    console.error(`governance-check: ${e?.stack ?? e}`);
-    process.exit(2);
+    // A crash is a check that did not finish looking.
+    if (!(e instanceof Exit)) return { status: "not_run", code: 2, out: "", err: String(e?.stack ?? e) };
+    // A problem found is fail even when some other input was NOT CHECKED (both are listed).
+    return { status: e.code === 1 ? "fail" : "not_run", code: e.code, out: "", err: e.message };
   }
+}
+
+if (process.argv[1] && path.basename(process.argv[1]) === "governance-check.mjs") {
+  const r = checkStatus(process.argv.slice(2));
+  // no line of the output may start a workflow command, whatever it interpolated
+  if (r.out) console.log(r.out.replace(/^(\s*)::/gm, "$1: :"));
+  if (r.err) console.error(`governance-check: ${r.err}`.replace(/^(\s*)::/gm, "$1: :"));
+  // GOVERNANCE_STATUS_FILE: where the runner reads the status (pass, fail or not_run) of this one check.
+  if (process.env.GOVERNANCE_STATUS_FILE) fs.writeFileSync(process.env.GOVERNANCE_STATUS_FILE, `${r.status}
+`);
+  process.exit(r.code);
 }

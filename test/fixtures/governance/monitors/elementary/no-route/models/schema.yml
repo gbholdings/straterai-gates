@@ -1,0 +1,20 @@
+version: 2
+models:
+  - name: orders
+    config:
+      meta:
+        owner: "@data-platform"
+        channel: data-alerts
+    data_tests:
+      - elementary.volume_anomalies:
+          arguments:
+            timestamp_column: updated_at
+  # an owner and no channel: the alert has nowhere to go
+  - name: customers
+    config:
+      meta:
+        owner: "@data-platform"
+    data_tests:
+      - elementary.volume_anomalies:
+          arguments:
+            timestamp_column: updated_at

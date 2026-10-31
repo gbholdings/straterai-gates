@@ -1,0 +1,12 @@
+snapshots:
+  - name: people_history
+    relation: ref('stg_people')
+    config:
+      unique_key: person_id
+      strategy: check
+      check_cols: all
+    columns:
+      - name: person_id
+        config: { meta: { classification: internal } }
+      - name: email
+        config: { meta: { classification: personal } }

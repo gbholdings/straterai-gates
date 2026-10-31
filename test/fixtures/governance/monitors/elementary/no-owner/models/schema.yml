@@ -1,0 +1,20 @@
+version: 2
+models:
+  # a channel and no owner: the alert reaches a room and nobody in it is answerable for the table
+  - name: orders
+    config:
+      meta:
+        channel: data-alerts
+    data_tests:
+      - elementary.volume_anomalies:
+          arguments:
+            timestamp_column: updated_at
+  - name: customers
+    config:
+      meta:
+        owner: "@data-platform"
+        channel: data-alerts
+    data_tests:
+      - elementary.volume_anomalies:
+          arguments:
+            timestamp_column: updated_at

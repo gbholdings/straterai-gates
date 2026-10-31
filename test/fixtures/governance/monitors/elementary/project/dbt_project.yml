@@ -1,0 +1,6 @@
+name: monitors_fixture
+version: "1.0"
+config-version: 2
+profile: monitors_fixture
+flags:
+  send_anonymous_usage_stats: false

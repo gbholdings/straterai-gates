@@ -1,0 +1,29 @@
+version: 2
+models:
+  - name: orders
+    config:
+      meta:
+        owner: "@data-platform"
+        channel: data-alerts
+    data_tests:
+      - elementary.volume_anomalies:
+          arguments:
+            timestamp_column: updated_at
+      - elementary.freshness_anomalies:
+          arguments:
+            timestamp_column: updated_at
+      # the test's own channel wins over the model's, under alerts_config as Elementary reads it
+      - elementary.schema_changes:
+          config:
+            meta:
+              alerts_config:
+                channel: schema-alerts
+  - name: customers
+    config:
+      meta:
+        owner: "@data-platform"
+        channel: data-alerts
+    data_tests:
+      - elementary.volume_anomalies:
+          arguments:
+            timestamp_column: updated_at

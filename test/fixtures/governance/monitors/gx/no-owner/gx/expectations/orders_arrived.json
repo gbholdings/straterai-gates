@@ -1,0 +1,19 @@
+{
+  "expectations": [
+    {
+      "id": "00000000-0000-0000-0000-000000000000",
+      "kwargs": {
+        "min_value": 1
+      },
+      "meta": {},
+      "severity": "critical",
+      "type": "expect_table_row_count_to_be_between"
+    }
+  ],
+  "id": "00000000-0000-0000-0000-000000000000",
+  "meta": {
+    "great_expectations_version": "1.24.1"
+  },
+  "name": "orders_arrived",
+  "notes": null
+}

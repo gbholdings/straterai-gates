@@ -1,0 +1,10 @@
+version: 2
+seeds:
+  - name: people_seed
+    columns:
+      - name: person_id
+        config: { meta: { classification: internal } }
+      - name: email
+        config: { meta: { classification: personal } }
+      - name: tax_id
+        config: { meta: { classification: restricted } }

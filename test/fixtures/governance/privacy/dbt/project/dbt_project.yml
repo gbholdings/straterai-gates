@@ -1,0 +1,12 @@
+name: privacy_fixture
+version: "1.0"
+config-version: 2
+profile: privacy_fixture
+flags:
+  send_anonymous_usage_stats: false
+models:
+  privacy_fixture:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table
