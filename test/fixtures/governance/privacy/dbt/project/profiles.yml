@@ -1,0 +1,6 @@
+privacy_fixture:
+  target: ci
+  outputs:
+    ci:
+      type: duckdb
+      path: "{{ env_var('PRIV_DUCKDB_PATH', 'priv.duckdb') }}"
