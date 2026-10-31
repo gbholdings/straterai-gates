@@ -28,7 +28,7 @@ jobs:
             echo "::error::fact-scan cannot run: the secrets GATES_READER_APP_ID and GATES_READER_PRIVATE_KEY are not set for this run. Create the straterai-gates-reader GitHub App (contents: read, installed on gbholdings/straterai-devagent only) and set both as repository secrets. A pull request from a fork never gets them, so it fails here by design. Nothing was scanned."
             exit 1
           fi
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: gates
           persist-credentials: false
@@ -41,7 +41,7 @@ jobs:
           owner: gbholdings
           repositories: straterai-devagent
           permission-contents: read
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: gbholdings/straterai-devagent
           ref: master
