@@ -1,0 +1,4 @@
+# Fixture budgets. shakespeare is 6432064 bytes in full and 1332943 bytes for the word column (dry runs, 2026-10-30).
+default: 2 MB
+models:
+  fct_wide: 2 MB
