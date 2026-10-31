@@ -3,7 +3,7 @@
 //
 // For each fixture case under test/fixtures/<dir>/<case>/ it builds a temp git repo: `base/` becomes
 // origin/main, `head/` becomes the PR branch on top. Then it runs the gate's named steps, in order, with
-// `bash -e` as GitHub does, using the workflow's own env and input defaults. Each step's `if:` is
+// `bash -e -o pipefail` as GitHub does, using the workflow's own env and input defaults. Each step's `if:` is
 // evaluated as GitHub would (success() by default, so a failed step skips the rest unless their `if:`
 // says otherwise), each step gets its own GITHUB_OUTPUT, and GITHUB_ENV carries into later steps. Every
 // case gets its own RUNNER_TEMP, and the repo gets this checkout's scripts/ under .gates/, as the
@@ -62,6 +62,20 @@ const GATES = [
     workflow: "dbt.yml",
     fixtures: "dbt-changes",
     steps: ["Did a dbt file change?"],
+    inputs: {},
+  },
+  {
+    name: "bq-dry-run (change detection)",
+    workflow: "bq-dry-run.yml",
+    fixtures: "bq-dry-run-changes",
+    steps: ["What changed?"],
+    inputs: {},
+  },
+  {
+    name: "bq-dry-run (CI profile cap)",
+    workflow: "bq-dry-run.yml",
+    fixtures: "bq-dry-run-profile",
+    steps: ["What changed?", "Check the CI profile caps billed bytes"],
     inputs: {},
   },
 ];
@@ -239,14 +253,12 @@ function buildRepo(caseDir, work) {
   git("init", "-q", "-b", "main");
   git("config", "core.autocrlf", "false");
   copyTree(path.join(caseDir, "base"), repo);
-  fs.writeFileSync(path.join(repo, ".gitkeep-base"), "");
   git("add", "-A");
-  git("commit", "-qm", "base");
+  git("commit", "-q", "--allow-empty", "-m", "base");
   git("update-ref", "refs/remotes/origin/main", "HEAD");
   git("checkout", "-q", "-b", "pr");
   for (const e of fs.readdirSync(repo)) if (e !== ".git") fs.rmSync(path.join(repo, e), { recursive: true, force: true });
   copyTree(path.join(caseDir, "head"), repo);
-  fs.writeFileSync(path.join(repo, ".gitkeep-head"), "");
   git("add", "-A");
   const links = path.join(caseDir, "links");
   if (fs.existsSync(links)) {
@@ -256,7 +268,7 @@ function buildRepo(caseDir, work) {
       git("update-index", "--add", "--cacheinfo", `120000,${blob},${p}`);
     }
   }
-  git("commit", "-qm", "head");
+  git("commit", "-q", "--allow-empty", "-m", "head");
   return repo;
 }
 
@@ -342,7 +354,7 @@ function runCase(gate, wf, caseName) {
     for (const [k, v] of Object.entries(step.env)) env[k] = interpolate(v, exprCtx);
     const script = path.join(work, `${id}.sh`);
     fs.writeFileSync(script, step.run);
-    const r = spawnSync("bash", ["-e", fwd(script)], { cwd: repo, env: { ...process.env, ...env }, encoding: "utf8", timeout: 300000 });
+    const r = spawnSync("bash", ["-e", "-o", "pipefail", fwd(script)], { cwd: repo, env: { ...process.env, ...env }, encoding: "utf8", timeout: 300000 });
     log += `--- ${step.name} (exit ${r.status})\n${r.stdout}${r.stderr}`;
     const stepOutputs = {};
     for (const l of lines(out)) {

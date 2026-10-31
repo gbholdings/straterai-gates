@@ -12,7 +12,7 @@
 #     pull-requests: write # the consumer notice; a reusable workflow cannot exceed the caller
 #   jobs:
 #     datacontract:
-#       uses: gbholdings/straterai-gates/.github/workflows/datacontract.yml@<40-char sha> # v1.1.0
+#       uses: gbholdings/straterai-gates/.github/workflows/datacontract.yml@<40-char sha> # v1.2.0
 #       with:
 #         contracts_glob: "contracts/*.odcs.yaml"
 #         prisma_schema: prisma/schema.prisma   # or dbt_manifest (and dbt_catalog, dbt_artifact)
