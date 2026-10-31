@@ -12,4 +12,9 @@ excluded_rules = [
   "require-statement-timeout",  # same: set statement_timeout on the role
   "prefer-identity",            # Prisma always emits SERIAL for autoincrement; it cannot emit IDENTITY
   "require-enum-value-ordering", # fires on every Prisma enum addition (ALTER TYPE ... ADD VALUE); Prisma owns the order and schema.prisma cannot change it
+  # Prisma 6 and 7 emit ALTER INDEX ... RENAME for a renamed @unique. The guard step (the Postgres parser) already
+  # covers renames: it fails a table or column rename until a reviewer approves, and lets an index rename through only
+  # when the merge base proves the name is an index. squawk's rule cannot tell an index from a table, so it would fail
+  # the one rename the guard proved safe.
+  "renaming-object",
 ]

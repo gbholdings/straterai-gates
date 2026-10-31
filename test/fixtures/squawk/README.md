@@ -12,11 +12,12 @@ Each case holds `base/` (optional, the base branch tree), `head/` (the PR's tree
   schema, an INSERT between, an index history built in a DO block, CONCURRENTLY). A removed enum value (the type
   recreated: DROP TYPE, a type change and a rename), a dropped default and a collation change each fail on their
   own rule. A COLLATE in a comment or a new table passes.
-- `cue-prisma-index-rename*`: `prisma migrate diff` output, byte for byte (Prisma 6.19.3 and 7.10.1 print the
-  same SQL), for a `@unique(map:)` and a `@@unique` rename: `ALTER INDEX ... RENAME`. `base/` proves each name is
-  an index, so the guard passes it; squawk's own `renaming-object` still needs a scoped ignore, and with one
-  (`-ignored`) the job passes. `cue-alter-index-on-a-table` (the name is a table in `base/`) and
-  `cue-alter-index-table-dropped-since` fail on `guard-rename`.
+- `cue-prisma-index-rename`: `prisma migrate diff` output, byte for byte (Prisma 6.19.3 and 7.10.1 print the
+  same SQL), for a `@unique(map:)` and a `@@unique` rename: `ALTER INDEX "User_email_key" RENAME TO "User_mail_key"`.
+  `base/` proves each name is an index, so the guard passes it, and the config switches off squawk's
+  `renaming-object` (the guard covers renames), so the whole job passes. `cue-alter-index-on-a-table` (the name is
+  a table in `base/`) and `cue-alter-index-table-dropped-since` fail on `guard-rename`, and so does
+  `cue-table-rename` (`ALTER TABLE users RENAME TO people`).
 - `log-injection-filename`: a migration whose name holds newlines and `::notice` / `::add-mask::` lines
   (`head-rename.json` gives it that name at run time). `reject-commands` proves the runner would act on none of
   them.
