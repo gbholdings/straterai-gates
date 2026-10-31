@@ -1,7 +1,9 @@
 {
  "metadata": {
   "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
-  "dbt_version": "1.12.6"
+  "dbt_version": "1.12.6",
+  "generated_at": "2026-10-31T00:00:00.000000Z",
+  "project_name": "monitors_fixture"
  },
  "nodes": {
   "model.monitors_fixture.customers": {

@@ -59,7 +59,7 @@ Access: the service account needs `roles/bigquery.jobUser` in the job project an
 
 `node scripts/governance-check.mjs evidence append --check <plugin>:<skill>/<gate> --result pass|fail|not_run [--run-link <url>] [--commit <sha>] [--detail <text>] [--file governance/evidence.json]`
 
-`governance/evidence.json` is a JSON array of `{ "check", "date" (ISO 8601 UTC), "result", "run_link" (URL or null), "commit", "detail" }`. It only grows: the script reads, appends, verifies no earlier entry changed, and writes through a temp file. A file it cannot parse exits 4 and is left untouched. Exit 2 is a usage error. On push and schedule `governance.yml` commits the file to the `governance-evidence` branch, touching nothing else; on a pull request it uploads the would-be file as an artifact and writes no branch. The file records what ran and what it found. It does not say a repo is compliant.
+`governance/evidence.json` is a JSON array of `{ "check", "date" (ISO 8601 UTC), "result", "run_link" (URL or null), "commit", "detail" }`. It only grows: the script reads, appends, verifies no earlier entry changed, and writes through a temp file. A file it cannot parse exits 4 and is left untouched. Exit 2 is a usage error. A check line in `governance.yml` that exits 2 (NOT CHECKED) is recorded as `not_run`, exit 0 as `pass` and anything else as `fail`; only `pass` lets the job succeed. On push and schedule `governance.yml` commits the file to the `governance-evidence` branch, touching nothing else; on a pull request it uploads the would-be file as an artifact and writes no branch. The file records what ran and what it found. It does not say a repo is compliant.
 
 ## Contract checks
 
@@ -82,22 +82,34 @@ node scripts/governance-check.mjs consumers --contract <file> [--format lines|ma
 ## Monitor routing
 
 ```
-node scripts/governance-check.mjs monitors [--repo .] (--manifest target/manifest.json | --gx gx)
+node scripts/governance-check.mjs monitors [--repo .] (--manifest <dbt project>/target/manifest.json ... | --gx <gx dir> ... [--gx-python <python>])
 ```
 
-Every run-time monitor must reach a person: it needs an alert destination and an owner. Run it from `governance.yml` as `<plugin>:<skill>/monitors=monitors --manifest target/manifest.json` after `dbt parse`, or with `--gx gx` for a GX file data context.
+Every run-time monitor must reach a person: it needs a deliverable alert destination and a real owner. In CI, have `governance.yml` parse the project itself and point the check at what it wrote:
 
-- **Elementary** (`--manifest`): every test in the `elementary` namespace (`volume_anomalies`, `freshness_anomalies`, `schema_changes` and the rest) needs `channel` and `owner`, read as Elementary reads them: the test's meta over its model's, at the top of `meta` or under `alerts_config`, from `meta` or `config.meta`. A value the test sets wins, so an empty `channel` on the test is not rescued by the model's. A manifest with no Elementary test exits 2.
-- **GX Core** (`--gx`): every checkpoint under `checkpoints/` needs an action that notifies (`slack`, `microsoft`, `email`, `opsgenie` or `api`) with its destination set and `notify_on` of `all` or `failure`, and every suite it validates needs `meta.owner`. A context with no checkpoint exits 2.
-- **Never both.** `--repo` (default `.`) is scanned for Elementary (`elementary-data/elementary` in `packages.yml` or `dependencies.yml`, or `elementary-data` in a Python dependency file) and GX (`great_expectations.yml`, or `great_expectations` in a Python dependency file). Both in one repository exit 1. `dbt_packages/`, `target/`, virtualenvs and comments are not read.
-- **NOT CHECKED is exit 2, never a pass.** A tool configured without its input, neither tool configured, and an input with no monitor in it all exit 2 with `monitors is NOT CHECKED`.
-- `test/monitors-engine.sh` proves it in the self-test on what the tools write: `dbt parse` with the Elementary package (dbt-core 1.12.6, dbt-duckdb 1.11.1, elementary 0.26.1) and GX Core 1.24.1 contexts, each installed from a hash-pinned file under `requirements/`.
+```yaml
+    with:
+      dbt_parse: transform
+      checks: |
+        <plugin>:<skill>/monitors=monitors --repo . --manifest transform/target/manifest.json
+```
+
+For GX, set `gx: true` and pass `--gx <dir>`; the job installs GX Core from `requirements/` and sets `GATES_GX_PYTHON`.
+
+- **Elementary** (`--manifest`, repeatable): every test in the `elementary` namespace (`volume_anomalies`, `freshness_anomalies`, `schema_changes` and the rest) needs `channel` and `owner`, read as Elementary reads them: the test's meta over its model's, at the top of `meta` or under `alerts_config`, from `meta` or `config.meta`. A value the test sets wins, so an empty `channel` on the test is not rescued by the model's. An `alert_suppression_interval` above 168 hours, or one that is not a number, fails. A manifest with no Elementary test is NOT CHECKED.
+- **The manifest must be this commit's.** Its `metadata.project_name` must name a dbt project under `--repo`; every `.sql` there must be in it with the checksum dbt gives it (sha256 of the stripped text); every file it lists must exist; and no project file may be newer than its `generated_at`. Otherwise it is NOT CHECKED: a committed manifest is stale by construction. Every dbt project whose packages pull in Elementary must be covered by a `--manifest`.
+- **GX Core** (`--gx`, repeatable): every checkpoint under `checkpoints/` needs an action that notifies with what delivery needs: `slack` (a webhook, or a token and a channel), `microsoft` (`teams_webhook`), `email` (`smtp_address`, `smtp_port` and `receiver_emails`), `opsgenie` (`api_key`) or `api` (`url`), with `notify_on` of `all` or `failure`. Every suite it validates needs `meta.owner`. Each context is then loaded in GX itself (`--gx-python`, or `GATES_GX_PYTHON`, a Python with `great_expectations`, run `-I` from a temp directory with no token in its environment); one GX refuses to load fails, and one not loaded is NOT CHECKED. Every directory under `--repo` holding `great_expectations.yml` must be covered by a `--gx`.
+- **Placeholders are not owners or channels.** Empty, a bare `#` or `@`, `<...>`, anything containing `example`, and `TODO`, `TBD`, `none`, `n/a`, `changeme`, `owner`, `team` and the like fail.
+- **Never both.** `--repo` (default `.`) is scanned for Elementary (`elementary-data/elementary` in `packages.yml` or `dependencies.yml`, or `elementary-data` in a Python dependency file) and GX (`great_expectations.yml`, or `great_expectations` or `great-expectations` anywhere in a dependency line: the Airflow provider, a `requirements*.txt` or any `.txt` under a `requirements/` folder, `pyproject.toml`, and a `Dockerfile` or `*.dockerfile`). Both in one repository exit 1. `dbt_packages/`, `target/`, virtualenvs and comments are not read.
+- **NOT CHECKED is exit 2, never a pass,** and `governance.yml` records it as `not_run` and fails the job. A problem found elsewhere in the same run still exits 1, with the unchecked inputs listed under it.
+- **Nothing from the repository reaches the log as a command.** Control characters in a path or a name are printed as `\u000a`-style escapes, no output line may start with `::`, and `governance.yml` prints each check between `::stop-commands::` markers.
+- `test/monitors-engine.sh` proves it in the self-test on what the tools write: `dbt parse` with the Elementary package (dbt-core 1.12.6, dbt-duckdb 1.11.1, elementary 0.26.1) and GX Core 1.24.1 contexts, each installed from a hash-pinned file under `requirements/`. Each case the review found (a stale and a foreign manifest, placeholders, an eleven-year suppression, an email action GX refuses, a second project and a second context, GX through the Airflow provider, `requirements/prod.txt` and a `Dockerfile`, and a directory name that would inject a workflow command) is a line there.
 
 ## What is in this repo
 
 - `.github/workflows/`: the gates above, and `self-test`, `fact-scan`, `zizmor` and `release`.
-- `scripts/`: `governance-check.mjs` and `bq-dry-run-check.mjs` (Node 20+, no dependencies), `next-tag.mjs`, `publish-evidence.sh`.
-- `test/`: `governance-check.test.mjs`, `monitors-check.test.mjs` and `bq-dry-run-check.test.mjs` (`node --test test/*.test.mjs`) and `run-blocks.mjs`, which runs each gate's `run:` blocks against `test/fixtures/` in a temp git repo, evaluating each step's `if:` and putting a recording stand-in for `gh` on the PATH (needs `bash`, `git`, `node`, and Python with PyYAML; `datacontract-cli` for the contract cases). A failing fixture carries `expect-log`, so it must fail for its stated reason.
+- `scripts/`: `governance-check.mjs` and `bq-dry-run-check.mjs` (Node 20+, no dependencies), `next-tag.mjs`, `version-check.mjs` (the self-test fails a PR whose `VERSION` is not the tag its `semver:` label will cut), `run-governance-checks.sh` and `dbt-parse.sh` (`governance.yml`'s check and parse steps), `publish-evidence.sh`.
+- `test/`: `governance-check.test.mjs`, `monitors-check.test.mjs`, `governance-run.test.mjs` and `bq-dry-run-check.test.mjs` (`node --test test/*.test.mjs`) and `run-blocks.mjs`, which runs each gate's `run:` blocks against `test/fixtures/` in a temp git repo, evaluating each step's `if:` and putting a recording stand-in for `gh` on the PATH (needs `bash`, `git`, `node`, and Python with PyYAML; `datacontract-cli` for the contract cases). A failing fixture carries `expect-log`, so it must fail for its stated reason.
 
 ## Rules for changes here
 

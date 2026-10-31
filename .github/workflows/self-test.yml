@@ -35,6 +35,11 @@ jobs:
         run: python3 -I -m pip install --disable-pip-version-check --require-hashes --no-deps -r requirements/datacontract-cli-1.2.8.txt
       - name: Script tests
         run: node --test test/*.test.mjs
+      - name: VERSION is the tag this PR will get (next-tag.mjs on its semver label and the current tags)
+        if: github.event_name == 'pull_request'
+        env:
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: node scripts/version-check.mjs
       - name: Gate run blocks against fixtures
         run: node test/run-blocks.mjs
 
@@ -151,7 +156,10 @@ jobs:
     with:
       checks: |
         gates:governance/version=version
-        gates:governance/monitors=monitors --repo test/fixtures/governance/monitors/elementary/project --manifest test/fixtures/governance/monitors/elementary/manifests/pass.json
+        gates:governance/monitors=monitors --repo test/fixtures/governance/monitors/elementary/project --manifest test/fixtures/governance/monitors/elementary/project/target/manifest.json
+        gates:governance/monitors-gx=monitors --repo test/fixtures/governance/monitors/gx/routed --gx test/fixtures/governance/monitors/gx/routed/gx
+      dbt_parse: test/fixtures/governance/monitors/elementary/project
+      gx: true
 
   self-test:
     if: ${{ always() }}
