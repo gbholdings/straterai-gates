@@ -20,15 +20,21 @@
 #         checks: |
 #           governance:data-contract/owner=owner --contracts contracts --manifest target/manifest.json
 #           governance:data-privacy/classification=classification prisma --schema prisma/schema.prisma --base origin/main
-#           governance:data-privacy/deletion-map=deletion-map --prisma prisma/schema.prisma
+#           governance:data-privacy/classification-dbt=classification dbt --manifest transform/target/manifest.json --repo transform --catalog transform/target/catalog.json
+#           governance:data-privacy/deletion-map=deletion-map --prisma prisma/schema.prisma --manifest transform/target/manifest.json --repo transform
 #           governance:data-privacy/retention=retention
+#           governance:data-privacy/exports=exports --module src/export/**/*.ts --prisma prisma/schema.prisma
+#
+# `--schema prisma/schema.prisma` reads the whole multi-file schema: every *.prisma in its folder that has no
+# datasource of its own.
 #
 # Each line of `checks` is `<plugin>:<skill>/<gate>=<subcommand and arguments>`, split on spaces (no
 # quoting) and run as `node governance-check.mjs <arguments>` in the caller's checkout
 # (scripts/run-governance-checks.sh), which is a full clone (fetch-depth: 0), so `--base origin/<branch>`
-# resolves. Exit 0 records pass, exit 2 (NOT CHECKED: a missing input, a base that does not resolve)
-# records not_run, any other exit records fail; anything but pass fails the job. Nothing missing is ever
-# recorded as a pass.
+# resolves. Each check reports its own status, which is what is recorded: pass when it looked at everything
+# and found nothing, fail when it found a problem, not_run when it could not look at some input (a NOT CHECKED
+# line, a missing input, a base that does not resolve), whatever its exit code. Anything but pass fails the
+# job. Nothing missing is ever recorded as a pass.
 #
 # A check that reads a dbt manifest needs one parsed from this commit; a committed manifest is stale by
 # construction and the monitors check refuses it. `dbt_parse` names the dbt project folders to parse here,

@@ -159,13 +159,15 @@ jobs:
       checks: |
         gates:governance/version=version
         gates:data-privacy/classification=classification prisma --schema test/fixtures/governance/privacy/schema.prisma --tiers test/fixtures/governance/privacy/tiers.json --base origin/main
-        gates:data-privacy/classification-dbt=classification dbt --manifest test/fixtures/governance/privacy/dbt/manifest.json --tiers test/fixtures/governance/privacy/tiers.json
-        gates:data-privacy/deletion-map=deletion-map --map test/fixtures/governance/privacy/deletion-map.json --prisma test/fixtures/governance/privacy/schema.prisma --tiers test/fixtures/governance/privacy/tiers.json
+        gates:data-privacy/classification-dbt=classification dbt --manifest test/fixtures/governance/privacy/dbt/project/target/manifest.json --repo test/fixtures/governance/privacy/dbt/project --catalog test/fixtures/governance/privacy/dbt/catalog.json --tiers test/fixtures/governance/privacy/tiers.json
+        gates:data-privacy/deletion-map=deletion-map --map test/fixtures/governance/privacy/deletion-map.json --prisma test/fixtures/governance/privacy/schema.prisma --manifest test/fixtures/governance/privacy/dbt/project/target/manifest.json --repo test/fixtures/governance/privacy/dbt/project --tiers test/fixtures/governance/privacy/tiers.json
         gates:data-privacy/retention=retention --rules test/fixtures/governance/privacy/retention.json --tiers test/fixtures/governance/privacy/tiers.json
         gates:data-privacy/exports=exports --module test/fixtures/governance/privacy/src/export/**/*.ts --prisma test/fixtures/governance/privacy/schema.prisma --tiers test/fixtures/governance/privacy/tiers.json
         gates:governance/monitors=monitors --repo test/fixtures/governance/monitors/elementary/project --manifest test/fixtures/governance/monitors/elementary/project/target/manifest.json
         gates:governance/monitors-gx=monitors --repo test/fixtures/governance/monitors/gx/routed --gx test/fixtures/governance/monitors/gx/routed/gx
-      dbt_parse: test/fixtures/governance/monitors/elementary/project
+      dbt_parse: |
+        test/fixtures/governance/monitors/elementary/project
+        test/fixtures/governance/privacy/dbt/project
       gx: true
 
   # The same workflow on a schema with one untagged new field: it must FAIL (its red sub-check is expected).
@@ -181,7 +183,8 @@ jobs:
 
   # classification prisma --emit-comments on a real Postgres (pgvector, for the fixture's embeddings table):
   # the generated migration applies after the schema's own, every tagged column then carries its tier as
-  # its comment, and a second run writes no migration.
+  # its comment, a second run writes no migration, and a column dropped and added back gets its comment again
+# (test/emit-comments-pg.sh).
   emit-comments:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -206,28 +209,10 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-      - name: The emitted migration applies and sets each tagged column's comment
+      - name: The emitted migration applies and sets each tagged column's comment, and sets it again after a drop and re-add
         env:
           PG: ${{ job.services.postgres.id }}
-        run: |
-          set -euo pipefail
-          psql() { docker exec -i "$PG" psql -U postgres -v ON_ERROR_STOP=1 -X -q "$@"; }
-          psql -tAc "select version()" </dev/null
-          W=$(mktemp -d)
-          cp -R "$F/migrations" "$W/migrations"
-          node scripts/governance-check.mjs classification prisma --schema "$F/schema.prisma" --tiers "$F/tiers.json" --emit-comments "$W/migrations" --date 2026-10-30T12:00:00Z
-          sql=$(ls "$W"/migrations/*_classification_comments/migration.sql 2>/dev/null | head -1)
-          [ -n "$sql" ] && [ -f "$sql" ] || { echo "::error::--emit-comments wrote no migration"; exit 1; }
-          cat "$sql"
-          for m in $(ls "$W/migrations" | sort); do psql < "$W/migrations/$m/migration.sql"; done
-          got=$(psql -tAc "select col_description('people'::regclass, attnum) from pg_attribute where attrelid = 'people'::regclass and attname = 'tax_id'" </dev/null)
-          [ "$got" = "classification:restricted" ] || { echo "::error::people.tax_id has comment '$got'"; exit 1; }
-          n=$(psql -tAc "select count(*) from pg_attribute a join pg_class c on c.oid = a.attrelid where c.relname in ('people','notes','note_embeddings','sessions') and a.attnum > 0 and col_description(c.oid, a.attnum) like 'classification:%'" </dev/null)
-          [ "$n" = 13 ] || { echo "::error::$n columns carry a classification comment, want 13"; exit 1; }
-          before=$(ls "$W/migrations" | wc -l)
-          node scripts/governance-check.mjs classification prisma --schema "$F/schema.prisma" --tiers "$F/tiers.json" --emit-comments "$W/migrations" --date 2026-10-31T12:00:00Z
-          [ "$(ls "$W/migrations" | wc -l)" = "$before" ] || { echo "::error::a second run wrote a migration with no tag changed"; exit 1; }
-          echo "13 columns carry their tier as a Postgres comment; the second run wrote nothing"
+        run: bash test/emit-comments-pg.sh
 
   self-test:
     if: ${{ always() }}
