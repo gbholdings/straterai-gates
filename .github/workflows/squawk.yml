@@ -15,7 +15,7 @@
 #     cancel-in-progress: true
 #   jobs:
 #     squawk:
-#       uses: gbholdings/straterai-gates/.github/workflows/squawk.yml@<40-char sha> # v1.4.0
+#       uses: gbholdings/straterai-gates/.github/workflows/squawk.yml@<40-char sha> # the release tag that ships this guard
 #
 # The review trigger makes an approval re-run the check, and the concurrency group lets only the latest run per
 # pull request report (a review submitted and then dismissed starts two runs on the same commit). The caller
