@@ -85,6 +85,7 @@ jobs:
   call-squawk:
     permissions:
       contents: read
+      pull-requests: read # the guard reads the PR's reviews; a caller cannot grant less than the called job declares
     uses: ./.github/workflows/squawk.yml
     with:
       lint_all: true

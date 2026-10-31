@@ -12,7 +12,8 @@
 // A case may carry:
 //   expect          the job result: 0 passes, anything else fails (any nonzero step)
 //   inputs.json     input overrides
-//   event.json      { "event_name": ..., "pr_number": ... } (default pull_request, 7)
+//   event.json      { "event_name": ..., "pr_number": ... } (default pull_request, 7); the squawk cases use
+//                   { "number", "author", "repository" }, the pull request the review event carries
 //   links           lines of "<path> <target>" committed as symlinks in head
 //   expect-output   lines that must appear in some step's GITHUB_OUTPUT
 //   expect-log      lines that must each appear in the log, so a failing case fails for its stated reason
@@ -20,6 +21,10 @@
 //   secrets.json    secrets the workflow sees (default none)
 //   expect-evidence lines that must each appear in the datacontract evidence file
 //   gh-responses    lines of "<argv substring>\t<stdout>" the fake `gh` answers with (first match wins)
+//   reviews.json    what `gh api graphql` prints for the squawk guard's reviews query ("HEAD" becomes the head SHA)
+//   head-rename.json  [{ from, to }] as base-rename.json, for head files
+//   reject-commands lines no workflow command the runner would act on may contain: each step's stdout and stderr
+//                   are read as the runner reads them, honouring ::stop-commands::<token> until ::<token>::
 //
 // Expressions are resolved the narrow way these workflows use them; anything else throws.
 import fs from "node:fs";
@@ -37,8 +42,11 @@ const GATES = [
     name: "squawk",
     workflow: "squawk.yml",
     fixtures: "squawk",
-    steps: ["Lint changed migrations"],
+    steps: ["Install the SQL parser", "Install squawk", "Destructive change needs an approving review", "Lint changed migrations"],
     inputs: { config_path: fwd(path.join(FIX, "squawk", "squawk.toml")) },
+    // The guard reads the PR's reviews with one read-only `gh api graphql` query on every PR; that read is
+    // not a gh call the "no gh calls" rule is about (a notice on a passing PR).
+    ghReads: true,
   },
   {
     name: "datacontract",
@@ -207,13 +215,16 @@ function makeLookup(inputs, ctx) {
       case "github":
         if (parts[1] === "base_ref") return "main";
         if (parts[1] === "event_name") return ctx.event.event_name;
-        if (parts[1] === "repository") return "example-org/gates-under-test";
+        if (parts[1] === "repository") return ctx.event.repository ?? "example-org/gates-under-test";
         if (parts[1] === "workspace") return fwd(ctx.repo);
         if (parts[1] === "server_url") return "https://github.example.test";
         if (parts[1] === "run_id") return "4242";
         if (parts[1] === "sha") return "fake-head-sha";
         if (parts[1] === "token") return "fake-token";
-        if (parts[1] === "event" && parts[2] === "pull_request" && parts[3] === "number") return String(ctx.event.pr_number);
+        if (parts[1] === "event" && parts[2] === "pull_request" && parts[3] === "number") return String(ctx.event.number ?? ctx.event.pr_number);
+        if (parts[1] === "event" && parts[2] === "pull_request" && parts[3] === "base" && parts[4] === "ref") return "main";
+        if (parts[1] === "event" && parts[2] === "pull_request" && parts[3] === "head" && parts[4] === "sha") return ctx.head;
+        if (parts[1] === "event" && parts[2] === "pull_request" && parts[3] === "user" && parts[4] === "login") return ctx.event.author ?? "";
         if (parts[1] === "event") return "";
         return "";
       case "env":
@@ -275,6 +286,8 @@ function buildRepo(caseDir, work) {
   git("checkout", "-q", "-b", "pr");
   for (const e of fs.readdirSync(repo)) if (e !== ".git") fs.rmSync(path.join(repo, e), { recursive: true, force: true });
   copyTree(path.join(caseDir, "head"), repo);
+  const headRenames = path.join(caseDir, "head-rename.json");
+  if (fs.existsSync(headRenames)) for (const { from, to } of JSON.parse(fs.readFileSync(headRenames, "utf8"))) fs.renameSync(path.join(repo, from), path.join(repo, to));
   git("add", "-A");
   const links = path.join(caseDir, "links");
   if (fs.existsSync(links)) {
@@ -290,11 +303,16 @@ function buildRepo(caseDir, work) {
 
 // A stand-in for the GitHub CLI: logs its argv (and the file behind any -F body=@file) and prints the
 // first canned response whose key is a substring of its argv, or nothing.
-function fakeGh(work, caseDir) {
+// A case's reviews.json is what `gh api graphql` prints for the squawk guard's reviews query ("HEAD" in it
+// becomes the head commit's SHA).
+function fakeGh(work, caseDir, head) {
   const bin = path.join(work, "bin");
   fs.mkdirSync(bin);
   const log = path.join(work, "gh.log");
   const responses = path.join(caseDir, "gh-responses");
+  const reviewsIn = path.join(caseDir, "reviews.json");
+  const reviews = path.join(work, "reviews.json");
+  if (fs.existsSync(reviewsIn)) fs.writeFileSync(reviews, fs.readFileSync(reviewsIn, "utf8").replaceAll("HEAD", head));
   const script = `#!/usr/bin/env node
 const fs = require("fs");
 const argv = process.argv.slice(2);
@@ -302,6 +320,8 @@ let out = "gh " + argv.join(" ") + "\\n";
 for (const a of argv) { const m = /^body=@(.*)$/.exec(a); if (m) out += fs.readFileSync(m[1], "utf8") + "\\n"; }
 const bf = argv.indexOf("--body-file"); if (bf >= 0) out += fs.readFileSync(argv[bf + 1], "utf8") + "\\n";
 fs.appendFileSync(${JSON.stringify(fwd(log))}, out);
+const rv = ${JSON.stringify(fwd(reviews))};
+if (argv[0] === "api" && argv[1] === "graphql" && argv.some((a) => a.includes("reviews(")) && fs.existsSync(rv)) { process.stdout.write(fs.readFileSync(rv, "utf8")); process.exit(0); }
 const r = ${JSON.stringify(fwd(responses))};
 if (fs.existsSync(r)) {
   for (const line of fs.readFileSync(r, "utf8").split("\\n").filter(Boolean)) {
@@ -313,6 +333,24 @@ if (fs.existsSync(r)) {
   fs.writeFileSync(path.join(bin, "gh"), script, { mode: 0o755 });
   fs.writeFileSync(log, "");
   return { bin, log };
+}
+
+// The lines of a step's output the runner would act on as workflow commands. A line that starts with :: (after
+// leading spaces) is a command, unless ::stop-commands::<token> came first and ::<token>:: has not ended it.
+function workflowCommands(text) {
+  const acted = [];
+  let stop = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const l = raw.trimStart();
+    if (stop !== null) {
+      if (l === `::${stop}::`) stop = null;
+      continue;
+    }
+    const m = /^::stop-commands::(.+)$/.exec(l);
+    if (m) stop = m[1];
+    else if (l.startsWith("::")) acted.push(l);
+  }
+  return acted;
 }
 
 function lines(file) {
@@ -328,7 +366,8 @@ function runCase(gate, wf, caseName) {
   const event = { event_name: "pull_request", pr_number: 7, ...(fs.existsSync(eventFile) ? JSON.parse(fs.readFileSync(eventFile, "utf8")) : {}) };
   const work = fs.mkdtempSync(path.join(os.tmpdir(), "blocks-"));
   const repo = buildRepo(caseDir, work);
-  const gh = fakeGh(work, caseDir);
+  const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).stdout.trim();
+  const gh = fakeGh(work, caseDir, head);
 
   const secretsFile = path.join(caseDir, "secrets.json");
   const secrets = fs.existsSync(secretsFile) ? JSON.parse(fs.readFileSync(secretsFile, "utf8")) : {};
@@ -337,6 +376,7 @@ function runCase(gate, wf, caseName) {
   const needs = {};
   let code = 0;
   let log = "";
+  const commands = [];
   let outputs = "";
   let first = true;
   let firstTemp = null;
@@ -351,7 +391,7 @@ function runCase(gate, wf, caseName) {
     else if (gate.handoff && fs.existsSync(path.join(firstTemp, gate.handoff))) fs.cpSync(path.join(firstTemp, gate.handoff), path.join(runnerTemp, gate.handoff), { recursive: true });
     if (gate.gates) fs.cpSync(path.join(ROOT, "scripts"), path.join(workspace, ".gates", "scripts"), { recursive: true });
     if (gate.gates && fs.existsSync(path.join(ROOT, "requirements"))) fs.cpSync(path.join(ROOT, "requirements"), path.join(workspace, ".gates", "requirements"), { recursive: true });
-    const ctx = { steps: {}, event, repo: workspace, runnerTemp, env: {}, secrets, needs };
+    const ctx = { steps: {}, event, head, repo: workspace, runnerTemp, env: {}, secrets, needs };
     let failed = false;
     const needFailed = () => job.needs.some((n) => needs[n]?.result === "failure");
     ctx.fns = { success: () => !failed && !needFailed(), failure: () => failed || needFailed(), always: () => true, cancelled: () => false };
@@ -407,6 +447,7 @@ function runCase(gate, wf, caseName) {
       const shell = (step.shell ?? job.shell ?? "bash -e -o pipefail {0}").trim().split(/\s+/).map((a) => (a === "{0}" ? fwd(script) : a));
       const r = spawnSync(shell[0], shell.slice(1), { cwd: workspace, env: { ...process.env, ...env }, encoding: "utf8", timeout: 300000 });
       log += `--- ${step.name} (exit ${r.status})\n${r.stdout}${r.stderr}`;
+      commands.push(...workflowCommands(r.stdout ?? ""), ...workflowCommands(r.stderr ?? ""));
       const stepOutputs = {};
       for (const l of lines(out)) {
         const eq = l.indexOf("=");
@@ -441,7 +482,10 @@ function runCase(gate, wf, caseName) {
   };
   want("expect-output", outputs.split("\n").map((l) => `${l}\n`).join(""), "a step's GITHUB_OUTPUT");
   want("expect-log", log, "the log");
-  const ghLog = fs.readFileSync(gh.log, "utf8");
+  const ghLog = fs.readFileSync(gh.log, "utf8")
+    .split(/(?=^gh )/m)
+    .filter((c) => !(gate.ghReads && /^gh api graphql --paginate -f query=query\(/.test(c) && /reviews\(/.test(c)))
+    .join("");
   want("expect-gh", ghLog, "the gh calls");
   // reject-log and reject-gh: lines that must appear nowhere (a planted script's marker, a token value).
   const reject = (file, haystack, what) => {
@@ -453,6 +497,7 @@ function runCase(gate, wf, caseName) {
   };
   reject("reject-log", log + ghLog, "the log or the gh calls");
   reject("reject-gh", ghLog, "the gh calls");
+  reject("reject-commands", commands.join("\n"), "the workflow commands the runner acts on");
   // A case that expects no gh call gets none: a notice on a passing PR is a bug.
   if (!fs.existsSync(path.join(caseDir, "expect-gh")) && ghLog) {
     expectOk = false;

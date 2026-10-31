@@ -1,0 +1,2 @@
+guard-drop-index
+pg_stat_user_indexes.idx_scan
