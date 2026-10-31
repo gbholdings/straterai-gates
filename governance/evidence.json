@@ -14,5 +14,13 @@
     "run_link": "https://github.com/gbholdings/straterai-gates/actions/runs/41150238404",
     "commit": "a839b4cfa5234796597a22a3c87af076ea302deb",
     "detail": "exit 0"
+  },
+  {
+    "check": "gates:governance/version",
+    "date": "2026-10-31T02:16:57.780Z",
+    "result": "pass",
+    "run_link": "https://github.com/gbholdings/straterai-gates/actions/runs/41159272060",
+    "commit": "53945e3427a2e959a7d39455a29e81157b6951f0",
+    "detail": "exit 0"
   }
 ]
