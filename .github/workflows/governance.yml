@@ -15,7 +15,7 @@
 #     contents: write
 #   jobs:
 #     governance:
-#       uses: gbholdings/straterai-gates/.github/workflows/governance.yml@<40-char sha> # v1.3.0
+#       uses: gbholdings/straterai-gates/.github/workflows/governance.yml@<40-char sha> # v1.4.0
 #       with:
 #         checks: |
 #           governance:data-contract/owner=owner --contracts contracts --manifest target/manifest.json
@@ -24,10 +24,24 @@
 #           governance:data-privacy/retention=retention
 #
 # Each line of `checks` is `<plugin>:<skill>/<gate>=<subcommand and arguments>`, split on spaces (no
-# quoting) and run as `node governance-check.mjs <arguments>` in the caller's checkout, which is a full
-# clone (fetch-depth: 0), so `--base origin/<branch>` resolves. Exit 0 records pass; any other exit
-# records fail and fails the job. A line that names a missing input exits 2, so it fails; nothing missing
-# is ever recorded as a pass.
+# quoting) and run as `node governance-check.mjs <arguments>` in the caller's checkout
+# (scripts/run-governance-checks.sh), which is a full clone (fetch-depth: 0), so `--base origin/<branch>`
+# resolves. Exit 0 records pass, exit 2 (NOT CHECKED: a missing input, a base that does not resolve)
+# records not_run, any other exit records fail; anything but pass fails the job. Nothing missing is ever
+# recorded as a pass.
+#
+# A check that reads a dbt manifest needs one parsed from this commit; a committed manifest is stale by
+# construction and the monitors check refuses it. `dbt_parse` names the dbt project folders to parse here,
+# one per line: dbt-duckdb from the gates' hash-pinned lock, a throwaway duckdb profile under the project's
+# profile name (parse opens no connection), `dbt deps`, then `dbt parse`, which writes
+# <folder>/target/manifest.json. A project whose parse needs its own adapter fails to parse; its check then
+# finds no manifest and records not_run. `gx: true` installs GX Core from the gates' lock and points
+# GATES_GX_PYTHON at it, so the monitors check can load each GX context in GX itself:
+#
+#       with:
+#         dbt_parse: transform
+#         checks: |
+#           governance:data-quality/monitors=monitors --repo . --manifest transform/target/manifest.json
 #
 # Isolation. The `governance` job reads the caller's tree (on a pull request, the PR's) and holds only
 # `contents: read`, no secret and no token in its environment. Every run step starts bash with BASH_ENV
@@ -56,6 +70,14 @@ on:
         description: "Commit of straterai-gates to run the script from. Default: the called workflow's own commit (job.workflow_sha)."
         type: string
         default: ""
+      dbt_parse:
+        description: "dbt project folders to `dbt parse` before the checks, one per line. Empty: no dbt."
+        type: string
+        default: ""
+      gx:
+        description: "Install GX Core and set GATES_GX_PYTHON, so the monitors check loads GX contexts in GX."
+        type: boolean
+        default: false
 permissions: {}
 jobs:
   governance:
@@ -73,6 +95,10 @@ jobs:
       GATES_SHA: ${{ inputs.gates_sha }}
       COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
       RUN_LINK: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      DBT_PARSE: ${{ inputs.dbt_parse }}
+      DO_NOT_TRACK: "1"
+      DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+      GX_ANALYTICS_ENABLED: "false"
     steps:
       - name: Check the inputs
         run: |
@@ -90,32 +116,38 @@ jobs:
           ref: ${{ inputs.gates_sha || job.workflow_sha }}
           path: .gates
           persist-credentials: false
+      - if: ${{ inputs.dbt_parse != '' || inputs.gx }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: dbt-duckdb and GX Core from the gates' hash-pinned locks
+        if: ${{ inputs.dbt_parse != '' || inputs.gx }}
+        working-directory: ${{ runner.temp }}
+        env:
+          WANT_GX: ${{ inputs.gx }}
+          REQS: ${{ github.workspace }}/.gates/requirements
+        run: |
+          set -euo pipefail
+          if [ -n "${DBT_PARSE//[[:space:]]/}" ]; then
+            python3 -I -m venv gates-dbt
+            env -u BASH_ENV -u ENV gates-dbt/bin/python -I -m pip install --disable-pip-version-check --quiet --require-hashes -r "$REQS/dbt-duckdb-1.11.1.txt"
+          fi
+          if [ "$WANT_GX" = true ]; then
+            python3 -I -m venv gates-gx
+            env -u BASH_ENV -u ENV gates-gx/bin/python -I -m pip install --disable-pip-version-check --quiet --require-hashes -r "$REQS/great-expectations-1.24.1.txt"
+            echo "GATES_GX_PYTHON=$RUNNER_TEMP/gates-gx/bin/python" >> "$GITHUB_ENV"
+          fi
+      - name: dbt parse each dbt_parse folder
+        if: ${{ inputs.dbt_parse != '' }}
+        env:
+          DBT: ${{ runner.temp }}/gates-dbt/bin/dbt
+        run: env -u BASH_ENV -u ENV bash .gates/scripts/dbt-parse.sh
       - name: Run checks and record evidence
         id: run
-        run: |
-          set -uo pipefail
-          GC=".gates/scripts/governance-check.mjs"
-          [ -f "$GC" ] || { echo "::error::$GC is missing from the gates checkout"; exit 1; }
-          export GOVERNANCE_EVIDENCE_FILE="$RUNNER_TEMP/governance-entries/evidence.json"
-          failed=0
-          ran=0
-          while IFS= read -r line; do
-            line="${line%$'\r'}"
-            [ -z "${line// /}" ] && continue
-            case "$line" in \#*) continue ;; esac
-            case "$line" in *=*) ;; *) echo "::error::bad checks line (want name=args): $(printf '%q' "$line")"; failed=1; continue ;; esac
-            name="${line%%=*}"
-            read -r -a args <<< "${line#*=}"
-            ran=1
-            echo "::group::$(printf '%q' "$name")"
-            if node "$GC" "${args[@]}"; then result=pass; detail="exit 0"; else rc=$?; result=fail; detail="exit $rc"; failed=1; fi
-            echo "::endgroup::"
-            echo "$name: $result ($detail)"
-            node "$GC" evidence append --check "$name" --result "$result" --run-link "$RUN_LINK" --commit "$COMMIT" --detail "$detail" || exit $?
-            echo "recorded=true" >> "$GITHUB_OUTPUT"
-          done <<< "$CHECKS"
-          [ "$ran" = 1 ] || echo "::notice::no checks configured; nothing recorded"
-          exit $failed
+        if: ${{ !cancelled() }} # after a failed parse too: the check that wanted its manifest records not_run
+        env:
+          GOVERNANCE_EVIDENCE_FILE: ${{ runner.temp }}/governance-entries/evidence.json
+        run: env -u BASH_ENV -u ENV bash .gates/scripts/run-governance-checks.sh
       - name: Upload the entries
         if: ${{ !cancelled() && steps.run.outputs.recorded == 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

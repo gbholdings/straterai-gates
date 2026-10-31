@@ -1,0 +1,6 @@
+monitors_fixture:
+  target: ci
+  outputs:
+    ci:
+      type: duckdb
+      path: "{{ env_var('MON_DUCKDB_PATH', 'mon.duckdb') }}"

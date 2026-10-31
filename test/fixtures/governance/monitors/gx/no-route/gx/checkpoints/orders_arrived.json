@@ -1,0 +1,12 @@
+{
+  "actions": [],
+  "id": "00000000-0000-0000-0000-000000000000",
+  "name": "orders_arrived",
+  "result_format": "SUMMARY",
+  "validation_definitions": [
+    {
+      "id": "00000000-0000-0000-0000-000000000000",
+      "name": "orders_arrived"
+    }
+  ]
+}

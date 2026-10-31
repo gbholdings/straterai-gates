@@ -1,0 +1,321 @@
+{
+ "metadata": {
+  "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+  "dbt_version": "1.12.6",
+  "generated_at": "2026-10-31T00:00:00.000000Z",
+  "project_name": "monitors_fixture"
+ },
+ "nodes": {
+  "model.monitors_fixture.customers": {
+   "access": "protected",
+   "alias": "customers",
+   "build_path": null,
+   "checksum": {
+    "checksum": "f80891b341cd40d122e704b4fea663e814e8aa98f36eda7acb10c007a2ec9b6b",
+    "name": "sha256"
+   },
+   "columns": {},
+   "compiled_path": null,
+   "config": {
+    "access": "protected",
+    "alias": null,
+    "batch_size": null,
+    "begin": null,
+    "column_types": {},
+    "concurrent_batches": null,
+    "contract": {
+     "alias_types": true,
+     "enforced": false
+    },
+    "database": null,
+    "docs": {
+     "node_color": null,
+     "show": true
+    },
+    "enabled": true,
+    "event_time": null,
+    "freshness": null,
+    "full_refresh": null,
+    "grants": {},
+    "group": null,
+    "incremental_strategy": null,
+    "latest_version_pointer": {
+     "alias": null,
+     "enabled": null
+    },
+    "lookback": 1,
+    "materialized": "view",
+    "meta": {
+     "owner": "@data-platform"
+    },
+    "on_configuration_change": "apply",
+    "on_error": null,
+    "on_schema_change": "ignore",
+    "packages": [],
+    "persist_docs": {},
+    "post-hook": [],
+    "pre-hook": [],
+    "quoting": {},
+    "schema": null,
+    "static_analysis": null,
+    "tags": [],
+    "unique_key": null
+   },
+   "constraints": [],
+   "contract": {
+    "alias_types": true,
+    "checksum": null,
+    "enforced": false
+   },
+   "created_at": 1793420081.2152047,
+   "database": "m",
+   "depends_on": {
+    "macros": [],
+    "nodes": []
+   },
+   "deprecation_date": null,
+   "description": "",
+   "doc_blocks": [],
+   "docs": {
+    "node_color": null,
+    "show": true
+   },
+   "fqn": [
+    "monitors_fixture",
+    "customers"
+   ],
+   "functions": [],
+   "group": null,
+   "language": "sql",
+   "latest_version": null,
+   "meta": {
+    "owner": "@data-platform"
+   },
+   "metrics": [],
+   "name": "customers",
+   "original_file_path": "models/customers.sql",
+   "package_name": "monitors_fixture",
+   "patch_path": "monitors_fixture://models/schema.yml",
+   "path": "customers.sql",
+   "primary_key": [],
+   "raw_code": "select 1 as customer_id, current_timestamp as updated_at",
+   "refs": [],
+   "relation_name": "\"m\".\"main\".\"customers\"",
+   "resource_type": "model",
+   "schema": "main",
+   "sources": [],
+   "tags": [],
+   "time_spine": null,
+   "unique_id": "model.monitors_fixture.customers",
+   "unrendered_config": {
+    "meta": {
+     "owner": "@data-platform"
+    }
+   },
+   "version": null
+  },
+  "model.monitors_fixture.orders": {
+   "access": "protected",
+   "alias": "orders",
+   "build_path": null,
+   "checksum": {
+    "checksum": "d74322e08f8f1c2f119d23fcc4b4508432c62b139dd3562725dab7aae55f2edc",
+    "name": "sha256"
+   },
+   "columns": {},
+   "compiled_path": null,
+   "config": {
+    "access": "protected",
+    "alias": null,
+    "batch_size": null,
+    "begin": null,
+    "column_types": {},
+    "concurrent_batches": null,
+    "contract": {
+     "alias_types": true,
+     "enforced": false
+    },
+    "database": null,
+    "docs": {
+     "node_color": null,
+     "show": true
+    },
+    "enabled": true,
+    "event_time": null,
+    "freshness": null,
+    "full_refresh": null,
+    "grants": {},
+    "group": null,
+    "incremental_strategy": null,
+    "latest_version_pointer": {
+     "alias": null,
+     "enabled": null
+    },
+    "lookback": 1,
+    "materialized": "view",
+    "meta": {
+     "channel": "data-alerts",
+     "owner": "@data-platform"
+    },
+    "on_configuration_change": "apply",
+    "on_error": null,
+    "on_schema_change": "ignore",
+    "packages": [],
+    "persist_docs": {},
+    "post-hook": [],
+    "pre-hook": [],
+    "quoting": {},
+    "schema": null,
+    "static_analysis": null,
+    "tags": [],
+    "unique_key": null
+   },
+   "constraints": [],
+   "contract": {
+    "alias_types": true,
+    "checksum": null,
+    "enforced": false
+   },
+   "created_at": 1793420081.2100394,
+   "database": "m",
+   "depends_on": {
+    "macros": [],
+    "nodes": []
+   },
+   "deprecation_date": null,
+   "description": "",
+   "doc_blocks": [],
+   "docs": {
+    "node_color": null,
+    "show": true
+   },
+   "fqn": [
+    "monitors_fixture",
+    "orders"
+   ],
+   "functions": [],
+   "group": null,
+   "language": "sql",
+   "latest_version": null,
+   "meta": {
+    "channel": "data-alerts",
+    "owner": "@data-platform"
+   },
+   "metrics": [],
+   "name": "orders",
+   "original_file_path": "models/orders.sql",
+   "package_name": "monitors_fixture",
+   "patch_path": "monitors_fixture://models/schema.yml",
+   "path": "orders.sql",
+   "primary_key": [],
+   "raw_code": "select 1 as order_id, current_timestamp as updated_at",
+   "refs": [],
+   "relation_name": "\"m\".\"main\".\"orders\"",
+   "resource_type": "model",
+   "schema": "main",
+   "sources": [],
+   "tags": [],
+   "time_spine": null,
+   "unique_id": "model.monitors_fixture.orders",
+   "unrendered_config": {
+    "meta": {
+     "channel": "data-alerts",
+     "owner": "@data-platform"
+    }
+   },
+   "version": null
+  },
+  "test.monitors_fixture.not_null_orders_order_id.cf6c17daed": {
+   "alias": "not_null_orders_order_id",
+   "attached_node": "model.monitors_fixture.orders",
+   "build_path": null,
+   "checksum": {
+    "checksum": "",
+    "name": "none"
+   },
+   "column_name": null,
+   "columns": {},
+   "compiled_path": null,
+   "config": {
+    "alias": null,
+    "database": null,
+    "enabled": true,
+    "error_if": "!= 0",
+    "fail_calc": "count(*)",
+    "group": null,
+    "limit": null,
+    "materialized": "test",
+    "meta": {},
+    "schema": "dbt_test__audit",
+    "severity": "ERROR",
+    "sql_header": null,
+    "static_analysis": null,
+    "store_failures": null,
+    "store_failures_as": null,
+    "tags": [],
+    "warn_if": "!= 0",
+    "where": null
+   },
+   "contract": {
+    "alias_types": true,
+    "checksum": null,
+    "enforced": false
+   },
+   "created_at": 1793420081.4132023,
+   "database": "m",
+   "depends_on": {
+    "macros": [
+     "macro.dbt.test_not_null"
+    ],
+    "nodes": [
+     "model.monitors_fixture.orders"
+    ]
+   },
+   "description": "",
+   "doc_blocks": [],
+   "docs": {
+    "node_color": null,
+    "show": true
+   },
+   "file_key_name": "models.orders",
+   "fqn": [
+    "monitors_fixture",
+    "not_null_orders_order_id"
+   ],
+   "functions": [],
+   "group": null,
+   "language": "sql",
+   "meta": {},
+   "metrics": [],
+   "name": "not_null_orders_order_id",
+   "original_file_path": "models/schema.yml",
+   "package_name": "monitors_fixture",
+   "patch_path": null,
+   "path": "not_null_orders_order_id.sql",
+   "raw_code": "{{ test_not_null(**_dbt_generic_test_kwargs) }}",
+   "refs": [
+    {
+     "name": "orders",
+     "package": null,
+     "version": null
+    }
+   ],
+   "relation_name": null,
+   "resource_type": "test",
+   "schema": "main_dbt_test__audit",
+   "sources": [],
+   "tags": [],
+   "test_metadata": {
+    "kwargs": {
+     "column_name": "order_id",
+     "model": "{{ get_where_subquery(ref('orders')) }}"
+    },
+    "name": "not_null",
+    "namespace": null
+   },
+   "unique_id": "test.monitors_fixture.not_null_orders_order_id.cf6c17daed",
+   "unrendered_config": {}
+  }
+ },
+ "sources": {}
+}
