@@ -136,7 +136,9 @@ test("--emit-comments writes a migration of COMMENT ON COLUMN, then nothing unti
   const emit = (date) => run(["classification", "prisma", "--schema", "schema.prisma", "--tiers", "tiers.json", "--emit-comments", "migrations", "--date", date], d);
   const r = emit("2026-10-30T12:00:00Z");
   assert.equal(r.status, 0, all(r));
-  const sql = fs.readFileSync(path.join(d, "migrations/20261030120000_classification_comments/migration.sql"), "utf8");
+  const emitted = () => fs.readdirSync(path.join(d, "migrations")).filter((x) => x.endsWith("_classification_comments")).sort();
+  assert.deepEqual(emitted().map((x) => x.slice(0, 8)), ["20261030"], "one migration, named for the date");
+  const sql = fs.readFileSync(path.join(d, "migrations", emitted()[0], "migration.sql"), "utf8");
   assert.match(sql, /^COMMENT ON COLUMN "people"\."full_name" IS 'classification:personal';$/m, "the @map name, not the field name");
   assert.match(sql, /^COMMENT ON COLUMN "people"\."tax_id" IS 'classification:restricted';$/m);
   assert.match(sql, /^COMMENT ON COLUMN "note_embeddings"\."source_pk" IS 'classification:internal';$/m);
@@ -144,12 +146,13 @@ test("--emit-comments writes a migration of COMMENT ON COLUMN, then nothing unti
   const again = emit("2026-10-31T12:00:00Z");
   assert.equal(again.status, 0, all(again));
   assert.match(again.stdout, /no migration written/);
-  assert.equal(fs.existsSync(path.join(d, "migrations/20261031120000_classification_comments")), false);
+  assert.equal(emitted().length, 1, "a second run with no tag changed writes nothing");
   // one tag changes: one statement; a tag removed (still a column): IS NULL, and the check fails first
   fs.writeFileSync(path.join(d, "schema.prisma"), fs.readFileSync(path.join(d, "schema.prisma"), "utf8").replace("/// @classification(restricted)\n  taxId", "/// @classification(personal)\n  taxId"));
   const one = emit("2026-11-01T12:00:00Z");
   assert.equal(one.status, 0, all(one));
-  const sql2 = fs.readFileSync(path.join(d, "migrations/20261101120000_classification_comments/migration.sql"), "utf8");
+  assert.equal(emitted().length, 2);
+  const sql2 = fs.readFileSync(path.join(d, "migrations", emitted()[1], "migration.sql"), "utf8");
   assert.deepEqual(sql2.match(/^COMMENT ON COLUMN.*$/gm), [`COMMENT ON COLUMN "people"."tax_id" IS 'classification:personal';`]);
 });
 

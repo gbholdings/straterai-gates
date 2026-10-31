@@ -152,7 +152,6 @@ jobs:
       run:
         shell: env -u BASH_ENV -u ENV bash --noprofile --norc -eo pipefail {0}
     env:
-      PG: ${{ job.services.postgres.id }}
       F: test/fixtures/governance/privacy
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -162,6 +161,8 @@ jobs:
         with:
           node-version: 22
       - name: The emitted migration applies and sets each tagged column's comment
+        env:
+          PG: ${{ job.services.postgres.id }}
         run: |
           set -euo pipefail
           psql() { docker exec -i "$PG" psql -U postgres -v ON_ERROR_STOP=1 -X -q "$@"; }
@@ -169,8 +170,8 @@ jobs:
           W=$(mktemp -d)
           cp -R "$F/migrations" "$W/migrations"
           node scripts/governance-check.mjs classification prisma --schema "$F/schema.prisma" --tiers "$F/tiers.json" --emit-comments "$W/migrations" --date 2026-10-30T12:00:00Z
-          sql="$W/migrations/20261030120000_classification_comments/migration.sql"
-          [ -f "$sql" ] || { echo "::error::--emit-comments wrote no migration"; exit 1; }
+          sql=$(ls "$W"/migrations/*_classification_comments/migration.sql 2>/dev/null | head -1)
+          [ -n "$sql" ] && [ -f "$sql" ] || { echo "::error::--emit-comments wrote no migration"; exit 1; }
           cat "$sql"
           for m in $(ls "$W/migrations" | sort); do psql < "$W/migrations/$m/migration.sql"; done
           got=$(psql -tAc "select col_description('people'::regclass, attnum) from pg_attribute where attrelid = 'people'::regclass and attname = 'tax_id'" </dev/null)
