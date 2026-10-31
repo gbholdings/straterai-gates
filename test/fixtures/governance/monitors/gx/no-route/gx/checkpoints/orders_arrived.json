@@ -1,11 +1,11 @@
 {
   "actions": [],
-  "id": "ea04c1ac-fcaa-4bd4-9af5-21e17e61fdb5",
+  "id": "00000000-0000-0000-0000-000000000000",
   "name": "orders_arrived",
   "result_format": "SUMMARY",
   "validation_definitions": [
     {
-      "id": "da1b1e52-97a2-482e-a0f4-8b2ab108ad95",
+      "id": "00000000-0000-0000-0000-000000000000",
       "name": "orders_arrived"
     }
   ]

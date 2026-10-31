@@ -83,15 +83,15 @@ data_docs_sites:
 fluent_datasources:
   orders_source:
     type: pandas
-    id: dd4047f1-c91e-45ec-975e-936d49ed27f4
+    id: 00000000-0000-0000-0000-000000000000
     assets:
       orders:
         type: dataframe
-        id: 8a86e278-d72b-46e5-a155-6b0f1c2a392f
+        id: 00000000-0000-0000-0000-000000000000
         batch_metadata: {}
         batch_definitions:
           all:
-            id: 735b3aea-08b1-4d73-908a-22830c9b5684
+            id: 00000000-0000-0000-0000-000000000000
             partitioner:
 analytics_enabled:
-data_context_id: 81302510-6ff0-44ad-b41d-2c58f3543a58
+data_context_id: 00000000-0000-0000-0000-000000000000

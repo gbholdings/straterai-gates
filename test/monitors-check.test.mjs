@@ -1,6 +1,7 @@
 // governance-check monitors. The manifests are real `dbt parse` output (dbt-core 1.12.6, dbt-duckdb 1.11.1,
 // the elementary package 0.26.1) of test/fixtures/governance/monitors/elementary, trimmed to the project's
-// own nodes; the GX stores were written by GX Core 1.24.1 through gx/make_context.py. test/monitors-engine.sh
+// own nodes; the GX stores were written by GX Core 1.24.1 through gx/make_context.py, with the UUIDs GX
+// generates set to zero (the check matches by name, and the public fact scan rejects a GUID). test/monitors-engine.sh
 // regenerates both with the real tools in the self-test and runs the same cases on them.
 import { test } from "node:test";
 import assert from "node:assert/strict";

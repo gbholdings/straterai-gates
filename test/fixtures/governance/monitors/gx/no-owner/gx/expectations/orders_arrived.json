@@ -1,7 +1,7 @@
 {
   "expectations": [
     {
-      "id": "3d4c2beb-54b3-4efe-b60f-bb70ca5865b2",
+      "id": "00000000-0000-0000-0000-000000000000",
       "kwargs": {
         "min_value": 1
       },
@@ -10,7 +10,7 @@
       "type": "expect_table_row_count_to_be_between"
     }
   ],
-  "id": "33bed5a4-ba4d-4b08-9a5b-b87ec9eead26",
+  "id": "00000000-0000-0000-0000-000000000000",
   "meta": {
     "great_expectations_version": "1.24.1"
   },

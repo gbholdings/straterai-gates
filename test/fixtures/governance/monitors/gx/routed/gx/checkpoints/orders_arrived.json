@@ -15,12 +15,12 @@
       "type": "slack"
     }
   ],
-  "id": "98bf8acd-1eb8-46e7-a915-acf0a4706134",
+  "id": "00000000-0000-0000-0000-000000000000",
   "name": "orders_arrived",
   "result_format": "SUMMARY",
   "validation_definitions": [
     {
-      "id": "47b6d02a-4138-49a7-ba86-1ee517000a57",
+      "id": "00000000-0000-0000-0000-000000000000",
       "name": "orders_arrived"
     }
   ]

@@ -1,7 +1,7 @@
 {
   "expectations": [
     {
-      "id": "1d1688a7-2742-4443-8b84-5b97c03867db",
+      "id": "00000000-0000-0000-0000-000000000000",
       "kwargs": {
         "min_value": 1
       },
@@ -10,7 +10,7 @@
       "type": "expect_table_row_count_to_be_between"
     }
   ],
-  "id": "dc08e4f9-052a-41ae-91d1-2f3ca64c7abd",
+  "id": "00000000-0000-0000-0000-000000000000",
   "meta": {
     "great_expectations_version": "1.24.1",
     "owner": "data-platform"
