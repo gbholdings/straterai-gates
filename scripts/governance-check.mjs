@@ -274,6 +274,29 @@ function elementaryMeta(node) {
 const sha256 = (s) => crypto.createHash("sha256").update(s, "utf8").digest("hex");
 const PROJECT_EXT = /\.(sql|ya?ml|csv|py|md|jinja2?)$/i;
 
+// The files dbt reads for a project: its config files and everything under its resource paths
+// (dbt_project.yml's model-paths, seed-paths and the rest, each defaulting to dbt's own folder name). A
+// script, a README or a CI file beside the project is not an input, so editing one does not make the
+// manifest stale.
+const RESOURCE_PATHS = { "model-paths": ["models"], "seed-paths": ["seeds"], "test-paths": ["tests"], "analysis-paths": ["analyses"], "macro-paths": ["macros"], "snapshot-paths": ["snapshots"], "docs-paths": [] };
+const DBT_CONFIG_FILES = ["dbt_project.yml", "packages.yml", "packages.yaml", "dependencies.yml", "dependencies.yaml", "selectors.yml"];
+function dbtInputs(dir) {
+  const text = fs.readFileSync(path.join(dir, "dbt_project.yml"), "utf8");
+  const dirs = new Set();
+  for (const [key, def] of Object.entries(RESOURCE_PATHS)) {
+    const inline = new RegExp(`^${key}:[ \\t]*\\[([^\\]]*)\\]`, "m").exec(text);
+    const block = new RegExp(`^${key}:[ \\t]*(?:#.*)?\\r?\\n((?:[ \\t]+-[^\\n]*\\r?\\n?)+)`, "m").exec(text);
+    const list = inline ? inline[1].split(",") : block ? block[1].split(/\r?\n/).map((l) => l.replace(/^\s*-\s*/, "")) : def;
+    for (const v of list.map((x) => x.replace(/#.*$/, "").trim().replace(/^["']|["']$/g, "")).filter(Boolean)) dirs.add(v);
+  }
+  const out = DBT_CONFIG_FILES.map((f) => path.join(dir, f)).filter((f) => fs.existsSync(f));
+  for (const d of dirs) {
+    const p = path.resolve(dir, d);
+    if (p.startsWith(path.resolve(dir)) && fs.existsSync(p) && fs.statSync(p).isDirectory()) out.push(...repoFiles(p));
+  }
+  return [...new Set(out)];
+}
+
 // Why a manifest is not a current parse of the dbt project at `proj.dir`, or [] when it is. dbt checksums a
 // .sql file as sha256 of its stripped text; every .sql in the project is a node or a macro of the project's
 // package; and no project file is newer than the manifest's generated_at (a schema.yml carries no checksum,
@@ -298,7 +321,7 @@ function manifestStaleness(m, proj) {
         reasons.push(`${q(rel)} has changed since the manifest was written`);
     }
   }
-  const files = repoFiles(proj.dir);
+  const files = dbtInputs(proj.dir);
   for (const f of files) {
     const rel = relTo(proj.dir, f);
     if (/\.sql$/i.test(f) && !listed.has(rel)) reasons.push(`${q(rel)} is not in the manifest`);

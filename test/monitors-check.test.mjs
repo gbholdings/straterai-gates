@@ -138,6 +138,24 @@ test("monitors: a schema.yml edited after the parse is caught by its mtime", () 
   assert.match(r.out, /models\/schema\.yml changed after the manifest was written/);
 });
 
+test("monitors: only what dbt reads ties the manifest; a script or a README beside the project does not", () => {
+  const p = el("pass");
+  fs.mkdirSync(path.join(p.d, "scripts"));
+  fs.writeFileSync(path.join(p.d, "scripts", "backfill.sql"), "delete from orders where false\n");
+  fs.writeFileSync(path.join(p.d, "README.md"), "# notes edited after the parse\n");
+  const r = run(p.args);
+  assert.equal(r.status, 0, r.out);
+  // a model under a custom model-paths folder is read, and one the manifest lacks makes it stale
+  const c = el("pass");
+  fs.writeFileSync(path.join(c.d, "dbt_project.yml"), `${fs.readFileSync(path.join(c.d, "dbt_project.yml"), "utf8")}model-paths:\n  - models\n  - marts # the second folder\n`);
+  fs.mkdirSync(path.join(c.d, "marts"));
+  fs.writeFileSync(path.join(c.d, "marts", "revenue.sql"), "select 1 as x\n");
+  age(c.d, c.m.metadata.generated_at);
+  const s = run(c.args);
+  assert.equal(s.status, 2, s.out);
+  assert.match(s.out, /marts\/revenue\.sql is not in the manifest/);
+});
+
 test("monitors: a manifest of another project, or of the same name over other files, is NOT CHECKED", () => {
   const other = el("pass");
   fs.writeFileSync(path.join(other.d, "dbt_project.yml"), fs.readFileSync(path.join(other.d, "dbt_project.yml"), "utf8").replace("name: monitors_fixture", "name: someone_else"));
