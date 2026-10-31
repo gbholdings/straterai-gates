@@ -1,0 +1,1 @@
+contract-schema: contracts/fct_orders.odcs.yaml agrees with dbt/manifest.json (3 column(s))

@@ -1,0 +1,34 @@
+version: 1.0.0
+kind: DataContract
+apiVersion: v3.2.0
+id: my-data-contract
+name: My Data Contract
+status: draft
+team:
+  name: data
+  members:
+    - username: data-platform
+      role: owner
+servers:
+- server: postgres
+  type: postgres
+  database: my_database
+  host: my_host
+  port: 5432
+  schema: public
+schema:
+- name: orders
+  physicalType: table
+  logicalType: object
+  physicalName: orders
+  properties:
+  - name: order_id
+    physicalType: TEXT
+    primaryKey: true
+    primaryKeyPosition: 1
+    logicalType: string
+    required: true
+    unique: true
+  - name: tags
+    physicalType: TEXT[]
+    logicalType: string

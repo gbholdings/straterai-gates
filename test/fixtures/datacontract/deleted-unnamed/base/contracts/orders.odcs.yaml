@@ -4,6 +4,15 @@ id: urn:datacontract:example:orders
 name: orders
 version: 1.0.0
 status: active
+team:
+  - username: data-platform
+    role: owner
+customProperties:
+  - property: consumers
+    value:
+      - repo: example-org/billing
+        team: example-org/billing-team
+      - team: Finance analysts
 domain: example
 description:
   purpose: One row per order placed.

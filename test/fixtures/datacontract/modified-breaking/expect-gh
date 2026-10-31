@@ -1,0 +1,7 @@
+gh api -X POST repos/example-org/gates-under-test/issues/7/comments
+<!-- straterai-gates:datacontract-consumers -->
+#### `contracts/orders.odcs.yaml`
+Owner: `data-platform`
+- [example-org/billing](https://github.com/example-org/billing) · @example-org/billing-team
+- `Finance analysts`
+Why: datacontract breaking reports a breaking change

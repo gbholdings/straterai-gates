@@ -1,0 +1,2 @@
+contracts/billing/orders.odcs.yaml is a contract under contracts that contracts_glob (contracts/*.odcs.yaml) does not match
+no contract file matches contracts/*.odcs.yaml, but a schema source is set

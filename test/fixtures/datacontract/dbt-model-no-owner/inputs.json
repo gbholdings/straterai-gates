@@ -1,0 +1,4 @@
+{
+ "dbt_manifest": "dbt/manifest.json",
+ "dbt_catalog": "dbt/catalog.json"
+}

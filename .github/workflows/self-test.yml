@@ -1,6 +1,10 @@
 # Proves the gates. `unit` runs the script tests and every gate's run blocks against fixtures (a failing
 # fixture must fail, a passing one must pass). The call-* jobs then call each reusable workflow once on a
-# passing fixture, as a consumer does. `self-test` is the single required check and fails if any of them did.
+# passing fixture, as a consumer does. `call-datacontract-notice` calls the contract gate on a breaking
+# fixture: it must FAIL (its red sub-check is expected), and `verify-notice` then reads the consumer notice
+# it posted on this PR back from the API. Both run only on a pull request from this repo, because a fork's
+# token cannot comment. `self-test` is the single required check: it fails unless every job ended the way
+# it should.
 name: self-test
 on:
   pull_request:
@@ -28,7 +32,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install datacontract-cli
-        run: pip install datacontract-cli==1.2.8
+        run: python3 -I -m pip install --disable-pip-version-check --require-hashes --no-deps -r requirements/datacontract-cli-1.2.8.txt
       - name: Script tests
         run: node --test test/*.test.mjs
       - name: Gate run blocks against fixtures
@@ -46,10 +50,51 @@ jobs:
   call-datacontract:
     permissions:
       contents: read
+      pull-requests: write # the called job declares it; a caller cannot grant less
     uses: ./.github/workflows/datacontract.yml
     with:
       lint_all: true
-      contracts_glob: test/fixtures/datacontract/passing/head/contracts/*.odcs.yaml
+      contracts_dir: test/fixtures/datacontract/passing/head/contracts
+      contracts_glob: test/fixtures/datacontract/passing/head/contracts/**/*.odcs.yaml
+
+  call-datacontract-notice:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/datacontract.yml
+    with:
+      fixture: test/fixtures/datacontract/modified-breaking
+      evidence_artifact: datacontract-evidence-notice
+
+  verify-notice:
+    needs: [call-datacontract-notice]
+    if: ${{ always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: The consumer notice is on this PR, from this run, naming each consumer
+        run: |
+          set -euo pipefail
+          marker='<!-- straterai-gates:datacontract-consumers -->'
+          body=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- straterai-gates:datacontract-consumers -->"))) | .body')
+          printf '%s\n' "$body"
+          [ "$(printf '%s\n' "$body" | grep -Fc -- "$marker")" = 1 ] || { echo "::error::expected exactly one notice comment"; exit 1; }
+          for want in "/actions/runs/$RUN_ID" \
+            '#### `contracts/orders.odcs.yaml`' \
+            '- [example-org/billing](https://github.com/example-org/billing) · @example-org/billing-team' \
+            '- `Finance analysts`' \
+            'Why: datacontract breaking reports a breaking change'; do
+            printf '%s\n' "$body" | grep -Fq -- "$want" || { echo "::error::the notice does not contain: $want"; exit 1; }
+          done
 
   call-dbt:
     permissions:
@@ -72,14 +117,24 @@ jobs:
 
   self-test:
     if: ${{ always() }}
-    needs: [unit, call-squawk, call-datacontract, call-dbt, call-governance]
+    needs: [unit, call-squawk, call-datacontract, call-datacontract-notice, verify-notice, call-dbt, call-governance]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     permissions: {}
     env:
-      RESULTS: ${{ join(needs.*.result, ' ') }}
+      MUST_SUCCEED: ${{ needs.unit.result }} ${{ needs.call-squawk.result }} ${{ needs.call-datacontract.result }} ${{ needs.call-dbt.result }} ${{ needs.call-governance.result }}
+      NOTICE: ${{ needs.call-datacontract-notice.result }}
+      VERIFY: ${{ needs.verify-notice.result }}
+      SAME_REPO_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
-      - name: Every job succeeded
+      - name: Every job ended the way it should
         run: |
-          echo "results: $RESULTS"
-          for r in $RESULTS; do [ "$r" = success ] || { echo "::error::a self-test job did not succeed"; exit 1; }; done
+          echo "must succeed: $MUST_SUCCEED; notice (must fail on a same-repo PR): $NOTICE; verify-notice: $VERIFY; same-repo PR: $SAME_REPO_PR"
+          for r in $MUST_SUCCEED; do [ "$r" = success ] || { echo "::error::a self-test job did not succeed"; exit 1; }; done
+          if [ "$SAME_REPO_PR" = true ]; then
+            [ "$NOTICE" = failure ] || { echo "::error::the breaking fixture must fail the contract gate (got $NOTICE)"; exit 1; }
+            [ "$VERIFY" = success ] || { echo "::error::the consumer notice was not found on the PR (got $VERIFY)"; exit 1; }
+          elif [ "$NOTICE" != skipped ] || [ "$VERIFY" != skipped ]; then
+            echo "::error::the notice jobs should be skipped outside a same-repo PR (got $NOTICE, $VERIFY)"
+            exit 1
+          fi

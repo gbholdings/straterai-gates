@@ -1,0 +1,30 @@
+apiVersion: v3.1.0
+kind: DataContract
+id: urn:datacontract:example:fct_orders
+name: fct_orders
+version: 1.0.0
+status: active
+team:
+  name: data-platform
+  members:
+    - username: data-platform
+      role: owner
+customProperties:
+  - property: consumers
+    value:
+      - repo: example-org/billing
+        team: example-org/billing-team
+schema:
+  - name: fct_orders
+    physicalType: table
+    properties:
+      - name: order_id
+        logicalType: integer
+        physicalType: INTEGER
+        required: true
+      - name: order_status
+        logicalType: string
+        physicalType: VARCHAR
+      - name: paid_amount
+        logicalType: integer
+        physicalType: INTEGER
