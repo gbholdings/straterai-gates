@@ -1,0 +1,27 @@
+{
+ "data": {
+  "repository": {
+   "pullRequest": {
+    "reviews": {
+     "pageInfo": {
+      "hasNextPage": false,
+      "endCursor": null
+     },
+     "nodes": [
+      {
+       "state": "APPROVED",
+       "authorCanPushToRepository": false,
+       "author": {
+        "__typename": "User",
+        "login": "carol"
+       },
+       "commit": {
+        "oid": "HEAD"
+       }
+      }
+     ]
+    }
+   }
+  }
+ }
+}

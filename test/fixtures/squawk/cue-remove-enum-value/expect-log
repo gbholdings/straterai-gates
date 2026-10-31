@@ -1,0 +1,3 @@
+guard-drop: DROP TYPE
+guard-type-change
+guard-rename
