@@ -114,10 +114,23 @@ jobs:
     with:
       checks: |
         gates:governance/version=version
+        gates:data-access/credentials=credentials --config test/fixtures/governance/credentials/pass/.env.example --config test/fixtures/governance/credentials/pass/**/*.json --targets test/fixtures/governance/credentials/pass/db-targets.json
+
+  # The credentials gate on the planted fixture, through the reusable workflow: it must FAIL. Pull
+  # requests only, so the planted failure is never published to the evidence branch.
+  call-governance-red:
+    if: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: write # the publish job declares it; it is skipped on a pull request
+    uses: ./.github/workflows/governance.yml
+    with:
+      evidence_artifact: governance-evidence-red
+      checks: |
+        gates:data-access/credentials=credentials --config test/fixtures/governance/credentials/fail/.env.example --targets test/fixtures/governance/credentials/fail/db-targets.json
 
   self-test:
     if: ${{ always() }}
-    needs: [unit, call-squawk, call-datacontract, call-datacontract-notice, verify-notice, call-dbt, call-governance]
+    needs: [unit, call-squawk, call-datacontract, call-datacontract-notice, verify-notice, call-dbt, call-governance, call-governance-red]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     permissions: {}
@@ -125,12 +138,20 @@ jobs:
       MUST_SUCCEED: ${{ needs.unit.result }} ${{ needs.call-squawk.result }} ${{ needs.call-datacontract.result }} ${{ needs.call-dbt.result }} ${{ needs.call-governance.result }}
       NOTICE: ${{ needs.call-datacontract-notice.result }}
       VERIFY: ${{ needs.verify-notice.result }}
+      GOV_RED: ${{ needs.call-governance-red.result }}
+      IS_PR: ${{ github.event_name == 'pull_request' }}
       SAME_REPO_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - name: Every job ended the way it should
         run: |
           echo "must succeed: $MUST_SUCCEED; notice (must fail on a same-repo PR): $NOTICE; verify-notice: $VERIFY; same-repo PR: $SAME_REPO_PR"
           for r in $MUST_SUCCEED; do [ "$r" = success ] || { echo "::error::a self-test job did not succeed"; exit 1; }; done
+          echo "governance on the planted credentials fixture (must fail on a PR): $GOV_RED"
+          if [ "$IS_PR" = true ]; then
+            [ "$GOV_RED" = failure ] || { echo "::error::the planted credentials fixture must fail the governance gate (got $GOV_RED)"; exit 1; }
+          elif [ "$GOV_RED" != skipped ]; then
+            echo "::error::the planted credentials call should be skipped outside a pull request (got $GOV_RED)"; exit 1
+          fi
           if [ "$SAME_REPO_PR" = true ]; then
             [ "$NOTICE" = failure ] || { echo "::error::the breaking fixture must fail the contract gate (got $NOTICE)"; exit 1; }
             [ "$VERIFY" = success ] || { echo "::error::the consumer notice was not found on the PR (got $VERIFY)"; exit 1; }

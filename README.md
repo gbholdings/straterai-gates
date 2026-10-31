@@ -12,7 +12,7 @@ A repo calls a gate with a few lines and gets the same check every other repo ge
 | `dbt.yml` | sqlfluff, then `dbt build --target ci` against a CI-only database. | `dbt_project_dir` (`.`), `adapter_package` (`dbt-bigquery==1.12.1`), `dbt_core` (`1.12.6`), `sqlfluff` (`4.4.0`), `auth` (`wif-google` or `none`), `workload_identity_provider`, `service_account`, `lint_all` |
 | `datacontract.yml` | [datacontract-cli](https://cli.datacontract.com/) lint of every contract; each contract's columns and types against the real schema (`governance-check contract-schema`); an owner on every contract, and on every dbt model with a manifest (`governance-check owner`); `breaking` against the base branch, and a block on deleting, renaming or retiring a contract that `RETIRED.md` on the base branch does not list. When one of those breaks on a PR, one comment names each consumer the base copy of the contract lists. | `contracts_dir` (`contracts`), `contracts_glob` (`contracts/**/*.odcs.yaml`), `datacontract_cli` (`1.2.8`, installed from a hash-pinned lockfile), `lint_all`, `prisma_schema`, `dbt_manifest`, `dbt_catalog`, `dbt_artifact`, `open_consumer_issues` (`false`, needs the secret `CONSUMER_ISSUES_TOKEN`), `evidence_artifact` (`datacontract-evidence`), `gates_sha` (a 40-character commit), `fixture` (self-test only) |
 | `bq-dry-run.yml` | Compiles the dbt models a PR can change and dry-runs each on BigQuery (free; nothing runs). Fails when a model would process more bytes than its budget in `warehouse-budgets.yml` (`default` plus per-model bytes, e.g. `10 GiB`), or when the gate cannot measure it. See [bq-dry-run](#bq-dry-run). | `project_id` (required), `location` (`US`), `dbt_project_dir` (`.`), `budgets_path` (`warehouse-budgets.yml`), `adapter_package`, `dbt_core`, `workload_identity_provider`, `service_account`, `gates_sha`, `lint_all` |
-| `governance.yml` | Runs `scripts/governance-check.mjs` checks and records each result as an evidence entry. | `checks` (one `<plugin>:<skill>/<gate>=<arguments>` per line), `evidence_branch` (`governance-evidence`), `gates_sha` |
+| `governance.yml` | Runs `scripts/governance-check.mjs` checks (for example `credentials`, below) and records each result as an evidence entry. The `governance` job reads the tree with `contents: read` and no token; a separate `publish` job, which never runs on a pull request, holds `contents: write` and writes only the evidence branch. An empty `checks` fails: nothing ran is not a pass. | `checks` (one `<plugin>:<skill>/<gate>=<arguments>` per line), `evidence_branch` (`governance-evidence`), `evidence_artifact` (`governance-evidence`), `gates_sha` |
 
 `lint_all` lints every tracked file that matches instead of the PR's diff. The self-test uses it, and so can a repo adopting a gate for the first time.
 
@@ -35,7 +35,7 @@ jobs:
 Each workflow's header comment has its own stub.
 
 - The required-check name is `<caller job> / <called job>`: `squawk / squawk`, not `squawk`. A repo that switches from a copied workflow to the stub updates its branch protection in the same change, or every PR waits on "Expected".
-- A reusable workflow cannot exceed the caller's permissions. `dbt.yml` and `bq-dry-run.yml` need `id-token: write` in the stub, `datacontract.yml` needs `pull-requests: write` (from v1.2.0, for the consumer notice; only its `notice` job, which never checks out the PR, holds it), and `governance.yml` needs `contents: write` (used only on push and schedule, only for the evidence branch). A caller still on `contents: read` that bumps `datacontract.yml` to v1.2.0 fails to start until it adds `pull-requests: write`.
+- A reusable workflow cannot exceed the caller's permissions. `dbt.yml` and `bq-dry-run.yml` need `id-token: write` in the stub, `datacontract.yml` needs `pull-requests: write` (from v1.2.0, for the consumer notice; only its `notice` job, which never checks out the PR, holds it), and `governance.yml` needs `contents: write` (from v1.3.0 only its `publish` job holds it, on push to the default branch, schedule and manual runs, for the evidence branch). A caller still on `contents: read` that bumps `datacontract.yml` to v1.2.0 fails to start until it adds `pull-requests: write`.
 - No workflow has a `paths:` filter, for the same "Expected" reason. Each job always runs and passes when there is nothing to check.
 
 ## bq-dry-run
@@ -59,7 +59,9 @@ Access: the service account needs `roles/bigquery.jobUser` in the job project an
 
 `node scripts/governance-check.mjs evidence append --check <plugin>:<skill>/<gate> --result pass|fail|not_run [--run-link <url>] [--commit <sha>] [--detail <text>] [--file governance/evidence.json]`
 
-`governance/evidence.json` is a JSON array of `{ "check", "date" (ISO 8601 UTC), "result", "run_link" (URL or null), "commit", "detail" }`. It only grows: the script reads, appends, verifies no earlier entry changed, and writes through a temp file. A file it cannot parse exits 4 and is left untouched. Exit 2 is a usage error. On push and schedule `governance.yml` commits the file to the `governance-evidence` branch, touching nothing else; on a pull request it uploads the would-be file as an artifact and writes no branch. The file records what ran and what it found. It does not say a repo is compliant.
+`node scripts/governance-check.mjs evidence merge --from <one run's entries.json> [--file governance/evidence.json]` appends another file's entries; an entry without the shape below exits 4 and nothing is written.
+
+`governance/evidence.json` is a JSON array of `{ "check", "date" (ISO 8601 UTC), "result", "run_link" (URL or null), "commit", "detail" }`. It only grows: the script reads, appends, verifies no earlier entry changed, and writes through a temp file. A file it cannot parse exits 4 and is left untouched. Exit 2 is a usage error. On push to the default branch, schedule and manual runs, `governance.yml`'s `publish` job merges the run's entries and commits the file to the `governance-evidence` branch, touching nothing else; on a pull request it uploads the would-be file as an artifact and writes no branch. The file records what ran and what it found. It does not say a repo is compliant.
 
 ## Contract checks
 
@@ -78,6 +80,19 @@ node scripts/governance-check.mjs consumers --contract <file> [--format lines|ma
 - **No schema source** in `datacontract.yml`: drift is NOT CHECKED. The job warns, says so in the step summary, and records `contract-schema` as `not_run`.
 - YAML contracts are read with Python's PyYAML (installed with datacontract-cli), run isolated (`python3 -I`, from the temp directory), so a `yaml.py` in the repository is never imported. No PyYAML exits 2; `GOVERNANCE_PYTHON` picks the interpreter.
 - The notice renders every path, owner and team as a code span with line breaks, control characters and backticks removed, so none of them can add Markdown, HTML, a mention or a link. A path under the contracts folder with a control character in it fails the gate's first step.
+
+## Credentials check
+
+```
+node scripts/governance-check.mjs credentials --config <file or glob> [--config ...] [--targets .claude/db-targets.json]
+```
+
+Fails (exit 1) when a committed file carries a database connection string with a literal password for a non-local host. It reads URL connection strings (`postgres://`, `postgresql+driver://`, `mysql://`, `mongodb+srv://`, `redis://`, `sqlserver://`, `jdbc:...`) with the password in the userinfo or a `password=`/`pwd=` parameter, and key=value strings (libpq `host=... password=...`, ADO.NET `Server=...;Password=...`). The password is never printed.
+
+- **Local** is `localhost`, `*.localhost`, `127.0.0.0/8`, `::1`, `0.0.0.0`, `host.docker.internal`, a socket path, or a one-label name (`db`, `postgres`: a compose or CI service). With `--targets`, a variable that is the `read_env` or `write_env` of a target whose `env` is not `local`, `dev` or `ci` is non-local whatever its host, so a tunnel to staging on `localhost:6543` fails; an unknown `env` counts as `prod`.
+- **A reference is not a committed password.** `${NAME}`, `$NAME`, `${{ secrets.NAME }}`, `{{ ... }}` and `%NAME%` pass with a note. A placeholder such as `<password>` or `changeme` fails: it tells the next person to paste one in.
+- **Not read:** a separate `DB_PASSWORD=` variable, which is not a connection string. A reviewer still has to look for one.
+- **NOT CHECKED is exit 2, never a pass:** no `--config`, a missing path, a directory, a glob (expanded over committed files with `git ls-files`) that matches nothing, or an unreadable `--targets`.
 
 ## What is in this repo
 

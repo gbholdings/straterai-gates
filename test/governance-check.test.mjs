@@ -652,3 +652,153 @@ test("YAML contracts are read through PyYAML, and a missing interpreter exits 2"
   assert.equal(r3.status, 1);
   assert.match(r3.stderr, /not valid YAML/);
 });
+
+// ---- credentials -----------------------------------------------------------------------------------
+const CRED = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "governance", "credentials");
+const credIn = (dir, files, args) => {
+  for (const [name, body] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
+    fs.writeFileSync(path.join(dir, name), body);
+  }
+  return run(["credentials", ...args], dir);
+};
+const SECRETS = ["planted-staging-pw", "s3cret", "hunter2", "p@ss", "pw-kv", "tunnel-pw"];
+const noSecret = (r) => { for (const s of SECRETS) assert.equal(`${r.stdout}${r.stderr}`.includes(s), false, `printed the password ${s}`); };
+
+test("credentials: the passing fixture passes, with --targets, and notes the reference", () => {
+  const r = run(["credentials", "--config", path.join(CRED, "pass", ".env.example"), "--targets", path.join(CRED, "pass", "db-targets.json")], tmp());
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /no literal password for a non-local target in 1 file\(s\) \(5 connection string\(s\) read\)/);
+  assert.match(r.stdout, /note: .*PROD_URL takes its password from a reference/);
+});
+
+test("credentials: the failing fixture fails on the staging write DSN, and never prints the password", () => {
+  const r = run(["credentials", "--config", path.join(CRED, "fail", ".env.example"), "--targets", path.join(CRED, "fail", "db-targets.json")], tmp());
+  assert.equal(r.status, 1, r.stdout);
+  assert.match(r.stderr, /\.env\.example:2: a postgres connection string in STAGING_RW_URL has a literal password for the non-local target staging \(env staging\)/);
+  assert.doesNotMatch(r.stderr, /\.env\.example:1:/);
+  noSecret(r);
+});
+
+test("credentials: each connection-string shape with a literal password for a real host fails", () => {
+  const shapes = {
+    url: "A=postgres://app:s3cret@db.example.com:5432/app",
+    driver: "B=postgresql+psycopg2://app:s3cret@db.example.com/app",
+    mysql: "C: mysql://root:hunter2@mysql.example.com/app",
+    srv: '"D": "mongodb+srv://u:p%40ss@cluster0.example.net/db"',
+    query: "E=postgres://db.example.com/app?user=a&password=hunter2",
+    jdbc: "F=jdbc:sqlserver://sql.example.com:1433;databaseName=a;password=hunter2",
+    libpq: "G=host=pg.example.com port=5432 user=a password=pw-kv",
+    adonet: 'H="Server=tcp:sql.example.com,1433;Database=a;User Id=u;Password=pw-kv;"',
+    multihost: "I=postgres://u:s3cret@localhost,db.example.com/app",
+    placeholder: "J=postgres://app:<password>@db.example.com/app",
+    commented: "# K=postgres://app:s3cret@db.example.com/app",
+    redis: "L=rediss://default:s3cret@cache.example.com:6380",
+  };
+  for (const [shape, line] of Object.entries(shapes)) {
+    const r = credIn(tmp(), { "a.env": `${line}\n` }, ["--config", "a.env"]);
+    assert.equal(r.status, 1, `${shape} passed: ${r.stdout}`);
+    assert.match(r.stderr, /a\.env:1: a \S+ connection string/, shape);
+    noSecret(r);
+  }
+});
+
+test("credentials: local hosts, no password, and references pass", () => {
+  const ok = [
+    "A=postgres://postgres:postgres@localhost:5432/t",
+    "B=postgres://u:p@127.0.0.1/t",
+    "C=postgres://u:p@[::1]:5432/t",
+    "D=postgres://u:p@db:5432/t",
+    "E=postgres://u:p@host.docker.internal/t",
+    "F=postgres://u:p@%2Fcloudsql%2Fproj%3Aregion%3Ainst/t",
+    "G=postgres://app@db.example.com/app",
+    "H=postgres://app:${DB_PASSWORD}@db.example.com/app",
+    "I=postgres://app:${{ secrets.DB_PASSWORD }}@db.example.com/app",
+    "J=postgres://app:@db.example.com/app",
+    "DB_PASSWORD=s3cret",
+    "K=https://user:s3cret@example.com/not-a-database",
+  ];
+  const r = credIn(tmp(), { "a.env": ok.join("\n") + "\n" }, ["--config", "a.env"]);
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test("credentials: --targets makes a tunnelled localhost DSN for a staging or unknown-env target fail", () => {
+  const d = tmp();
+  const targets = { targets: { st: { env: "staging", read_env: "STAGING_URL" }, odd: { env: "qa", read_env: "QA_URL" }, loc: { env: "local", read_env: "DATABASE_URL" } } };
+  fs.writeFileSync(path.join(d, "t.json"), JSON.stringify(targets));
+  const body = "STAGING_URL=postgres://u:tunnel-pw@localhost:6543/app\nQA_URL=postgres://u:tunnel-pw@localhost:6544/app\nDATABASE_URL=postgres://u:p@localhost/app\n";
+  const r = credIn(d, { "a.env": body }, ["--config", "a.env", "--targets", "t.json"]);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /a\.env:1: .*target st \(env staging\)/);
+  assert.match(r.stderr, /a\.env:2: .*target odd \(env prod\)/, "an unknown env label counts as prod");
+  assert.doesNotMatch(r.stderr, /a\.env:3:/);
+  noSecret(r);
+  assert.equal(credIn(d, {}, ["--config", "a.env"]).status, 0, "without --targets the localhost tunnel is local");
+});
+
+test("credentials: nothing to read is NOT CHECKED (exit 2), never a pass", () => {
+  const d = tmp();
+  for (const args of [[], ["--config", "missing.env"], ["--config", "a.env", "--targets", "missing.json"]]) {
+    const r = credIn(d, { "a.env": "A=1\n" }, args);
+    assert.equal(r.status, 2, `${args.join(" ")}: ${r.stdout}`);
+    assert.match(r.stderr, /NOT CHECKED|required/);
+  }
+  fs.mkdirSync(path.join(d, "dir"));
+  assert.equal(run(["credentials", "--config", "dir"], d).status, 2, "a directory");
+  fs.writeFileSync(path.join(d, "bad.json"), "{");
+  assert.equal(run(["credentials", "--config", "a.env", "--targets", "bad.json"], d).status, 2, "malformed targets");
+  assert.equal(run(["credentials", "--config", "a.env", "--bogus", "x"], d).status, 2, "unknown flag");
+});
+
+test("credentials: a glob reads committed files only, and a glob that matches none exits 2", () => {
+  const d = tmp();
+  spawnSync("git", ["init", "-q"], { cwd: d });
+  fs.mkdirSync(path.join(d, "config/env"), { recursive: true });
+  fs.writeFileSync(path.join(d, "config/env/staging.env"), "A=postgres://u:s3cret@db.example.com/app\n");
+  fs.writeFileSync(path.join(d, "config/env/ok.env"), "A=postgres://u:p@localhost/app\n");
+  assert.equal(run(["credentials", "--config", "config/**/*.env"], d).status, 2, "nothing is committed yet");
+  spawnSync("git", ["add", "config/env/ok.env"], { cwd: d });
+  assert.equal(run(["credentials", "--config", "config/**/*.env"], d).status, 0);
+  spawnSync("git", ["add", "config/env/staging.env"], { cwd: d });
+  const r = run(["credentials", "--config", "config/**/*.env"], d);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /config\/env\/staging\.env:1:/);
+  assert.equal(run(["credentials", "--config", "nothing/**/*.yml", "--config", "config/**/*.env"], d).status, 2, "any glob matching nothing fails");
+  const outside = tmp();
+  assert.equal(run(["credentials", "--config", "**/*.env"], outside).status, 2, "a glob outside a git checkout");
+});
+
+// ---- evidence merge (the publish job of governance.yml) ---------------------------------------------
+test("evidence merge appends a run's entries after the existing ones, and never drops one", () => {
+  const d = tmp();
+  for (let i = 0; i < 2; i++) assert.equal(append(d, ["--detail", `old${i}`]).status, 0);
+  const before = JSON.parse(fs.readFileSync(path.join(d, "governance/evidence.json"), "utf8"));
+  assert.equal(append(d, ["--detail", "new0", "--file", "run.json"]).status, 0);
+  assert.equal(append(d, ["--detail", "new1", "--file", "run.json"]).status, 0);
+  const r = run(["evidence", "merge", "--from", "run.json"], d);
+  assert.equal(r.status, 0, r.stderr);
+  const after = JSON.parse(fs.readFileSync(path.join(d, "governance/evidence.json"), "utf8"));
+  assert.equal(after.length, 4);
+  assert.deepEqual(after.slice(0, 2), before);
+  assert.deepEqual(after.slice(2).map((e) => e.detail), ["new0", "new1"]);
+  const fresh = tmp();
+  fs.copyFileSync(path.join(d, "run.json"), path.join(fresh, "run.json"));
+  assert.equal(run(["evidence", "merge", "--from", "run.json", "--file", "out.json"], fresh).status, 0, "a missing target starts empty");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(fresh, "out.json"), "utf8")).length, 2);
+});
+
+test("evidence merge refuses a malformed run file or entry with exit 4, and writes nothing", () => {
+  const d = tmp();
+  assert.equal(append(d, ["--detail", "old"]).status, 0);
+  const target = path.join(d, "governance/evidence.json");
+  const before = fs.readFileSync(target, "utf8");
+  const ok = { check: "a:b/c", date: "2026-10-30T00:00:00Z", result: "pass", run_link: null, commit: "abc", detail: "" };
+  const bads = ["{", JSON.stringify({}), JSON.stringify([{ ...ok, result: "compliant" }]), JSON.stringify([{ ...ok, extra: 1 }]), JSON.stringify([ok, { ...ok, date: "soon" }])];
+  for (const bad of bads) {
+    fs.writeFileSync(path.join(d, "run.json"), bad);
+    assert.equal(run(["evidence", "merge", "--from", "run.json"], d).status, 4, bad);
+    assert.equal(fs.readFileSync(target, "utf8"), before, `left untouched after ${bad}`);
+  }
+  assert.equal(run(["evidence", "merge"], d).status, 2);
+  assert.equal(run(["evidence", "merge", "--from", "missing.json"], d).status, 2);
+});

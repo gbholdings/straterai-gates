@@ -17,7 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 
-export const VERSION = "1.2.0";
+export const VERSION = "1.3.0";
 const RESULTS = ["pass", "fail", "not_run"];
 const DEFAULT_EVIDENCE = "governance/evidence.json";
 
@@ -60,6 +60,35 @@ function headCommit() {
 
 // A14. The file is a JSON array that only grows. Read, validate, append, verify nothing earlier
 // changed, then write through a temp file so a crash never leaves half a file.
+function readEvidence(file) {
+  if (!fs.existsSync(file)) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (e) {
+    throw new Exit(4, `evidence file ${file} is not valid JSON and was left untouched: ${e.message}`);
+  }
+  if (!Array.isArray(parsed) || parsed.some((x) => x === null || typeof x !== "object" || Array.isArray(x))) {
+    throw new Exit(4, `evidence file ${file} is not a JSON array of entries and was left untouched`);
+  }
+  return parsed;
+}
+
+function writeEvidence(file, entries, added) {
+  const next = [...entries, ...added];
+  const text = JSON.stringify(next, null, 2) + "\n";
+  // Refuse to proceed if the write would alter or drop an earlier entry.
+  const back = JSON.parse(text);
+  if (back.length !== entries.length + added.length || entries.some((e, i) => JSON.stringify(e) !== JSON.stringify(back[i]))) {
+    throw new Exit(4, "refusing to write: an earlier entry would change");
+  }
+  fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, text);
+  fs.renameSync(tmp, file);
+  return next.length;
+}
+
 export function evidenceAppend(argv, env = process.env) {
   const f = parseFlags(argv, ["check", "result", "run-link", "commit", "detail", "file", "date"]);
   if (!f.check) throw new Exit(2, "evidence append: --check <plugin>:<skill>/<gate> is required");
@@ -67,20 +96,7 @@ export function evidenceAppend(argv, env = process.env) {
   const file = f.file ?? env.GOVERNANCE_EVIDENCE_FILE ?? DEFAULT_EVIDENCE;
   const date = f.date ?? new Date().toISOString();
   if (Number.isNaN(Date.parse(date))) throw new Exit(2, `evidence append: --date is not a date: ${date}`);
-
-  let entries = [];
-  if (fs.existsSync(file)) {
-    let parsed;
-    try {
-      parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-    } catch (e) {
-      throw new Exit(4, `evidence file ${file} is not valid JSON and was left untouched: ${e.message}`);
-    }
-    if (!Array.isArray(parsed) || parsed.some((x) => x === null || typeof x !== "object" || Array.isArray(x))) {
-      throw new Exit(4, `evidence file ${file} is not a JSON array of entries and was left untouched`);
-    }
-    entries = parsed;
-  }
+  const entries = readEvidence(file);
   const entry = {
     check: f.check,
     date,
@@ -89,18 +105,37 @@ export function evidenceAppend(argv, env = process.env) {
     commit: f.commit ?? headCommit(),
     detail: f.detail ?? "",
   };
-  const next = [...entries, entry];
-  const text = JSON.stringify(next, null, 2) + "\n";
-  // Refuse to proceed if the write would alter or drop an earlier entry.
-  const back = JSON.parse(text);
-  if (back.length !== entries.length + 1 || entries.some((e, i) => JSON.stringify(e) !== JSON.stringify(back[i]))) {
-    throw new Exit(4, "refusing to write: an earlier entry would change");
+  const n = writeEvidence(file, entries, [entry]);
+  return `appended ${entry.check} ${entry.result} to ${file} (${n} entries)`;
+}
+
+// evidence merge: append every entry of --from (one run's entries, as governance.yml's check job
+// uploads them) to --file. The publish job runs it, so the job that read the caller's tree never holds
+// the write token. Each entry must have the A14 shape; one that does not exits 4 and nothing is written.
+const ENTRY_KEYS = ["check", "date", "result", "run_link", "commit", "detail"];
+export function evidenceMerge(argv, env = process.env) {
+  const f = parseFlags(argv, ["from", "file"]);
+  if (!f.from) throw new Exit(2, "evidence merge: --from <entries.json> is required");
+  if (!fs.existsSync(f.from)) throw new Exit(2, `evidence merge: ${f.from}: no such file`);
+  const file = f.file ?? env.GOVERNANCE_EVIDENCE_FILE ?? DEFAULT_EVIDENCE;
+  const added = readEvidence(f.from);
+  for (const [i, e] of added.entries()) {
+    const keys = Object.keys(e);
+    const bad =
+      keys.length !== ENTRY_KEYS.length ||
+      !ENTRY_KEYS.every((k) => keys.includes(k)) ||
+      typeof e.check !== "string" ||
+      !e.check ||
+      !RESULTS.includes(e.result) ||
+      typeof e.date !== "string" ||
+      Number.isNaN(Date.parse(e.date)) ||
+      !(e.run_link === null || typeof e.run_link === "string") ||
+      typeof e.commit !== "string" ||
+      typeof e.detail !== "string";
+    if (bad) throw new Exit(4, `evidence merge: entry ${i} of ${f.from} is not an evidence entry; nothing was written`);
   }
-  fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
-  const tmp = `${file}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, text);
-  fs.renameSync(tmp, file);
-  return `appended ${entry.check} ${entry.result} to ${file} (${next.length} entries)`;
+  const n = writeEvidence(file, readEvidence(file), added);
+  return `merged ${added.length} entr${added.length === 1 ? "y" : "ies"} into ${file} (${n} entries)`;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -781,22 +816,202 @@ export function consumersCmd(argv, env = process.env) {
   return out.join("\n");
 }
 
+// ---------------------------------------------------------------------------------------------------
+// credentials: no committed config may carry a database connection string with a literal password for a
+// non-local host. Use IAM database authentication, or keep the whole connection string in a secret store
+// with a rotation date, and commit only the variable's name.
+//
+// What it reads: URL DSNs (postgres://, mysql://, mongodb+srv://, redis://, jdbc:..., sqlserver://, with
+// or without a `+driver` suffix), the password in their userinfo or in a `password=` / `pwd=` parameter,
+// and key=value connection strings (libpq `host=... password=...`, ADO.NET `Server=...;Password=...`).
+// It does not read a separate `DB_PASSWORD=` variable: that is not a connection string, so a reviewer
+// still has to look for one.
+//
+// Local: localhost, *.localhost, 127.0.0.0/8, ::1, 0.0.0.0, host.docker.internal, a socket path, and a
+// one-label name such as `db` or `postgres` (a compose or CI service). With --targets
+// .claude/db-targets.json, a variable named as the read_env or write_env of a target whose env is not
+// local, dev or ci is non-local whatever its host says; an unknown env counts as prod.
+//
+// A password that is only a reference (`${NAME}`, `$NAME`, `${{ secrets.NAME }}`, `{{ ... }}`, `%NAME%`)
+// is not a committed password and is listed as a note. A placeholder such as `<password>` or `changeme`
+// is a literal: it tells the next person to paste a password into the file.
+//
+// Exit 0 nothing found, 1 a finding, 2 nothing to read (a missing path, a glob that matches no committed
+// file, a directory): NOT CHECKED, never a pass. The password is never printed.
+
+const DSN_SCHEMES = "postgres(?:ql)?|mysql|mariadb|mongodb(?:\\+srv)?|redis|rediss|sqlserver|mssql|cockroach(?:db)?|oracle|clickhouse|snowflake|tidb";
+const URL_DSN = new RegExp(`(?<![\\w+.-])((?:jdbc:)?(?:${DSN_SCHEMES})(?:\\+[a-z0-9_]+)?):\\/\\/([^\\s'"\`]*)`, "gi");
+const LOCAL_ENVS = ["local", "dev", "ci"];
+const KNOWN_ENVS = ["local", "dev", "ci", "staging", "prod"];
+
+export function isReference(s) {
+  return /^(?:\$\{\{[^}]*\}\}|\$\{[A-Za-z_]\w*(?::?[-=?+][^}]*)?\}|\$[A-Za-z_]\w*|\{\{[^}]*\}\}|%[A-Za-z_]\w*%)$/.test(String(s).trim());
+}
+
+export function isLocalHost(host) {
+  let h = String(host ?? "").trim().toLowerCase();
+  if (h.startsWith("[")) {
+    const close = h.indexOf("]");
+    h = close === -1 ? h.slice(1) : h.slice(1, close);
+  } else h = h.replace(/:\d*$/, "");
+  if (h === "" || h.startsWith("/") || h.startsWith("%2f")) return true;
+  if (h === "localhost" || h.endsWith(".localhost") || h === "::1" || h === "0.0.0.0" || h === "host.docker.internal") return true;
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+  return /^[a-z0-9_-]+$/.test(h) && !/^\d+$/.test(h);
+}
+
+function decode(s) {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+function kvValue(line, keys) {
+  const re = new RegExp(`(?:^|[\\s;=,("'])(?:${keys})\\s*=\\s*('[^']*'|"[^"]*"|[^\\s;"']+)`, "i");
+  const m = re.exec(line);
+  return m ? m[1].replace(/^['"]|['"]$/g, "") : undefined;
+}
+
+// Every connection string on a line, as { scheme, host, hosts, password } (password undefined when none).
+export function dsnsInLine(line) {
+  const out = [];
+  for (const m of line.matchAll(URL_DSN)) {
+    const scheme = m[1].toLowerCase();
+    const rest = m[2];
+    const end = rest.search(/[/?#]/);
+    let authority = end === -1 ? rest : rest.slice(0, end);
+    let params = end === -1 ? "" : rest.slice(end);
+    const semi = authority.indexOf(";");
+    if (semi !== -1) {
+      params = authority.slice(semi) + params;
+      authority = authority.slice(0, semi);
+    }
+    const at = authority.lastIndexOf("@");
+    const userinfo = at === -1 ? "" : authority.slice(0, at);
+    const hostport = (at === -1 ? authority : authority.slice(at + 1)).replace(/[),\]}>]+$/, "");
+    let password;
+    const colon = userinfo.indexOf(":");
+    if (colon !== -1 && colon < userinfo.length - 1) password = decode(userinfo.slice(colon + 1));
+    const pm = /(?:^|[?&;])(?:password|pwd)=([^&;#\s'"`]*)/i.exec(params);
+    if (password === undefined && pm && pm[1]) password = decode(pm[1]);
+    const hosts = hostport.split(",");
+    out.push({ scheme, host: hosts.find((h) => !isLocalHost(h)) ?? hosts[0], hosts, password });
+  }
+  if (!out.length) {
+    const password = kvValue(line, "password|pwd");
+    const host = kvValue(line, "host|hostaddr|server|data source|address|addr");
+    if (password && host !== undefined) {
+      const h = host.replace(/^tcp:/i, "").replace(/,(\d+)$/, ":$1");
+      out.push({ scheme: "key=value", host: h, hosts: [h], password });
+    }
+  }
+  return out;
+}
+
+function varName(line) {
+  const m = /^\s*(?:export\s+|-\s+)?["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*[:=]/.exec(line);
+  return m ? m[1] : null;
+}
+
+function readTargets(file) {
+  if (!fs.existsSync(file)) throw new Exit(2, `credentials: --targets ${file}: no such file. NOT CHECKED.`);
+  let cfg;
+  try {
+    cfg = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (e) {
+    throw new Exit(2, `credentials: --targets ${file} is not valid JSON: ${e.message}`);
+  }
+  if (!cfg || typeof cfg.targets !== "object" || cfg.targets === null || Array.isArray(cfg.targets)) {
+    throw new Exit(2, `credentials: --targets ${file} has no "targets" object`);
+  }
+  const byVar = new Map();
+  for (const [name, t] of Object.entries(cfg.targets)) {
+    const env = KNOWN_ENVS.includes(t?.env) ? t.env : "prod";
+    for (const k of ["read_env", "write_env"]) {
+      if (typeof t?.[k] === "string" && t[k]) byVar.set(t[k], { name, env, local: LOCAL_ENVS.includes(env) });
+    }
+  }
+  return byVar;
+}
+
+function trackedMatches(pattern) {
+  const r = spawnSync("git", ["ls-files", "-z", "--", `:(glob)${pattern}`], { encoding: "utf8" });
+  if (r.status !== 0) throw new Exit(2, `credentials: --config ${pattern} is a glob and git ls-files failed (not a git checkout?). NOT CHECKED.`);
+  return r.stdout.split("\0").filter(Boolean);
+}
+
+export function credentialsCheck(argv) {
+  const f = parseFlags(argv, ["config", "targets"], ["config"]);
+  if (!f.config?.length) throw new Exit(2, "credentials: --config <file or glob> is required (repeatable). NOT CHECKED.");
+  const targets = f.targets ? readTargets(f.targets) : new Map();
+  const files = [];
+  for (const c of f.config) {
+    if (/[*?[]/.test(c)) {
+      const hit = trackedMatches(c);
+      if (!hit.length) throw new Exit(2, `credentials: --config ${c} matches no committed file. NOT CHECKED: fix the pattern.`);
+      files.push(...hit);
+      continue;
+    }
+    if (!fs.existsSync(c)) throw new Exit(2, `credentials: ${c}: no such file. NOT CHECKED.`);
+    files.push(c);
+  }
+  const unique = [...new Set(files)];
+  const findings = [];
+  const notes = [];
+  let seen = 0;
+  for (const file of unique) {
+    if (!fs.lstatSync(file).isFile()) throw new Exit(2, `credentials: ${file}: not a regular file. NOT CHECKED.`);
+    const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
+    lines.forEach((line, i) => {
+      const name = varName(line);
+      const target = name ? targets.get(name) : undefined;
+      for (const d of dsnsInLine(line)) {
+        seen++;
+        const nonLocal = (target && !target.local) || !d.hosts.every(isLocalHost);
+        if (d.password === undefined || !nonLocal) continue;
+        const where = `${file}:${i + 1}`;
+        const what = `a ${d.scheme} connection string${name ? ` in ${name}` : ""}`;
+        const why = target && !target.local ? `target ${target.name} (env ${target.env})` : `host ${mdCode(d.host)}`;
+        if (isReference(d.password)) notes.push(`${where}: ${what} takes its password from a reference, not from the file (${why})`);
+        else findings.push(`${where}: ${what} has a literal password for the non-local ${why}`);
+      }
+    });
+  }
+  const tail = notes.length ? `\n${notes.map((n) => `  note: ${n}`).join("\n")}` : "";
+  if (findings.length) {
+    throw new Exit(
+      1,
+      `credentials: ${findings.length} committed connection string(s) carry a password for a non-local target (${unique.length} file(s) read; no password is printed)\n` +
+        findings.map((x) => `  ${x}`).join("\n") +
+        "\n  fix: IAM database authentication (Cloud SQL, AlloyDB, RDS), or the whole connection string in a secret store with a rotation date and only its variable name committed. Rotate any real password that was committed." +
+        tail,
+    );
+  }
+  return `credentials: no literal password for a non-local target in ${unique.length} file(s) (${seen} connection string(s) read)${tail}`;
+}
+
 export function main(argv, env = process.env) {
   const [cmd, sub, ...rest] = argv;
   if (cmd === "version" || cmd === "--version") return VERSION;
   if (cmd === "evidence" && sub === "append") return evidenceAppend(rest, env);
+  if (cmd === "evidence" && sub === "merge") return evidenceMerge(rest, env);
   if (cmd === "owner") return ownerCheck(argv.slice(1), env);
   if (cmd === "contract-schema") return contractSchemaCheck(argv.slice(1), env);
   if (cmd === "consumers") return consumersCmd(argv.slice(1), env);
+  if (cmd === "credentials") return credentialsCheck(argv.slice(1));
   throw new Exit(
     2,
     [
       "usage: governance-check.mjs <command>",
       "  version",
       "  evidence append --check <name> --result pass|fail|not_run [--run-link <url>] [--commit <sha>] [--detail <text>] [--file <path>]",
+      "  evidence merge --from <entries.json> [--file <path>]",
       "  owner (--contracts <dir> | --contract <file> ...) [--manifest <manifest.json>]",
       "  contract-schema --contract <file> (--prisma <schema.prisma or folder> | --manifest <manifest.json> [--catalog <catalog.json>])",
       "  consumers --contract <file> [--format lines|markdown] [--label <path>]",
+      "  credentials --config <file or glob> [--config ...] [--targets .claude/db-targets.json]",
     ].join("\n"),
   );
 }
