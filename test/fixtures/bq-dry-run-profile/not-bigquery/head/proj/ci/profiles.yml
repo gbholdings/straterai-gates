@@ -1,0 +1,7 @@
+proj:
+  target: ci
+  outputs:
+    ci:
+      type: duckdb
+      path: x.duckdb
+      maximum_bytes_billed: 1000000000

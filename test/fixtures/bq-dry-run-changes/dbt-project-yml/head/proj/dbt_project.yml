@@ -1,0 +1,6 @@
+name: proj
+profile: proj
+version: "1.0"
+models:
+  proj:
+    +materialized: view

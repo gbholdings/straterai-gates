@@ -1,0 +1,8 @@
+proj:
+  target: ci
+  outputs:
+    ci:
+      type: bigquery
+      method: oauth
+      project: example-project
+      dataset: ci

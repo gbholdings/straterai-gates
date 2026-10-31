@@ -1,6 +1,7 @@
-# Reusable gate: compile the dbt models a PR changes, dry-run each one on BigQuery, and fail when a
+# Reusable gate: compile the dbt models a PR can change, dry-run each one on BigQuery, and fail when a
 # model would process more bytes than its budget in warehouse-budgets.yml. A dry run is free and runs
-# nothing. The script is scripts/bq-dry-run-check.mjs (budget file format in its header).
+# nothing. The script is scripts/bq-dry-run-check.mjs (budget file format and what is measured are in
+# its header).
 #
 # Caller stub (make "bq-dry-run / bq-dry-run" the required check). A reusable workflow cannot exceed
 # the caller's permissions, so the stub declares id-token: write:
@@ -20,14 +21,26 @@
 #
 # Setup, once per repo:
 #   1. warehouse-budgets.yml at the repo root (or set budgets_path): a `default` and per-model bytes.
-#   2. <dbt project>/ci/profiles.yml with a `ci` target dbt can compile against (method: oauth uses the
-#      credentials the auth step writes).
-#   3. A service account that can create jobs in project_id (roles/bigquery.jobUser) and read table
-#      metadata for the models' sources (roles/bigquery.metadataViewer); a dry run needs no data read.
+#   2. <dbt project>/ci/profiles.yml with a `ci` target of type bigquery for the profile dbt_project.yml
+#      names (method: oauth uses the credentials the auth step writes). The target must set
+#      `maximum_bytes_billed:` to a literal byte count, e.g. 1000000000. `dbt compile` runs SQL the PR
+#      wrote (introspection, and any run_query() or statement block in a macro or model) as real, billed
+#      queries under the CI credential; dbt-bigquery puts this cap on every query it sends, so a PR
+#      cannot spend past it. The gate refuses to compile without it.
+#   3. A service account that can create jobs in project_id (roles/bigquery.jobUser) and read the data
+#      of every table and view the models reference (roles/bigquery.dataViewer on those datasets). A dry
+#      run needs bigquery.tables.getData: with roles/bigquery.metadataViewer it is refused with 403
+#      "User does not have permission to query table" (measured 2026-10-30). Grant no write role.
 #      Trust only this repo on the workload identity provider. A PR from a fork gets no token and fails
 #      at the auth step.
 #
-# No `paths:` filter on purpose: the job always runs and passes when no model changed.
+# Which models are checked: an added or edited .sql file under <dbt project>/models/ checks that model
+# and everything downstream of it (`<model>+`). Any other change under the dbt project (a macro, a
+# source or schema YAML, dbt_project.yml, packages, seeds, snapshots, a deleted or renamed model) or to
+# the budget file checks every model, as does a project whose dbt_project.yml sets model-paths.
+# Markdown and .github/ changes are ignored.
+#
+# No `paths:` filter on purpose: the job always runs and passes when nothing in the dbt project changed.
 name: bq-dry-run
 on:
   workflow_call:
@@ -65,7 +78,7 @@ on:
         type: string
         default: ""
       lint_all:
-        description: "Check every model, not only the ones the PR changes."
+        description: "Check every model, whatever the PR changes."
         type: boolean
         default: false
 permissions: {}
@@ -92,29 +105,39 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Which models changed?
+      - name: What changed?
         id: changes
         run: |
           d="${GATES_DBT_DIR%/}"
           if [ "$d" = "." ] || [ -z "$d" ]; then p=""; else p="$d/"; fi
           if [ "$LINT_ALL" = "true" ]; then
-            files=$(git ls-files -- ":(glob)${p}models/**/*.sql")
+            scope=all
           else
-            files=$(git diff --name-only --diff-filter=ACMR "origin/$BASE_REF...HEAD" -- ":(glob)${p}models/**/*.sql")
-          fi
-          if [ -z "$files" ]; then
-            echo "no model changed; the rest of this job is skipped"
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            # Renames come through as a delete plus an add, so a moved model checks everything.
+            changes=$(git diff --name-status --no-renames "origin/$BASE_REF...HEAD" -- "${p:-.}" "$BUDGETS_PATH" ":(exclude,glob)**/*.md" ":(exclude).github/**")
+            if [ -z "$changes" ]; then
+              echo "nothing in the dbt project changed; the rest of this job is skipped"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            scope=models
+            if [ ! -f "${p}dbt_project.yml" ] || grep -Eq '^[[:space:]]*model[-_]paths[[:space:]]*:' "${p}dbt_project.yml"; then scope=all; fi
+            sel=""
+            while IFS=$'\t' read -r status file; do
+              case "$status" in A|M) ;; *) scope=all ;; esac
+              case "$file" in "${p}models/"*.sql) sel="$sel $(basename "$file" .sql)+" ;; *) scope=all ;; esac
+            done <<< "$changes"
           fi
           if [ ! -f "$BUDGETS_PATH" ]; then
-            echo "::error::models changed but $BUDGETS_PATH does not exist"
+            echo "::error::the dbt project changed but $BUDGETS_PATH does not exist"
             exit 1
           fi
-          models=$(printf '%s\n' "$files" | sed 's#.*/##; s#\.sql$##' | sort -u | tr '\n' ' ')
-          echo "models: $models"
+          if [ "$scope" = "all" ]; then sel=""; fi
+          sel=$(printf '%s\n' $sel | sort -u | tr '\n' ' ' | sed 's/^ *//; s/ *$//')
+          echo "scope: $scope${sel:+ ($sel)}"
           echo "changed=true" >> "$GITHUB_OUTPUT"
-          echo "models=$models" >> "$GITHUB_OUTPUT"
+          echo "scope=$scope" >> "$GITHUB_OUTPUT"
+          echo "select=$sel" >> "$GITHUB_OUTPUT"
       - name: Check out the gates
         if: steps.changes.outputs.changed == 'true'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -130,6 +153,31 @@ jobs:
       - name: Install
         if: steps.changes.outputs.changed == 'true'
         run: pip install "dbt-core==$DBT_CORE" "$ADAPTER_PACKAGE"
+      - name: Check the CI profile caps billed bytes
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          python3 - <<'PY'
+          import os, sys, yaml
+          d = os.environ["GATES_DBT_DIR"].rstrip("/") or "."
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+          try:
+              profile = (yaml.safe_load(open(f"{d}/dbt_project.yml")) or {}).get("profile")
+              profiles = yaml.safe_load(open(f"{d}/ci/profiles.yml")) or {}
+          except (OSError, yaml.YAMLError) as e:
+              fail(f"cannot read the dbt project or ci/profiles.yml: {e}")
+          target = (((profiles.get(profile) or {}).get("outputs") or {}).get("ci")) if isinstance(profiles, dict) else None
+          if not isinstance(target, dict):
+              fail(f"{d}/ci/profiles.yml has no `ci` target for profile {profile!r}")
+          if target.get("type") != "bigquery":
+              fail(f"the ci target's type is {target.get('type')!r}, not bigquery")
+          cap = target.get("maximum_bytes_billed")
+          ok = (isinstance(cap, int) and not isinstance(cap, bool)) or (isinstance(cap, str) and cap.strip().isdigit())
+          if not ok or int(cap) <= 0:
+              fail(f"the ci target must set maximum_bytes_billed to a literal positive byte count (got {cap!r}): dbt compile runs this PR's SQL as billed queries, and the cap is what stops it spending")
+          print(f"ci target caps every query dbt sends at {int(cap)} bytes billed")
+          PY
       - name: Authenticate to Google Cloud (keyless)
         id: auth
         if: steps.changes.outputs.changed == 'true'
@@ -138,21 +186,31 @@ jobs:
           workload_identity_provider: ${{ inputs.workload_identity_provider }}
           service_account: ${{ inputs.service_account }}
           token_format: access_token
-      - name: Compile the changed models
+      - name: Compile and list the models to check
+        id: compile
         if: steps.changes.outputs.changed == 'true'
         working-directory: ${{ inputs.dbt_project_dir }}
         env:
           DBT_PROFILES_DIR: ./ci
-          MODELS: ${{ steps.changes.outputs.models }}
+          SCOPE: ${{ steps.changes.outputs.scope }}
+          SELECT: ${{ steps.changes.outputs.select }}
         run: |
+          sel=()
+          if [ "$SCOPE" != "all" ]; then
+            read -ra names <<< "$SELECT"
+            sel=(--select "${names[@]}")
+          fi
           dbt deps
-          # shellcheck disable=SC2086 # one selector per model name
-          dbt compile --target ci --select $MODELS
+          dbt compile --target ci "${sel[@]}"
+          # Ephemeral models have no relation of their own; their SQL is inside the models that use them.
+          models=$(dbt --quiet ls --target ci --resource-type model --output name "${sel[@]}" --exclude config.materialized:ephemeral | sort -u | tr '\n' ' ')
+          echo "models: $models"
+          echo "models=$models" >> "$GITHUB_OUTPUT"
       - name: Dry-run each model against its budget
         if: steps.changes.outputs.changed == 'true'
         env:
-          MODELS: ${{ steps.changes.outputs.models }}
+          MODELS: ${{ steps.compile.outputs.models }}
           BQ_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
         run: |
           d="${GATES_DBT_DIR%/}"
-          node .gates/scripts/bq-dry-run-check.mjs --budgets "$BUDGETS_PATH" --compiled-dir "${d:-.}/target/compiled" --models "$MODELS" --project "$PROJECT_ID" --location "$BQ_LOCATION"
+          node .gates/scripts/bq-dry-run-check.mjs --budgets "$BUDGETS_PATH" --compiled-dir "${d:-.}/target/compiled" --manifest "${d:-.}/target/manifest.json" --models "$MODELS" --project "$PROJECT_ID" --location "$BQ_LOCATION"

@@ -1,1 +1,1 @@
-select * from {{ ref("stg_a") }}
+select * from {{ ref('stg_a') }}
