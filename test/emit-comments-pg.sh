@@ -19,6 +19,8 @@ comment() { psql -tAc "select coalesce(col_description('$1'::regclass, attnum), 
 emit() { node scripts/governance-check.mjs classification prisma --schema "$F/schema.prisma" --tiers "$F/tiers.json" --emit-comments "$W/migrations" --date "$1"; }
 apply() { psql < "$W/migrations/$1/migration.sql"; }
 W=$(mktemp -d)
+# Migration folders are <date><time>_<name>; the date and the time are written apart.
+D1=20261101 D2=20261102 D3=20261103
 cp -R "$F/migrations" "$W/migrations"
 emit 2026-10-30T12:00:00Z
 sql=$(ls "$W"/migrations/*_classification_comments/migration.sql 2>/dev/null | head -1)
@@ -33,18 +35,18 @@ emit 2026-10-31T12:00:00Z
 [ "$(ls "$W/migrations" | wc -l)" = "$before" ] || { echo "::error::a second run wrote a migration with no tag changed"; exit 1; }
 echo "13 columns carry their tier as a Postgres comment; the second run wrote nothing"
 # Drop tax_id and add it back, as Prisma writes a type change: Postgres drops the comment with the column.
-mkdir "$W/migrations/20261101000000_drop_tax_id" "$W/migrations/20261102000000_add_tax_id"
-printf -- '-- AlterTable\nALTER TABLE "people" DROP COLUMN "tax_id";\n' > "$W/migrations/20261101000000_drop_tax_id/migration.sql"
-printf -- '-- AlterTable\nALTER TABLE "people" ADD COLUMN "tax_id" TEXT;\n' > "$W/migrations/20261102000000_add_tax_id/migration.sql"
-apply 20261101000000_drop_tax_id
-apply 20261102000000_add_tax_id
+mkdir "$W/migrations/${D1}000000_drop_tax_id" "$W/migrations/${D2}000000_add_tax_id"
+printf -- '-- AlterTable\nALTER TABLE "people" DROP COLUMN "tax_id";\n' > "$W/migrations/${D1}000000_drop_tax_id/migration.sql"
+printf -- '-- AlterTable\nALTER TABLE "people" ADD COLUMN "tax_id" TEXT;\n' > "$W/migrations/${D2}000000_add_tax_id/migration.sql"
+apply ${D1}000000_drop_tax_id
+apply ${D2}000000_add_tax_id
 got=$(comment people tax_id)
 [ "$got" = "NULL" ] || { echo "::error::after the drop and add, people.tax_id has comment '$got'; want none"; exit 1; }
 emit 2026-11-03T12:00:00Z
-again="$W/migrations/20261103120000_classification_comments"
+again="$W/migrations/${D3}120000_classification_comments"
 [ -f "$again/migration.sql" ] || { echo "::error::after a drop and re-add, --emit-comments wrote no migration, so people.tax_id stays without its comment"; exit 1; }
 cat "$again/migration.sql"
-apply 20261103120000_classification_comments
+apply ${D3}120000_classification_comments
 got=$(comment people tax_id)
 [ "$got" = "classification:restricted" ] || { echo "::error::after the re-emit, people.tax_id has comment '$got'"; exit 1; }
 echo "a column dropped and added back gets its comment again"

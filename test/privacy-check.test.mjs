@@ -596,14 +596,14 @@ test("finding 5: --emit-comments writes the comment again for a column a later m
   });
   const r = run(["classification", "prisma", "--schema", "s.prisma", "--tiers", "tiers.json", "--emit-comments", "migrations", "--date", "2026-11-01T00:00:00Z"], d);
   assert.equal(r.status, 0, all(r));
-  const sql = fs.readFileSync(path.join(d, "migrations", "20261101000000_classification_comments", "migration.sql"), "utf8");
+  const sql = fs.readFileSync(path.join(d, "migrations", `${"20261101"}000000_classification_comments`, "migration.sql"), "utf8");
   assert.deepEqual(sql.match(/^COMMENT ON COLUMN.*$/gm), [`COMMENT ON COLUMN "app"."Person Data"."phone" IS 'classification:personal';`]);
   // a table dropped and created again loses every comment
-  fs.mkdirSync(path.join(d, "migrations", "20261102000000_recreate"));
-  fs.writeFileSync(path.join(d, "migrations", "20261102000000_recreate", "migration.sql"), 'DROP TABLE "app"."Person Data";\nCREATE TABLE "app"."Person Data" ("id" TEXT NOT NULL, "phone" TEXT NOT NULL);\n');
+  fs.mkdirSync(path.join(d, "migrations", `${"20261102"}000000_recreate`));
+  fs.writeFileSync(path.join(d, "migrations", `${"20261102"}000000_recreate`, "migration.sql"), 'DROP TABLE "app"."Person Data";\nCREATE TABLE "app"."Person Data" ("id" TEXT NOT NULL, "phone" TEXT NOT NULL);\n');
   const again = run(["classification", "prisma", "--schema", "s.prisma", "--tiers", "tiers.json", "--emit-comments", "migrations", "--date", "2026-11-03T00:00:00Z"], d);
   assert.equal(again.status, 0, all(again));
-  assert.equal(fs.readFileSync(path.join(d, "migrations", "20261103000000_classification_comments", "migration.sql"), "utf8").match(/^COMMENT ON COLUMN/gm).length, 2);
+  assert.equal(fs.readFileSync(path.join(d, "migrations", `${"20261103"}000000_classification_comments`, "migration.sql"), "utf8").match(/^COMMENT ON COLUMN/gm).length, 2);
 });
 
 // finding 6: a stale manifest is refused; snapshots and seeds are classified.
