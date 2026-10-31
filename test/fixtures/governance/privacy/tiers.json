@@ -1,0 +1,8 @@
+{
+  "tiers": {
+    "public": { "personal_data": false, "model": "allow", "embedding": "allow", "log": "allow", "export": "allow", "bigquery_policy_tag": null },
+    "internal": { "personal_data": false, "model": "allow", "embedding": "allow", "log": "allow", "export": "allow", "bigquery_policy_tag": null },
+    "personal": { "personal_data": true, "model": "mask", "embedding": "allow", "log": "mask", "export": "mask", "retention_days": 730, "bigquery_policy_tag": "projects/example-project/locations/us/taxonomies/1111/policyTags/2222" },
+    "restricted": { "personal_data": true, "model": "deny", "embedding": "deny", "log": "deny", "export": "deny", "retention_days": 30, "bigquery_policy_tag": "projects/example-project/locations/us/taxonomies/1111/policyTags/3333" }
+  }
+}

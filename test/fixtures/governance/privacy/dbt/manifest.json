@@ -1,0 +1,635 @@
+{
+  "metadata": {
+    "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+    "dbt_version": "1.12.6",
+    "generated_at": "2026-10-31T08:28:10.883017Z",
+    "project_name": "privacy_fixture"
+  },
+  "nodes": {
+    "model.privacy_fixture.stg_people": {
+      "database": "priv",
+      "schema": "main",
+      "name": "stg_people",
+      "resource_type": "model",
+      "package_name": "privacy_fixture",
+      "path": "staging/stg_people.sql",
+      "original_file_path": "models/staging/stg_people.sql",
+      "unique_id": "model.privacy_fixture.stg_people",
+      "fqn": [
+        "privacy_fixture",
+        "staging",
+        "stg_people"
+      ],
+      "alias": "stg_people",
+      "checksum": {
+        "name": "sha256",
+        "checksum": "22bb826bdf1abfffd651c0ac9e14d933f2b65550c2248b271c02e3b5996f76a5"
+      },
+      "config": {
+        "enabled": true,
+        "alias": null,
+        "schema": null,
+        "database": null,
+        "tags": [],
+        "meta": {},
+        "group": null,
+        "static_analysis": null,
+        "materialized": "view",
+        "incremental_strategy": null,
+        "batch_size": null,
+        "lookback": 1,
+        "begin": null,
+        "persist_docs": {},
+        "post-hook": [],
+        "pre-hook": [],
+        "quoting": {},
+        "column_types": {},
+        "full_refresh": null,
+        "unique_key": null,
+        "on_schema_change": "ignore",
+        "on_configuration_change": "apply",
+        "grants": {},
+        "packages": [],
+        "docs": {
+          "show": true,
+          "node_color": null
+        },
+        "contract": {
+          "enforced": false,
+          "alias_types": true
+        },
+        "event_time": null,
+        "concurrent_batches": null,
+        "access": "protected",
+        "freshness": null,
+        "on_error": null,
+        "latest_version_pointer": {
+          "enabled": null,
+          "alias": null
+        }
+      },
+      "tags": [],
+      "description": "",
+      "columns": {
+        "person_id": {
+          "name": "person_id",
+          "description": "",
+          "meta": {
+            "classification": "internal"
+          },
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {
+              "classification": "internal"
+            },
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "dimension": null,
+          "entity": null,
+          "doc_blocks": []
+        },
+        "email": {
+          "name": "email",
+          "description": "",
+          "meta": {
+            "classification": "personal"
+          },
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {
+              "classification": "personal"
+            },
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "dimension": null,
+          "entity": null,
+          "doc_blocks": []
+        }
+      },
+      "meta": {},
+      "group": null,
+      "docs": {
+        "show": true,
+        "node_color": null
+      },
+      "patch_path": "privacy_fixture://models/schema.yml",
+      "build_path": null,
+      "unrendered_config": {
+        "materialized": "view"
+      },
+      "created_at": 1793435292.9084344,
+      "relation_name": "\"priv\".\"main\".\"stg_people\"",
+      "raw_code": "select person_id, email from {{ ref('people_seed') }}",
+      "doc_blocks": [],
+      "language": "sql",
+      "refs": [
+        {
+          "name": "people_seed",
+          "package": null,
+          "version": null
+        }
+      ],
+      "sources": [],
+      "metrics": [],
+      "functions": [],
+      "depends_on": {
+        "macros": [],
+        "nodes": [
+          "seed.privacy_fixture.people_seed"
+        ]
+      },
+      "compiled_path": null,
+      "contract": {
+        "enforced": false,
+        "alias_types": true,
+        "checksum": null
+      },
+      "access": "protected",
+      "constraints": [],
+      "version": null,
+      "latest_version": null,
+      "deprecation_date": null,
+      "primary_key": [],
+      "time_spine": null
+    },
+    "model.privacy_fixture.dim_people": {
+      "database": "priv",
+      "schema": "main",
+      "name": "dim_people",
+      "resource_type": "model",
+      "package_name": "privacy_fixture",
+      "path": "marts/dim_people.sql",
+      "original_file_path": "models/marts/dim_people.sql",
+      "unique_id": "model.privacy_fixture.dim_people",
+      "fqn": [
+        "privacy_fixture",
+        "marts",
+        "dim_people"
+      ],
+      "alias": "dim_people",
+      "checksum": {
+        "name": "sha256",
+        "checksum": "290d42f917548f219578603cf53e9731c376b1639715be7fa4baca0ee66cc22c"
+      },
+      "config": {
+        "enabled": true,
+        "alias": null,
+        "schema": null,
+        "database": null,
+        "tags": [],
+        "meta": {},
+        "group": null,
+        "static_analysis": null,
+        "materialized": "table",
+        "incremental_strategy": null,
+        "batch_size": null,
+        "lookback": 1,
+        "begin": null,
+        "persist_docs": {},
+        "post-hook": [],
+        "pre-hook": [],
+        "quoting": {},
+        "column_types": {},
+        "full_refresh": null,
+        "unique_key": null,
+        "on_schema_change": "ignore",
+        "on_configuration_change": "apply",
+        "grants": {},
+        "packages": [],
+        "docs": {
+          "show": true,
+          "node_color": null
+        },
+        "contract": {
+          "enforced": false,
+          "alias_types": true
+        },
+        "event_time": null,
+        "concurrent_batches": null,
+        "access": "protected",
+        "freshness": null,
+        "on_error": null,
+        "latest_version_pointer": {
+          "enabled": null,
+          "alias": null
+        }
+      },
+      "tags": [],
+      "description": "",
+      "columns": {
+        "person_id": {
+          "name": "person_id",
+          "description": "",
+          "meta": {
+            "classification": "internal"
+          },
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {
+              "classification": "internal"
+            },
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "dimension": null,
+          "entity": null,
+          "doc_blocks": []
+        },
+        "email": {
+          "name": "email",
+          "description": "",
+          "meta": {
+            "classification": "personal"
+          },
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {
+              "classification": "personal"
+            },
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "dimension": null,
+          "entity": null,
+          "doc_blocks": []
+        },
+        "tax_id": {
+          "name": "tax_id",
+          "description": "",
+          "meta": {
+            "classification": "restricted"
+          },
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {
+              "classification": "restricted"
+            },
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "dimension": null,
+          "entity": null,
+          "doc_blocks": []
+        }
+      },
+      "meta": {},
+      "group": null,
+      "docs": {
+        "show": true,
+        "node_color": null
+      },
+      "patch_path": "privacy_fixture://models/schema.yml",
+      "build_path": null,
+      "unrendered_config": {
+        "materialized": "table"
+      },
+      "created_at": 1793435292.9111145,
+      "relation_name": "\"priv\".\"main\".\"dim_people\"",
+      "raw_code": "select person_id, email, tax_id from {{ ref('people_seed') }}",
+      "doc_blocks": [],
+      "language": "sql",
+      "refs": [
+        {
+          "name": "people_seed",
+          "package": null,
+          "version": null
+        }
+      ],
+      "sources": [],
+      "metrics": [],
+      "functions": [],
+      "depends_on": {
+        "macros": [],
+        "nodes": [
+          "seed.privacy_fixture.people_seed"
+        ]
+      },
+      "compiled_path": null,
+      "contract": {
+        "enforced": false,
+        "alias_types": true,
+        "checksum": null
+      },
+      "access": "protected",
+      "constraints": [],
+      "version": null,
+      "latest_version": null,
+      "deprecation_date": null,
+      "primary_key": [],
+      "time_spine": null
+    },
+    "seed.privacy_fixture.people_seed": {
+      "database": "priv",
+      "schema": "main",
+      "name": "people_seed",
+      "resource_type": "seed",
+      "package_name": "privacy_fixture",
+      "path": "people_seed.csv",
+      "original_file_path": "seeds/people_seed.csv",
+      "unique_id": "seed.privacy_fixture.people_seed",
+      "fqn": [
+        "privacy_fixture",
+        "people_seed"
+      ],
+      "alias": "people_seed",
+      "checksum": {
+        "name": "sha256",
+        "checksum": "fedc718a8a43c918137fd12084c762d325a16effaddc11a5ece3b698b529c65e"
+      },
+      "config": {
+        "enabled": true,
+        "alias": null,
+        "schema": null,
+        "database": null,
+        "tags": [],
+        "meta": {},
+        "group": null,
+        "static_analysis": null,
+        "materialized": "seed",
+        "incremental_strategy": null,
+        "batch_size": null,
+        "lookback": 1,
+        "begin": null,
+        "persist_docs": {},
+        "post-hook": [],
+        "pre-hook": [],
+        "quoting": {},
+        "column_types": {},
+        "full_refresh": null,
+        "unique_key": null,
+        "on_schema_change": "ignore",
+        "on_configuration_change": "apply",
+        "grants": {},
+        "packages": [],
+        "docs": {
+          "show": true,
+          "node_color": null
+        },
+        "contract": {
+          "enforced": false,
+          "alias_types": true
+        },
+        "event_time": null,
+        "concurrent_batches": null,
+        "delimiter": ",",
+        "quote_columns": null
+      },
+      "tags": [],
+      "description": "",
+      "columns": {
+        "person_id": {
+          "name": "person_id",
+          "description": "",
+          "meta": {
+            "classification": "internal"
+          },
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {
+              "classification": "internal"
+            },
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "dimension": null,
+          "entity": null,
+          "doc_blocks": []
+        },
+        "email": {
+          "name": "email",
+          "description": "",
+          "meta": {
+            "classification": "personal"
+          },
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {
+              "classification": "personal"
+            },
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "dimension": null,
+          "entity": null,
+          "doc_blocks": []
+        },
+        "tax_id": {
+          "name": "tax_id",
+          "description": "",
+          "meta": {
+            "classification": "restricted"
+          },
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {
+              "classification": "restricted"
+            },
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "dimension": null,
+          "entity": null,
+          "doc_blocks": []
+        }
+      },
+      "meta": {},
+      "group": null,
+      "docs": {
+        "show": true,
+        "node_color": null
+      },
+      "patch_path": "privacy_fixture://seeds/schema.yml",
+      "build_path": null,
+      "unrendered_config": {},
+      "created_at": 1793435292.9736652,
+      "relation_name": "\"priv\".\"main\".\"people_seed\"",
+      "raw_code": "",
+      "doc_blocks": [],
+      "depends_on": {
+        "macros": []
+      }
+    },
+    "snapshot.privacy_fixture.people_history": {
+      "database": "priv",
+      "schema": "main",
+      "name": "people_history",
+      "resource_type": "snapshot",
+      "package_name": "privacy_fixture",
+      "path": "people_history.sql",
+      "original_file_path": "snapshots/snapshots.yml",
+      "unique_id": "snapshot.privacy_fixture.people_history",
+      "fqn": [
+        "privacy_fixture",
+        "people_history"
+      ],
+      "alias": "people_history",
+      "checksum": {
+        "name": "sha256",
+        "checksum": "c00289299410b7d1faf71c65ca40ae45c70ac68b2846c8514deec0b57425fd10"
+      },
+      "config": {
+        "enabled": true,
+        "alias": null,
+        "schema": null,
+        "database": null,
+        "tags": [],
+        "meta": {},
+        "group": null,
+        "static_analysis": null,
+        "materialized": "snapshot",
+        "incremental_strategy": null,
+        "batch_size": null,
+        "lookback": 1,
+        "begin": null,
+        "persist_docs": {},
+        "post-hook": [],
+        "pre-hook": [],
+        "quoting": {},
+        "column_types": {},
+        "full_refresh": null,
+        "unique_key": "person_id",
+        "on_schema_change": "ignore",
+        "on_configuration_change": "apply",
+        "grants": {},
+        "packages": [],
+        "docs": {
+          "show": true,
+          "node_color": null
+        },
+        "contract": {
+          "enforced": false,
+          "alias_types": true
+        },
+        "event_time": null,
+        "concurrent_batches": null,
+        "strategy": "check",
+        "target_schema": null,
+        "target_database": null,
+        "updated_at": null,
+        "check_cols": "all",
+        "snapshot_meta_column_names": {
+          "dbt_valid_to": null,
+          "dbt_valid_from": null,
+          "dbt_scd_id": null,
+          "dbt_updated_at": null,
+          "dbt_is_deleted": null
+        },
+        "dbt_valid_to_current": null
+      },
+      "tags": [],
+      "description": "",
+      "columns": {
+        "person_id": {
+          "name": "person_id",
+          "description": "",
+          "meta": {
+            "classification": "internal"
+          },
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {
+              "classification": "internal"
+            },
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "dimension": null,
+          "entity": null,
+          "doc_blocks": []
+        },
+        "email": {
+          "name": "email",
+          "description": "",
+          "meta": {
+            "classification": "personal"
+          },
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {
+              "classification": "personal"
+            },
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "dimension": null,
+          "entity": null,
+          "doc_blocks": []
+        }
+      },
+      "meta": {},
+      "group": null,
+      "docs": {
+        "show": true,
+        "node_color": null
+      },
+      "patch_path": "privacy_fixture://snapshots/snapshots.yml",
+      "build_path": null,
+      "unrendered_config": {
+        "unique_key": "person_id",
+        "strategy": "check",
+        "check_cols": "all"
+      },
+      "created_at": 1793435293.3805854,
+      "relation_name": "\"priv\".\"main\".\"people_history\"",
+      "raw_code": "select * from {{ ref('stg_people') }}",
+      "doc_blocks": [],
+      "language": "sql",
+      "refs": [
+        {
+          "name": "stg_people",
+          "package": null,
+          "version": null
+        }
+      ],
+      "sources": [],
+      "metrics": [],
+      "functions": [],
+      "depends_on": {
+        "macros": [],
+        "nodes": [
+          "model.privacy_fixture.stg_people"
+        ]
+      },
+      "compiled_path": null,
+      "contract": {
+        "enforced": false,
+        "alias_types": true,
+        "checksum": null
+      }
+    }
+  },
+  "sources": {},
+  "macros": {}
+}

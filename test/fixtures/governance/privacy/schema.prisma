@@ -1,0 +1,54 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Person {
+  /// @classification(internal)
+  id        String   @id @default(uuid()) @db.Uuid
+  /// The address we write to.
+  /// @classification(personal)
+  email     String   @unique
+  fullName  String   @map("full_name") /// @classification(personal)
+  /// @classification(restricted)
+  taxId     String?  @map("tax_id")
+  /// @classification(internal)
+  createdAt DateTime @default(now()) @map("created_at")
+  notes     Note[]
+
+  @@map("people")
+}
+
+model Note {
+  /// @classification(internal)
+  id        String   @id @default(uuid()) @db.Uuid
+  /// @classification(internal)
+  personId  String   @map("person_id") @db.Uuid
+  /// @classification(personal)
+  body      String
+  person    Person   @relation(fields: [personId], references: [id])
+  embedding NoteEmbedding?
+
+  @@map("notes")
+}
+
+model NoteEmbedding {
+  /// @classification(internal)
+  noteId    String   @id @map("source_pk") @db.Uuid
+  /// @classification(personal)
+  vector    Unsupported("vector(3)")
+  note      Note     @relation(fields: [noteId], references: [id], onDelete: Cascade)
+
+  @@map("note_embeddings")
+}
+
+model Session {
+  /// @classification(internal)
+  id        String   @id
+  /// @classification(restricted)
+  token     String
+  /// @classification(internal)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("sessions")
+}
