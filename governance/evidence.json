@@ -246,5 +246,77 @@
     "run_link": "https://github.com/gbholdings/straterai-gates/actions/runs/41198119188",
     "commit": "296b556f77f6b2210fa87e8d4a09980b0e29f1d3",
     "detail": "pass, exit 0"
+  },
+  {
+    "check": "gates:governance/version",
+    "date": "2026-11-13T14:58:11.285Z",
+    "result": "pass",
+    "run_link": "https://github.com/gbholdings/straterai-gates/actions/runs/43447672840",
+    "commit": "1b5c2c87c0dc7a5d16f491e7ee41eb50277b7352",
+    "detail": "pass, exit 0"
+  },
+  {
+    "check": "gates:data-privacy/classification",
+    "date": "2026-11-13T14:58:11.718Z",
+    "result": "pass",
+    "run_link": "https://github.com/gbholdings/straterai-gates/actions/runs/43447672840",
+    "commit": "1b5c2c87c0dc7a5d16f491e7ee41eb50277b7352",
+    "detail": "pass, exit 0"
+  },
+  {
+    "check": "gates:data-privacy/classification-dbt",
+    "date": "2026-11-13T14:58:11.855Z",
+    "result": "pass",
+    "run_link": "https://github.com/gbholdings/straterai-gates/actions/runs/43447672840",
+    "commit": "1b5c2c87c0dc7a5d16f491e7ee41eb50277b7352",
+    "detail": "pass, exit 0"
+  },
+  {
+    "check": "gates:data-privacy/deletion-map",
+    "date": "2026-11-13T14:58:11.962Z",
+    "result": "pass",
+    "run_link": "https://github.com/gbholdings/straterai-gates/actions/runs/43447672840",
+    "commit": "1b5c2c87c0dc7a5d16f491e7ee41eb50277b7352",
+    "detail": "pass, exit 0"
+  },
+  {
+    "check": "gates:data-privacy/retention",
+    "date": "2026-11-13T14:58:12.054Z",
+    "result": "pass",
+    "run_link": "https://github.com/gbholdings/straterai-gates/actions/runs/43447672840",
+    "commit": "1b5c2c87c0dc7a5d16f491e7ee41eb50277b7352",
+    "detail": "pass, exit 0"
+  },
+  {
+    "check": "gates:data-privacy/exports",
+    "date": "2026-11-13T14:58:12.163Z",
+    "result": "pass",
+    "run_link": "https://github.com/gbholdings/straterai-gates/actions/runs/43447672840",
+    "commit": "1b5c2c87c0dc7a5d16f491e7ee41eb50277b7352",
+    "detail": "pass, exit 0"
+  },
+  {
+    "check": "gates:governance/monitors",
+    "date": "2026-11-13T14:58:12.272Z",
+    "result": "pass",
+    "run_link": "https://github.com/gbholdings/straterai-gates/actions/runs/43447672840",
+    "commit": "1b5c2c87c0dc7a5d16f491e7ee41eb50277b7352",
+    "detail": "pass, exit 0"
+  },
+  {
+    "check": "gates:governance/monitors-gx",
+    "date": "2026-11-13T14:58:14.998Z",
+    "result": "pass",
+    "run_link": "https://github.com/gbholdings/straterai-gates/actions/runs/43447672840",
+    "commit": "1b5c2c87c0dc7a5d16f491e7ee41eb50277b7352",
+    "detail": "pass, exit 0"
+  },
+  {
+    "check": "gates:data-access/credentials",
+    "date": "2026-11-13T14:58:15.097Z",
+    "result": "pass",
+    "run_link": "https://github.com/gbholdings/straterai-gates/actions/runs/43447672840",
+    "commit": "1b5c2c87c0dc7a5d16f491e7ee41eb50277b7352",
+    "detail": "pass, exit 0"
   }
 ]
