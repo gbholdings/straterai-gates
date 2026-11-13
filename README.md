@@ -2,7 +2,17 @@
 
 Reusable GitHub Actions workflows that wrap open-source database tools, plus the small scripts they run. Apache-2.0.
 
-A repo calls a gate with a few lines and gets the same check every other repo gets. Releases are tags (`v1.0.0`); a tag never moves, so pin the full commit SHA and let Dependabot bump it.
+A repo calls a gate with a few lines and gets the same check every other repo gets. Releases are tags (`vMAJOR.MINOR.PATCH`; the latest at the time of writing is `v1.6.0`); a tag never moves, so pin the full commit SHA and let Dependabot bump it.
+
+**Status:** live and public. There is nothing to host: the gates are reusable workflows that run on the calling repo's GitHub Actions runners. Owners are in `CODEOWNERS`.
+
+## Run the tests
+
+```sh
+npm test    # node --test test/*.test.mjs && node test/run-blocks.mjs
+```
+
+Needs Node 20+, `bash`, `git`, and Python with PyYAML (`datacontract-cli` for the contract cases). CI (`self-test.yml`) also runs the version check, the monitor-engine test and the Postgres comment test.
 
 ## Gates
 
@@ -152,7 +162,7 @@ For GX, set `gx: true` and pass `--gx <dir>`; the job installs GX Core from `req
 - Every action is pinned to a 40-character SHA with a version comment.
 - `permissions:` is set per job, least privilege.
 - No `${{ inputs.* }}` or `${{ github.event.* }}` inside a `run:` block. Values go through `env:`. `zizmor` checks it.
-- No client names, internal hosts or thresholds. `fact-scan` reads a deny list from a private repo with a read-only GitHub App token and prints only `file:line deny-rule #n`. It fails closed: no app secrets (a fork PR, say) means a red check and no scan.
+- No client names, internal hosts or thresholds. The `fact-scan` workflow scans every PR for them, prints only `file:line` and a rule number, and fails closed: a PR where it cannot run (a fork, say) is a red check, not a pass.
 - Every PR carries one label: `semver:major` (an input removed or renamed), `semver:minor` (a new input or gate) or `semver:patch`. On merge, `release.yml` tags the merge commit.
 
 ## What the self-test cannot prove
