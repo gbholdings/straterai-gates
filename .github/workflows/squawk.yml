@@ -131,7 +131,7 @@ jobs:
       # --require-hashes, so only these exact CPython 3.12 Linux wheels (x86_64, aarch64) are accepted.
       PGLAST: "pglast==8.7 --hash=sha256:e1c2e041507b723ac4eb521846c2a0be76f0b52b4bfd22a7e8e3dce05e3c78cb --hash=sha256:02f7b819df3244870dabfe1e65f3797932bd33b738738c9ae7870157306fecee"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The PR's head commit, not the merge ref, so what the guard reads is what a review approves.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
